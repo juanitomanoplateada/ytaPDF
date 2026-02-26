@@ -150,9 +150,15 @@
                 StandardFonts[pdfLibFontId as keyof typeof StandardFonts] ||
                   StandardFonts.Helvetica,
               );
-              
-              const { drawFabricTextToPdf } = await import("./lib/pdfTextMatrix");
-              const cropBoxData = { x: cLeft, y: cBottom, width: cWidth, height: cHeight };
+
+              const { drawFabricTextToPdf } =
+                await import("./lib/pdfTextMatrix");
+              const cropBoxData = {
+                x: cLeft,
+                y: cBottom,
+                width: cWidth,
+                height: cHeight,
+              };
 
               await drawFabricTextToPdf(
                 page,
@@ -160,7 +166,7 @@
                 viewportDimensions,
                 cropBoxData,
                 pageRotation,
-                fontToUse
+                fontToUse,
               );
             }),
           );
@@ -169,28 +175,6 @@
           obj.type === "Image" ||
           obj.type === "FabricImage"
         ) {
-          const ratioX = cWidth / viewportDimensions.width;
-          const ratioY = cHeight / viewportDimensions.height;
-
-          const fabricWidth = (obj.width || 0) * scaleX;
-          const fabricHeight = (obj.height || 0) * scaleY;
-
-          const pdfWidth = fabricWidth * ratioX;
-          const pdfHeightImg = fabricHeight * ratioY;
-
-          const pivotX = (obj.left || 0) * ratioX + cLeft;
-          const pivotY = cHeight - (obj.top || 0) * ratioY + cBottom;
-
-          // Manual Calibration (Iteration 6): PivotX - 13.5, PivotY + 3.5
-          // Image rotation around top-left; bottom-left is the origin for pdf-lib
-          const pdfX = pivotX - 13.5 - Math.sin(rad) * pdfHeightImg;
-          const pdfY = pivotY + 3.5 - Math.cos(rad) * pdfHeightImg;
-
-          console.log("--- IMAGE DIAGNOSTIC (Calibrated) ---");
-          console.log("Editor Image (left, top):", obj.left, obj.top);
-          console.log("Export Image (pdfX, pdfY):", pdfX, pdfY);
-          console.log("------------------------");
-
           textDrawPromises.push(
             (async () => {
               if (!obj.src) return;
@@ -202,13 +186,23 @@
                   imgToDraw = await pdfDoc.embedJpg(obj.src);
                 }
 
-                page.drawImage(imgToDraw, {
-                  x: pdfX,
-                  y: pdfY,
-                  width: pdfWidth,
-                  height: pdfHeightImg,
-                  rotate: degrees(-fabricAngle - pageRotation),
-                });
+                const { drawFabricImageToPdf } =
+                  await import("./lib/pdfTextMatrix");
+                const cropBoxData = {
+                  x: cLeft,
+                  y: cBottom,
+                  width: cWidth,
+                  height: cHeight,
+                };
+
+                await drawFabricImageToPdf(
+                  page,
+                  obj,
+                  viewportDimensions,
+                  cropBoxData,
+                  pageRotation,
+                  imgToDraw,
+                );
               } catch (e) {
                 console.error("Failed to embed image into PDF", e);
               }

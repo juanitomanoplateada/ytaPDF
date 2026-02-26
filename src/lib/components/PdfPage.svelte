@@ -4,17 +4,11 @@
   import * as fabric from "fabric";
   import type { PDFPageProxy } from "pdfjs-dist";
 
-  const deleteIcon =
-    "data:image/svg+xml,%3C%3Fxml version='1.0' encoding='utf-8'%3F%3E%3Csvg version='1.1' id='Layer_1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' x='0px' y='0px' viewBox='0 0 512 512' style='enable-background:new 0 0 512 512;' xml:space='preserve'%3E%3Cpath fill='%23FF0000' d='M256,0C114.615,0,0,114.615,0,256s114.615,256,256,256s256-114.615,256-256S397.385,0,256,0z M341.333,311.168 L311.168,341.333L256,286.165L200.832,341.333l-30.165-30.165L225.835,256l-55.168-55.168l30.165-30.165L256,225.835l55.168-55.168 l30.165,30.165L286.165,256L341.333,311.168z'/%3E%3C/svg%3E";
-
-  const deleteImg = document.createElement("img");
-  deleteImg.src = deleteIcon;
-
   const deleteControl = new fabric.Control({
-    x: 0.5,
+    x: -0.5,
     y: -0.5,
-    offsetY: -8,
-    offsetX: 8,
+    offsetY: -10,
+    offsetX: -10,
     cursorStyle: "pointer",
 
     mouseUpHandler: function (eventData: any, transform: any) {
@@ -30,8 +24,8 @@
 
     render: function (
       ctx: any,
-      left: any,
-      top: any,
+      left: number,
+      top: number,
       styleOverride: any,
       fabricObject: any,
     ) {
@@ -39,26 +33,39 @@
       ctx.save();
       ctx.translate(left, top);
       ctx.rotate(fabric.util.degreesToRadians(fabricObject.angle || 0));
-      ctx.drawImage(deleteImg, -size / 2, -size / 2, size, size);
+
+      // Draw red circle background
+      ctx.beginPath();
+      ctx.arc(0, 0, size / 2, 0, 2 * Math.PI, false);
+      ctx.fillStyle = "#ff4444";
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#fff";
+      ctx.stroke();
+
+      // Draw white 'X'
+      ctx.beginPath();
+      const crossSize = size / 4;
+      ctx.moveTo(-crossSize, -crossSize);
+      ctx.lineTo(crossSize, crossSize);
+      ctx.moveTo(crossSize, -crossSize);
+      ctx.lineTo(-crossSize, crossSize);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#fff";
+      ctx.stroke();
+
       ctx.restore();
     },
 
     // @ts-ignore
-    cornerSize: 24,
+    cornerSize: 22,
   } as any);
 
-  // Initialize controls properly for Fabric.js v7
-  const defaultControls = (fabric as any).controlsUtils
-    ?.createObjectDefaultControls
-    ? (fabric as any).controlsUtils.createObjectDefaultControls()
-    : {};
-
-  (fabric.Object as any).ownDefaults = {
-    ...(fabric.Object as any).ownDefaults,
-    controls: {
-      ...defaultControls,
-      deleteControl,
-    },
+  // Initialize controls properly for Fabric.js v6/v7
+  // Force the control on the default Object prototype
+  fabric.Object.prototype.controls = {
+    ...fabric.Object.prototype.controls,
+    deleteControl: deleteControl,
   };
 
   export let pageProxy: PDFPageProxy;
@@ -172,6 +179,16 @@
               editable: true,
             });
 
+            // Make sure we have the default resize/rotate controls in V6/V7
+            const defaultControls =
+              (fabric as any).controlsUtils?.createObjectDefaultControls() ||
+              fabric.Object.prototype.controls;
+
+            text.controls = {
+              ...defaultControls,
+              deleteControl: deleteControl,
+            };
+
             fabricApp.add(text);
             fabricApp.setActiveObject(text);
             text.enterEditing();
@@ -187,6 +204,19 @@
         fabricApp.loadFromJSON(existing.fabricJSON, () => {
           fabricApp.setDimensions({ width: CSS_w, height: CSS_h });
           fabricApp.setZoom(currentZoom);
+
+          // Ensure all loaded objects have the control but keep defaults
+          const defaultControls =
+            (fabric as any).controlsUtils?.createObjectDefaultControls() ||
+            fabric.Object.prototype.controls;
+
+          fabricApp.getObjects().forEach((obj) => {
+            obj.controls = {
+              ...defaultControls,
+              deleteControl: deleteControl,
+            };
+          });
+
           fabricApp.requestRenderAll();
           setupEvents();
         });
@@ -306,6 +336,17 @@
             left: fabricApp.width! / 2 - img.getScaledWidth() / 2,
             top: fabricApp.height! / 2 - img.getScaledHeight() / 2,
           });
+
+          // Re-apply explicit controls for images
+          const defaultControls =
+            (fabric as any).controlsUtils?.createObjectDefaultControls() ||
+            fabric.Object.prototype.controls;
+
+          img.controls = {
+            ...defaultControls,
+            deleteControl: deleteControl,
+          };
+
           fabricApp.add(img);
           fabricApp.setActiveObject(img);
           savePageToStore();
