@@ -135,14 +135,14 @@
           if (obj.fontFamily === "Courier") fontType = "Courier";
 
           let pdfLibFontId = fontType;
-          if (isBold && isItalic) pdfLibFontId += "-BoldOblique";
-          else if (isBold) pdfLibFontId += "-Bold";
-          else if (isItalic) pdfLibFontId += "-Oblique";
+          if (isBold && isItalic) pdfLibFontId += "BoldOblique";
+          else if (isBold) pdfLibFontId += "Bold";
+          else if (isItalic) pdfLibFontId += "Oblique";
 
-          if (pdfLibFontId === "TimesRoman-Oblique")
-            pdfLibFontId = "TimesRoman-Italic";
-          if (pdfLibFontId === "TimesRoman-BoldOblique")
-            pdfLibFontId = "TimesRoman-BoldItalic";
+          if (pdfLibFontId === "TimesRomanOblique")
+            pdfLibFontId = "TimesRomanItalic";
+          if (pdfLibFontId === "TimesRomanBoldOblique")
+            pdfLibFontId = "TimesRomanBoldItalic";
 
           textDrawPromises.push(
             import("pdf-lib").then(async ({ StandardFonts }) => {
