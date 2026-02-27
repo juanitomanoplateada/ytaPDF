@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="public/ytaPDF.png" alt="ytaPDF Logo" height="120" style="background-color: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin-bottom: 20px;">
+  <img src="public/ytaPDF.png" alt="ytaPDF Logo" height="100%" style="background-color: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin-bottom: 20px;">
 
   # ytaPDF - Editor PDF Web Avanzado
 
