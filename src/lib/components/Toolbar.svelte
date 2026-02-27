@@ -207,6 +207,27 @@
       >
         <FlipVertical size={16} />
       </button>
+
+      <div class="tools-divider-small"></div>
+
+      <div class="opacity-control" title="Opacidad">
+        <label for="opacity-slider" class="opacity-label">Opacidad</label>
+        <input
+          id="opacity-slider"
+          type="range"
+          min="0.1"
+          max="1"
+          step="0.05"
+          value={$editorStore.activeObjectParams.opacity ?? 1}
+          on:input={(e) =>
+            handleModifyObject("opacity", parseFloat(e.currentTarget.value))}
+        />
+        <span class="opacity-value"
+          >{Math.round(
+            ($editorStore.activeObjectParams.opacity ?? 1) * 100,
+          )}%</span
+        >
+      </div>
     </div>
   {/if}
 
@@ -450,6 +471,27 @@
     gap: 4px;
     align-items: center;
     margin-left: 4px;
+  }
+  .opacity-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 8px;
+  }
+  .opacity-label {
+    font-size: 13px;
+    color: #555;
+    font-weight: 500;
+  }
+  .opacity-control input[type="range"] {
+    width: 80px;
+    accent-color: #1976d2;
+    cursor: pointer;
+  }
+  .opacity-value {
+    font-size: 13px;
+    color: #555;
+    min-width: 35px;
   }
   button.swatch {
     width: 20px;

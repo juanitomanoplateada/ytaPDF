@@ -240,6 +240,7 @@
         angle: activeObj.angle || 0,
         flipX: !!activeObj.flipX,
         flipY: !!activeObj.flipY,
+        opacity: activeObj.opacity !== undefined ? activeObj.opacity : 1,
       };
 
       if (activeObj.type === "i-text" || activeObj.type === "text") {
@@ -301,6 +302,8 @@
         activeObj.set("flipX", !activeObj.flipX);
       } else if (action === "flipY") {
         activeObj.set("flipY", !activeObj.flipY);
+      } else if (action === "opacity") {
+        activeObj.set("opacity", value);
       }
 
       fabricApp.requestRenderAll();

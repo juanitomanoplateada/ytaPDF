@@ -93,12 +93,15 @@ export async function drawFabricTextToPdf(
   }
   const textColor = rgb(fillRgb.r, fillRgb.g, fillRgb.b);
 
+  const opacity = obj.opacity !== undefined ? obj.opacity : 1;
+
   page.drawText(obj.text || "", {
     x: localX,
     y: localY,
     size: finalFontSize,
     font: fontToUse,
     color: textColor,
+    opacity: opacity,
   });
 
   if (obj.underline) {
@@ -111,6 +114,7 @@ export async function drawFabricTextToPdf(
       end: { x: localX + textWidth, y: localY - uOffset },
       thickness: underlineThickness,
       color: textColor,
+      opacity: opacity,
     });
   }
 
@@ -183,12 +187,14 @@ export async function drawFabricImageToPdf(
 
   const localX = - ((obj.width || 0) / 2);
   const localY = - ((obj.height || 0) / 2);
+  const opacity = obj.opacity !== undefined ? obj.opacity : 1;
 
   page.drawImage(imgToDraw, {
     x: localX,
     y: localY,
     width: obj.width || 0,
     height: obj.height || 0,
+    opacity: opacity,
   });
 
   page.pushOperators(popGraphicsState());

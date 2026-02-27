@@ -32,6 +32,7 @@ export interface RootState {
     angle: number;
     flipX: boolean;
     flipY: boolean;
+    opacity: number;
   } | null;
   history: Record<number, PageAnnotation>[];
   historyIndex: number;
