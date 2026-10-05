@@ -1,10 +1,12 @@
 import { StaticCanvas } from "fabric";
 import type { PageAnnotations, PageRef, SourceDocument } from "./editor.svelte";
+import { ensureFontsFor } from "./embeddedFonts";
 import { renderPage } from "./pdfjs";
 
 /**
- * Rendered page bitmaps, keyed by source page and pixel width, so annotation
- * changes only repaint the overlay instead of re-rasterising the PDF page.
+ * Rendered page bitmaps, keyed by source page, rotation, form revision and
+ * pixel width, so annotation changes only repaint the overlay instead of
+ * re-rasterising the PDF page.
  */
 const pageBitmaps = new Map<string, ImageBitmap>();
 const CACHE_LIMIT = 150;
@@ -28,16 +30,17 @@ async function pageBitmap(
   page: PageRef,
   cssWidth: number,
   pixelRatio: number,
+  formRevision: number,
   signal: AbortSignal,
 ): Promise<ImageBitmap | null> {
-  const key = `${source.id}:${page.sourceIndex}:${Math.round(cssWidth * pixelRatio)}`;
+  const key = `${source.id}:${page.sourceIndex}:${page.rotation}:${formRevision}:${Math.round(cssWidth * pixelRatio)}`;
   const cached = pageBitmaps.get(key);
   if (cached) return cached;
 
   const pdfPage = await source.pdf.getPage(page.sourceIndex + 1);
   if (signal.aborted) return null;
   const scratch = document.createElement("canvas");
-  const task = renderPage(pdfPage, scratch, cssWidth / page.width, pixelRatio);
+  const task = renderPage(pdfPage, scratch, cssWidth / page.width, pixelRatio, page.rotation);
   const cancel = () => task.cancel();
   signal.addEventListener("abort", cancel, { once: true });
   try {
@@ -57,6 +60,7 @@ export async function paintAnnotations(
   scale: number,
   signal?: AbortSignal,
 ): Promise<void> {
+  await ensureFontsFor(data.objects);
   const element = document.createElement("canvas");
   const overlay = new StaticCanvas(element, {
     width: ctx.canvas.width,
@@ -84,10 +88,11 @@ export async function renderThumbnail(
   page: PageRef,
   cssWidth: number,
   annotations: PageAnnotations | undefined,
+  formRevision: number,
   signal: AbortSignal,
 ): Promise<void> {
   const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-  const bitmap = await pageBitmap(source, page, cssWidth, pixelRatio, signal);
+  const bitmap = await pageBitmap(source, page, cssWidth, pixelRatio, formRevision, signal);
   if (!bitmap || signal.aborted) return;
 
   const scratch = document.createElement("canvas");

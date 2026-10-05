@@ -6,7 +6,7 @@
 
 export type EmbeddableMime = "image/png" | "image/jpeg";
 
-interface ImageAsset {
+export interface ImageAsset {
   bytes: Uint8Array;
   mime: EmbeddableMime;
 }
@@ -15,6 +15,13 @@ const assets = new Map<string, ImageAsset>();
 
 export function getImageAsset(url: string): ImageAsset | undefined {
   return assets.get(url);
+}
+
+/** Registers image bytes (for example, from a recovered session) under a new URL. */
+export function registerImage(asset: ImageAsset): string {
+  const url = URL.createObjectURL(new Blob([asset.bytes as BlobPart], { type: asset.mime }));
+  assets.set(url, asset);
+  return url;
 }
 
 export function releaseImageAssets(): void {
@@ -44,10 +51,7 @@ export async function importImage(file: Blob): Promise<string> {
   } else {
     asset = await reencode(file, kind);
   }
-
-  const url = URL.createObjectURL(new Blob([asset.bytes as BlobPart], { type: asset.mime }));
-  assets.set(url, asset);
-  return url;
+  return registerImage(asset);
 }
 
 type ImageKind = "png" | "jpeg" | "svg" | "other";

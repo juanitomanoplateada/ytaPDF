@@ -1,17 +1,36 @@
 <script lang="ts">
   import {
+    ArrowDown,
+    ArrowUp,
     Bold,
+    BringToFront,
+    Circle,
+    CopyPlus,
     Download,
+    EllipsisVertical,
+    EyeOff,
     FlipHorizontal2,
     FlipVertical2,
+    Highlighter,
+    History,
     Image as ImageIcon,
     Italic,
+    Keyboard,
     LayoutGrid,
-    Menu,
+    Lock,
+    LockOpen,
+    Menu as MenuIcon,
+    Minus,
+    MonitorDown,
     MousePointer2,
+    MoveUpRight,
     Redo2,
     RotateCcw,
     RotateCw,
+    SendToBack,
+    Shapes,
+    Signature,
+    Square,
     Trash2,
     Type,
     Underline,
@@ -20,13 +39,18 @@
     ZoomIn,
     ZoomOut,
   } from "lucide-svelte";
-  import { editor, type TextStyle } from "../editor.svelte";
-  import { FONT_FAMILIES, familyFromCss } from "../fonts";
+  import { editor, type DrawTool, type ShapeStyle, type TextStyle } from "../editor.svelte";
+  import { ensureFamilyLoaded } from "../embeddedFonts";
+  import { FONT_FAMILIES, familyFromCss, type EmbeddedFamilyId } from "../fonts";
+  import { notifications } from "../notifications.svelte";
+  import { pwa } from "../pwa.svelte";
   import ConfirmModal from "./ConfirmModal.svelte";
+  import Menu from "./Menu.svelte";
 
   let { onopenfiles }: { onopenfiles: () => void } = $props();
 
   const FONT_SIZES = [8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 60, 72, 96];
+  const STROKE_WIDTHS = [1, 2, 3, 4, 6, 8, 12];
   const SWATCHES = [
     { color: "#000000", name: "Negro" },
     { color: "#ffffff", name: "Blanco" },
@@ -34,21 +58,64 @@
     { color: "#1976d2", name: "Azul" },
     { color: "#2e7d32", name: "Verde" },
   ];
+  const HIGHLIGHTS = [
+    { color: "#ffe14d", name: "Amarillo" },
+    { color: "#7ee081", name: "Verde" },
+    { color: "#ff9ec7", name: "Rosa" },
+    { color: "#7fc8ff", name: "Azul" },
+  ];
+  const SHAPE_TOOLS: { tool: DrawTool; label: string; icon: typeof Square; hint: string }[] = [
+    { tool: "rect", label: "Rectángulo", icon: Square, hint: "Arrastra sobre la página para dibujar un rectángulo. Con Mayús, un cuadrado." },
+    { tool: "ellipse", label: "Elipse", icon: Circle, hint: "Arrastra sobre la página para dibujar una elipse. Con Mayús, un círculo." },
+    { tool: "line", label: "Línea", icon: Minus, hint: "Arrastra para trazar una línea. Con Mayús, en ángulos de 45°." },
+    { tool: "arrow", label: "Flecha", icon: MoveUpRight, hint: "Arrastra desde el origen hasta donde debe apuntar la flecha." },
+    { tool: "highlight", label: "Resaltador", icon: Highlighter, hint: "Arrastra sobre el texto que quieras resaltar." },
+    {
+      tool: "redact",
+      label: "Censurar",
+      icon: EyeOff,
+      hint: "Arrastra sobre lo que quieras ocultar. Al exportar, la página se convierte en imagen y el contenido tapado se elimina de verdad.",
+    },
+  ];
 
   let imageInput = $state<HTMLInputElement>();
   let confirmClose = $state(false);
 
   const inEditor = $derived(editor.hasDocument && editor.view === "editor");
   const selection = $derived(editor.selection);
+  const locked = $derived(selection?.locked ?? false);
+  const activeShape = $derived(SHAPE_TOOLS.find((s) => s.tool === editor.tool));
+  const ShapeIcon = $derived(activeShape?.icon ?? Shapes);
+
   /** Text controls edit the selected text, or the style of the next text. */
-  const showTextControls = $derived(inEditor && (selection?.text != null || editor.tool === "text"));
+  const showTextControls = $derived(selection ? selection.text !== null && !locked : editor.tool === "text");
   const textStyle = $derived<TextStyle>(selection?.text ?? editor.textStyle);
-  // The properties row is always present in the editor so the page never jumps
-  // when a tool is picked or something gets selected.
-  const showContextBar = $derived(inEditor);
+
+  const showShapeControls = $derived(
+    selection ? selection.shape !== null && !locked : ["rect", "ellipse", "line", "arrow"].includes(editor.tool),
+  );
+  const shapeStyle = $derived<ShapeStyle>(selection?.shape ?? editor.shapeStyle);
+  const showFill = $derived(
+    selection ? ["rect", "ellipse", "multiple"].includes(selection.kind) : editor.tool === "rect" || editor.tool === "ellipse",
+  );
+  const showHighlight = $derived(selection ? selection.highlight !== null && !locked : editor.tool === "highlight");
+  const highlightColor = $derived(selection?.highlight ?? editor.highlightColor);
 
   function setStyle(style: Partial<TextStyle>) {
     editor.applyTextStyle(style);
+  }
+
+  async function setFont(css: string) {
+    const option = familyFromCss(css);
+    if (option.embedded) {
+      try {
+        await ensureFamilyLoaded(option.id as EmbeddedFamilyId);
+      } catch {
+        notifications.error(`No se pudo cargar la fuente ${option.label}.`);
+        return;
+      }
+    }
+    setStyle({ fontFamily: css });
   }
 
   function onFontSize(event: Event) {
@@ -67,6 +134,17 @@
     if (editor.isDirty) confirmClose = true;
     else editor.closeDocument();
   }
+
+  function pickTool(tool: DrawTool) {
+    editor.tool = editor.tool === tool ? "select" : tool;
+  }
+
+  const hint = $derived(
+    activeShape?.hint ??
+      (editor.tool === "text"
+        ? "Haz clic en la página donde quieras escribir."
+        : "Selecciona un elemento para editarlo, o añade texto, imágenes, firmas y formas."),
+  );
 </script>
 
 {#snippet zoomControls(placement: string)}
@@ -83,12 +161,56 @@
   </div>
 {/snippet}
 
+{#snippet historyControls(placement: string)}
+  <div class="group {placement}">
+    <button
+      class="icon"
+      title="Deshacer (Ctrl Z)"
+      aria-label="Deshacer"
+      disabled={!editor.canUndo}
+      onclick={() => editor.undo()}
+    >
+      <Undo2 size={18} />
+    </button>
+    <button
+      class="icon"
+      title="Rehacer (Ctrl Y)"
+      aria-label="Rehacer"
+      disabled={!editor.canRedo}
+      onclick={() => editor.redo()}
+    >
+      <Redo2 size={18} />
+    </button>
+  </div>
+{/snippet}
+
+{#snippet colorPicker(label: string, value: string, onpick: (color: string) => void)}
+  <input
+    class="color"
+    type="color"
+    aria-label={label}
+    title={label}
+    {value}
+    oninput={(event) => onpick(event.currentTarget.value)}
+  />
+  {#each SWATCHES as swatch (swatch.color)}
+    <button
+      class="swatch"
+      class:selected={value === swatch.color}
+      style:background-color={swatch.color}
+      title="{label}: {swatch.name.toLowerCase()}"
+      aria-label="{label}: {swatch.name.toLowerCase()}"
+      onclick={() => onpick(swatch.color)}
+    ></button>
+  {/each}
+{/snippet}
+
 <header class="toolbar">
   <div class="row">
     <div class="brand">
       {#if inEditor}
         <button class="icon menu" aria-label="Mostrar páginas" onclick={() => (editor.sidebarOpen = true)}>
-          <Menu size={20} />
+          <MenuIcon size={20} />
         </button>
       {/if}
       <img src="/paty.png" alt="" class="logo" />
@@ -125,14 +247,41 @@
           <ImageIcon size={18} />
           <span class="hide-mobile">Imagen</span>
         </button>
-        <input
-          bind:this={imageInput}
-          type="file"
-          accept="image/*"
-          multiple
-          hidden
-          onchange={onImageChosen}
-        />
+        <button
+          class="icon labeled"
+          title="Añadir una firma manuscrita"
+          aria-label="Añadir firma"
+          onclick={() => (editor.signatureOpen = true)}
+        >
+          <Signature size={18} />
+          <span class="hide-mobile">Firma</span>
+        </button>
+        <Menu label="Formas y marcas" triggerClass="icon labeled" active={activeShape !== undefined}>
+          {#snippet trigger()}
+            <ShapeIcon size={18} />
+            <span class="hide-mobile">{activeShape?.label ?? "Formas"}</span>
+          {/snippet}
+          {#snippet children(close)}
+            {#each SHAPE_TOOLS as shape (shape.tool)}
+              <button
+                role="menuitemradio"
+                aria-checked={editor.tool === shape.tool}
+                onclick={() => {
+                  pickTool(shape.tool);
+                  close();
+                }}
+              >
+                <shape.icon size={18} />
+                {shape.label}
+              </button>
+              {#if shape.tool === "arrow"}
+                <div class="menu-separator" role="separator"></div>
+              {/if}
+            {/each}
+            <p class="menu-note">La censura elimina el contenido tapado al exportar.</p>
+          {/snippet}
+        </Menu>
+        <input bind:this={imageInput} type="file" accept="image/*" multiple hidden onchange={onImageChosen} />
       </div>
     {/if}
 
@@ -148,26 +297,7 @@
         </button>
       {/if}
 
-      <div class="group">
-        <button
-          class="icon"
-          title="Deshacer (Ctrl Z)"
-          aria-label="Deshacer"
-          disabled={!editor.canUndo}
-          onclick={() => editor.undo()}
-        >
-          <Undo2 size={18} />
-        </button>
-        <button
-          class="icon"
-          title="Rehacer (Ctrl Y)"
-          aria-label="Rehacer"
-          disabled={!editor.canRedo}
-          onclick={() => editor.redo()}
-        >
-          <Redo2 size={18} />
-        </button>
-      </div>
+      {@render historyControls("history")}
 
       <button
         class="primary"
@@ -179,25 +309,89 @@
         <Download size={18} />
         <span class="hide-mobile">Exportar PDF</span>
       </button>
-      <button class="icon" title="Cerrar documento" aria-label="Cerrar documento" onclick={requestClose}>
-        <X size={20} />
-      </button>
     {:else}
       <div class="spacer"></div>
       <button class="primary" onclick={onopenfiles}>Abrir PDF</button>
     {/if}
+
+    <Menu label="Más opciones" align="end">
+      {#snippet trigger()}
+        <EllipsisVertical size={20} />
+      {/snippet}
+      {#snippet children(close)}
+        <button
+          role="menuitemcheckbox"
+          aria-checked={editor.recoveryEnabled}
+          onclick={() => {
+            editor.setRecovery(!editor.recoveryEnabled);
+            close();
+          }}
+        >
+          <History size={18} />
+          Recuperar el trabajo al volver
+          <span class="switch" aria-hidden="true"></span>
+        </button>
+        <p class="menu-note">
+          Guarda una copia del documento en este navegador mientras trabajas. No se envía a ningún sitio.
+        </p>
+        <button
+          role="menuitem"
+          onclick={() => {
+            editor.shortcutsOpen = true;
+            close();
+          }}
+        >
+          <Keyboard size={18} />
+          Atajos de teclado
+          <span class="shortcut">?</span>
+        </button>
+        {#if pwa.canInstall}
+          <button
+            role="menuitem"
+            onclick={() => {
+              close();
+              void pwa.install();
+            }}
+          >
+            <MonitorDown size={18} />
+            Instalar la aplicación
+          </button>
+        {/if}
+        {#if editor.hasDocument}
+          <div class="menu-separator" role="separator"></div>
+          <button
+            role="menuitem"
+            onclick={() => {
+              close();
+              requestClose();
+            }}
+          >
+            <X size={18} />
+            Cerrar documento
+          </button>
+        {/if}
+      {/snippet}
+    </Menu>
+
+    {#if editor.hasDocument}
+      <button class="icon close-doc" title="Cerrar documento" aria-label="Cerrar documento" onclick={requestClose}>
+        <X size={20} />
+      </button>
+    {/if}
   </div>
 
-  {#if showContextBar}
+  {#if inEditor}
     <div class="row context" role="toolbar" aria-label="Propiedades">
       {@render zoomControls("zoom-compact")}
+      {@render historyControls("history-compact")}
+
       {#if showTextControls}
         <div class="group">
           <select
             class="font"
             aria-label="Fuente"
             value={familyFromCss(textStyle.fontFamily).css}
-            onchange={(event) => setStyle({ fontFamily: event.currentTarget.value })}
+            onchange={(event) => void setFont(event.currentTarget.value)}
           >
             {#each FONT_FAMILIES as family (family.id)}
               <option value={family.css}>{family.label}</option>
@@ -220,28 +414,9 @@
             {/each}
           </datalist>
         </div>
-
         <div class="group">
-          <input
-            class="color"
-            type="color"
-            aria-label="Color del texto"
-            title="Color del texto"
-            value={textStyle.fill}
-            oninput={(event) => setStyle({ fill: event.currentTarget.value })}
-          />
-          {#each SWATCHES as swatch (swatch.color)}
-            <button
-              class="swatch"
-              class:selected={textStyle.fill === swatch.color}
-              style:background-color={swatch.color}
-              title={swatch.name}
-              aria-label="Color {swatch.name.toLowerCase()}"
-              onclick={() => setStyle({ fill: swatch.color })}
-            ></button>
-          {/each}
+          {@render colorPicker("Color del texto", textStyle.fill, (fill) => setStyle({ fill }))}
         </div>
-
         <div class="group">
           <button
             class="icon"
@@ -276,56 +451,174 @@
         </div>
       {/if}
 
-      {#if selection}
+      {#if showShapeControls}
         <div class="group">
-          <button class="icon" title="Girar a la izquierda" aria-label="Girar a la izquierda" onclick={() => editor.rotateSelection(-90)}>
-            <RotateCcw size={16} />
-          </button>
-          <button class="icon" title="Girar a la derecha" aria-label="Girar a la derecha" onclick={() => editor.rotateSelection(90)}>
-            <RotateCw size={16} />
+          <span class="label">Trazo</span>
+          {@render colorPicker("Color del trazo", shapeStyle.stroke, (stroke) => editor.applyShapeStyle({ stroke }))}
+          <select
+            class="stroke-width"
+            aria-label="Grosor del trazo"
+            value={STROKE_WIDTHS.includes(shapeStyle.strokeWidth) ? shapeStyle.strokeWidth : 3}
+            onchange={(event) => editor.applyShapeStyle({ strokeWidth: Number(event.currentTarget.value) })}
+          >
+            {#each STROKE_WIDTHS as width (width)}
+              <option value={width}>{width} pt</option>
+            {/each}
+          </select>
+        </div>
+        {#if showFill}
+          <div class="group">
+            <span class="label">Relleno</span>
+            <button
+              class="swatch none"
+              class:selected={shapeStyle.fill === null}
+              title="Sin relleno"
+              aria-label="Sin relleno"
+              onclick={() => editor.applyShapeStyle({ fill: null })}
+            ></button>
+            <input
+              class="color"
+              type="color"
+              aria-label="Color de relleno"
+              title="Color de relleno"
+              value={shapeStyle.fill ?? "#ffffff"}
+              oninput={(event) => editor.applyShapeStyle({ fill: event.currentTarget.value })}
+            />
+          </div>
+        {/if}
+      {/if}
+
+      {#if showHighlight}
+        <div class="group">
+          <span class="label">Resaltado</span>
+          {#each HIGHLIGHTS as swatch (swatch.color)}
+            <button
+              class="swatch"
+              class:selected={highlightColor === swatch.color}
+              style:background-color={swatch.color}
+              title={swatch.name}
+              aria-label="Resaltado {swatch.name.toLowerCase()}"
+              onclick={() => editor.setHighlightColor(swatch.color)}
+            ></button>
+          {/each}
+        </div>
+      {/if}
+
+      {#if selection}
+        {#if !locked}
+          <div class="group">
+            <button class="icon" title="Girar a la izquierda" aria-label="Girar a la izquierda" onclick={() => editor.rotateSelection(-90)}>
+              <RotateCcw size={16} />
+            </button>
+            <button class="icon" title="Girar a la derecha" aria-label="Girar a la derecha" onclick={() => editor.rotateSelection(90)}>
+              <RotateCw size={16} />
+            </button>
+            <button
+              class="icon"
+              class:active={selection.flipX}
+              aria-pressed={selection.flipX}
+              title="Voltear horizontalmente"
+              aria-label="Voltear horizontalmente"
+              onclick={() => editor.flipSelection("x")}
+            >
+              <FlipHorizontal2 size={16} />
+            </button>
+            <button
+              class="icon"
+              class:active={selection.flipY}
+              aria-pressed={selection.flipY}
+              title="Voltear verticalmente"
+              aria-label="Voltear verticalmente"
+              onclick={() => editor.flipSelection("y")}
+            >
+              <FlipVertical2 size={16} />
+            </button>
+          </div>
+        {/if}
+
+        <div class="group" role="group" aria-label="Orden de capas">
+          <button
+            class="icon"
+            title="Traer al frente (Ctrl Mayús ])"
+            aria-label="Traer al frente"
+            disabled={!selection.canRaise}
+            onclick={() => editor.arrangeSelection("front")}
+          >
+            <BringToFront size={16} />
           </button>
           <button
             class="icon"
-            class:active={selection.flipX}
-            aria-pressed={selection.flipX}
-            title="Voltear horizontalmente"
-            aria-label="Voltear horizontalmente"
-            onclick={() => editor.flipSelection("x")}
+            title="Traer adelante (Ctrl ])"
+            aria-label="Traer adelante"
+            disabled={!selection.canRaise}
+            onclick={() => editor.arrangeSelection("forward")}
           >
-            <FlipHorizontal2 size={16} />
+            <ArrowUp size={16} />
           </button>
           <button
             class="icon"
-            class:active={selection.flipY}
-            aria-pressed={selection.flipY}
-            title="Voltear verticalmente"
-            aria-label="Voltear verticalmente"
-            onclick={() => editor.flipSelection("y")}
+            title="Enviar atrás (Ctrl [)"
+            aria-label="Enviar atrás"
+            disabled={!selection.canLower}
+            onclick={() => editor.arrangeSelection("backward")}
           >
-            <FlipVertical2 size={16} />
+            <ArrowDown size={16} />
+          </button>
+          <button
+            class="icon"
+            title="Enviar al fondo (Ctrl Mayús [)"
+            aria-label="Enviar al fondo"
+            disabled={!selection.canLower}
+            onclick={() => editor.arrangeSelection("back")}
+          >
+            <SendToBack size={16} />
           </button>
         </div>
 
-        <label class="group opacity">
-          <span>Opacidad</span>
-          <input
-            type="range"
-            min="0.1"
-            max="1"
-            step="0.05"
-            value={selection.opacity}
-            oninput={(event) => editor.setSelectionOpacity(Number(event.currentTarget.value))}
-          />
-          <span class="value">{Math.round(selection.opacity * 100)}%</span>
-        </label>
+        {#if !locked}
+          <label class="group opacity">
+            <span>Opacidad</span>
+            <input
+              type="range"
+              min="0.1"
+              max="1"
+              step="0.05"
+              value={selection.opacity}
+              oninput={(event) => editor.setSelectionOpacity(Number(event.currentTarget.value))}
+            />
+            <span class="value">{Math.round(selection.opacity * 100)}%</span>
+          </label>
+        {/if}
 
-        <button class="icon danger" title="Eliminar (Supr)" aria-label="Eliminar selección" onclick={() => editor.deleteSelection()}>
-          <Trash2 size={16} />
-        </button>
-      {:else if editor.tool === "text"}
-        <span class="hint">Haz clic en la página donde quieras escribir.</span>
+        <div class="group">
+          <button class="icon" title="Duplicar (Ctrl D)" aria-label="Duplicar" onclick={() => void editor.duplicateSelection()}>
+            <CopyPlus size={16} />
+          </button>
+          <button
+            class="icon"
+            class:active={locked}
+            aria-pressed={locked}
+            title={locked ? "Desbloquear (Ctrl L)" : "Bloquear para que no se mueva (Ctrl L)"}
+            aria-label={locked ? "Desbloquear" : "Bloquear"}
+            onclick={() => editor.toggleLockSelection()}
+          >
+            {#if locked}<Lock size={16} />{:else}<LockOpen size={16} />{/if}
+          </button>
+          <button
+            class="icon danger"
+            title="Eliminar (Supr)"
+            aria-label="Eliminar selección"
+            disabled={locked}
+            onclick={() => editor.deleteSelection()}
+          >
+            <Trash2 size={16} />
+          </button>
+        </div>
+        {#if locked}
+          <span class="hint">Bloqueado: no se puede mover ni editar hasta desbloquearlo.</span>
+        {/if}
       {:else}
-        <span class="hint">Selecciona un texto o una imagen para editarlo, o añade contenido con Texto e Imagen.</span>
+        <span class="hint">{hint}</span>
       {/if}
     </div>
   {/if}
@@ -416,12 +709,17 @@
   .spacer {
     flex: 1;
   }
-  button {
+  .label {
+    margin-right: 2px;
+    color: var(--color-text-muted);
+    font-size: 13px;
+  }
+  .toolbar :global(button) {
     border: none;
     background: transparent;
     cursor: pointer;
   }
-  .icon {
+  .toolbar :global(.icon) {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -434,27 +732,28 @@
     flex-shrink: 0;
     transition: background 0.15s;
   }
-  .icon:hover:not(:disabled) {
+  .toolbar :global(.icon:hover:not(:disabled)) {
     background: var(--color-surface-muted);
     color: var(--color-text);
   }
-  .icon.active {
+  .toolbar :global(.icon.active) {
     background: var(--color-primary-soft);
     color: var(--color-primary);
   }
-  .icon:disabled {
+  .toolbar :global(.icon:disabled) {
     opacity: 0.4;
     cursor: not-allowed;
   }
   .icon.danger {
     color: var(--color-danger);
   }
-  .icon.danger:hover {
+  .icon.danger:hover:not(:disabled) {
     background: var(--color-danger-soft);
     color: var(--color-danger);
   }
   .menu,
-  .zoom-compact {
+  .zoom-compact,
+  .history-compact {
     display: none;
   }
   .zoom-value {
@@ -475,21 +774,22 @@
     height: 36px;
     padding: 0 16px;
     border-radius: var(--radius-sm);
-    background: var(--color-primary);
+    background: var(--color-primary) !important;
     color: white;
     font-weight: 500;
     flex-shrink: 0;
     white-space: nowrap;
   }
   .primary:hover:not(:disabled) {
-    background: var(--color-primary-hover);
+    background: var(--color-primary-hover) !important;
   }
   .primary:disabled {
     opacity: 0.6;
     cursor: progress;
   }
   .font,
-  .size {
+  .size,
+  .stroke-width {
     height: 32px;
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
@@ -526,6 +826,11 @@
     outline: 2px solid var(--color-primary);
     outline-offset: 2px;
   }
+  .swatch.none {
+    background:
+      linear-gradient(135deg, transparent 45%, var(--color-danger) 45%, var(--color-danger) 55%, transparent 55%),
+      #fff !important;
+  }
   .opacity {
     gap: 8px;
     color: var(--color-text-muted);
@@ -555,10 +860,13 @@
     .title,
     .doc-name,
     .hide-mobile,
-    .zoom {
-      display: none;
+    .zoom,
+    .history,
+    .close-doc {
+      display: none !important;
     }
-    .zoom-compact {
+    .zoom-compact,
+    .history-compact {
       display: flex;
       padding-right: 6px;
       border-right: 1px solid var(--color-border);

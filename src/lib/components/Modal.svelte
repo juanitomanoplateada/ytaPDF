@@ -5,9 +5,10 @@
     title: string;
     onclose: () => void;
     children: Snippet;
+    wide?: boolean;
   }
 
-  let { title, onclose, children }: Props = $props();
+  let { title, onclose, children, wide = false }: Props = $props();
 
   let dialog: HTMLDivElement;
   const titleId = `modal-title-${Math.random().toString(36).slice(2)}`;
@@ -55,6 +56,7 @@
 >
   <div
     class="dialog"
+    class:wide
     role="dialog"
     aria-modal="true"
     aria-labelledby={titleId}
@@ -85,6 +87,9 @@
     background: var(--color-surface);
     box-shadow: var(--shadow-lg);
     animation: pop-in 0.18s ease-out;
+  }
+  .dialog.wide {
+    width: min(600px, 100%);
   }
   .dialog:focus {
     outline: none;

@@ -1,17 +1,29 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import "./lib/fabricSetup";
-  import { editor } from "./lib/editor.svelte";
+  import { editor, type ArrangeAction } from "./lib/editor.svelte";
   import { notifications } from "./lib/notifications.svelte";
+  import { pwa } from "./lib/pwa.svelte";
   import GridOrganizer from "./lib/components/GridOrganizer.svelte";
   import PasswordModal from "./lib/components/PasswordModal.svelte";
+  import ShortcutsModal from "./lib/components/ShortcutsModal.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
+  import SignatureModal from "./lib/components/SignatureModal.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
   import Toolbar from "./lib/components/Toolbar.svelte";
   import Welcome from "./lib/components/Welcome.svelte";
   import Workspace from "./lib/components/Workspace.svelte";
 
+  /** Marks clipboard content copied from this app, to paste it back as objects. */
+  const CLIPBOARD_TYPE = "application/x-ytapdf-objects";
+
   let fileInput: HTMLInputElement;
   let dragDepth = $state(0);
+
+  onMount(() => {
+    pwa.init((files) => void editor.openFiles(files));
+    void editor.checkRecovery();
+  });
 
   function openFilePicker() {
     fileInput.click();
@@ -76,11 +88,30 @@
     );
   }
 
+  function modalOpen() {
+    return document.querySelector("[role='dialog']") !== null;
+  }
+
+  /** Ctrl+] / Ctrl+[ (also with the physical bracket keys and Ctrl+↑/↓). */
+  function arrangeShortcut(event: KeyboardEvent): ArrangeAction | null {
+    const up = event.key === "]" || event.key === "}" || event.code === "BracketRight" || event.key === "ArrowUp";
+    const down = event.key === "[" || event.key === "{" || event.code === "BracketLeft" || event.key === "ArrowDown";
+    if (up) return event.shiftKey ? "front" : "forward";
+    if (down) return event.shiftKey ? "back" : "backward";
+    return null;
+  }
+
   function onkeydown(event: KeyboardEvent) {
-    if (editor.passwordRequest) return;
+    if (editor.passwordRequest || modalOpen()) return;
     const mod = event.ctrlKey || event.metaKey;
     const key = event.key.toLowerCase();
     const typing = isTypingTarget(event.target);
+
+    if (!typing && event.key === "?") {
+      event.preventDefault();
+      editor.shortcutsOpen = true;
+      return;
+    }
 
     if (mod && key === "o") {
       event.preventDefault();
@@ -120,6 +151,24 @@
       editor.setZoom(1);
       return;
     }
+    if (editor.view === "editor" && editor.selection && mod) {
+      const arrange = arrangeShortcut(event);
+      if (arrange) {
+        event.preventDefault();
+        editor.arrangeSelection(arrange);
+        return;
+      }
+      if (key === "d") {
+        event.preventDefault();
+        void editor.duplicateSelection();
+        return;
+      }
+      if (key === "l") {
+        event.preventDefault();
+        editor.toggleLockSelection();
+        return;
+      }
+    }
     if (mod || event.altKey || editor.view !== "editor") return;
 
     if (event.key === "Escape") {
@@ -151,6 +200,50 @@
     }
   }
 
+  // ── Clipboard ────────────────────────────────────────────────────────────
+
+  function canUseClipboard(event: ClipboardEvent) {
+    return editor.hasDocument && editor.view === "editor" && !isTypingTarget(event.target) && !modalOpen();
+  }
+
+  function copyTo(event: ClipboardEvent, text: string | null) {
+    if (text === null) return;
+    event.preventDefault();
+    event.clipboardData?.setData("text/plain", text);
+    event.clipboardData?.setData(CLIPBOARD_TYPE, "1");
+  }
+
+  function oncopy(event: ClipboardEvent) {
+    if (canUseClipboard(event) && editor.selection) copyTo(event, editor.copySelection());
+  }
+
+  function oncut(event: ClipboardEvent) {
+    if (canUseClipboard(event) && editor.selection) copyTo(event, editor.cutSelection());
+  }
+
+  async function onpaste(event: ClipboardEvent) {
+    const data = event.clipboardData;
+    if (!data || !canUseClipboard(event)) return;
+    const files = [...data.files];
+    const images = files.filter((file) => file.type.startsWith("image/"));
+    const pdfs = files.filter(isPdf);
+    const text = data.getData("text/plain");
+    event.preventDefault();
+
+    const own = data.types.includes(CLIPBOARD_TYPE) || (files.length === 0 && editor.isOwnClipboardText(text));
+    if (own && editor.hasClipboard) {
+      await editor.pasteObjects();
+    } else if (pdfs.length > 0) {
+      await editor.openFiles(pdfs);
+    } else if (images.length > 0) {
+      for (const image of images) await editor.addImage(image);
+    } else if (text.trim()) {
+      editor.addTextFromClipboard(text);
+    } else if (editor.hasClipboard) {
+      await editor.pasteObjects();
+    }
+  }
+
   function onbeforeunload(event: BeforeUnloadEvent) {
     if (!editor.isDirty) return;
     event.preventDefault();
@@ -166,6 +259,9 @@
 
 <svelte:window
   {onkeydown}
+  {oncopy}
+  {oncut}
+  {onpaste}
   {onbeforeunload}
   {onscroll}
   {ondragenter}
@@ -222,6 +318,14 @@
         {editor.busy}
       </div>
     </div>
+  {/if}
+
+  {#if editor.signatureOpen}
+    <SignatureModal />
+  {/if}
+
+  {#if editor.shortcutsOpen}
+    <ShortcutsModal />
   {/if}
 
   {#if editor.passwordRequest}

@@ -1,5 +1,5 @@
 import * as pdfjsLib from "pdfjs-dist";
-import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
+import type { PageViewport, PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
 import workerSrc from "pdfjs-dist/build/pdf.worker.mjs?url";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
@@ -61,31 +61,212 @@ export function isRenderCancelled(error: unknown): boolean {
 }
 
 /**
+ * Viewport of a page with an extra rotation on top of its own `/Rotate`, as
+ * the editor shows it. At scale 1 its units are PDF points.
+ */
+export function viewportOf(page: PDFPageProxy, scale: number, extraRotation = 0): PageViewport {
+  return page.getViewport({ scale, rotation: (page.rotate + extraRotation) % 360 });
+}
+
+/**
  * Renders `page` into `canvas` at `scale` CSS pixels per PDF point, using the
- * device pixel ratio for sharpness. The returned task can be cancelled.
+ * device pixel ratio for sharpness. Form fields are drawn with the values held
+ * in the document's annotation storage. The returned task can be cancelled.
  */
 export function renderPage(
   page: PDFPageProxy,
   canvas: HTMLCanvasElement,
   scale: number,
   pixelRatio = window.devicePixelRatio || 1,
+  extraRotation = 0,
 ): RenderTask {
-  const cssViewport = page.getViewport({ scale });
+  const cssViewport = viewportOf(page, scale, extraRotation);
   const outputScale = clampOutputScale(cssViewport.width, cssViewport.height, pixelRatio);
-  const viewport = page.getViewport({ scale: scale * outputScale });
+  const viewport = viewportOf(page, scale * outputScale, extraRotation);
 
   canvas.width = Math.max(1, Math.floor(viewport.width));
   canvas.height = Math.max(1, Math.floor(viewport.height));
   canvas.style.width = `${cssViewport.width}px`;
   canvas.style.height = `${cssViewport.height}px`;
 
-  return page.render({ canvas, viewport });
+  return page.render({
+    canvas,
+    viewport,
+    annotationMode: pdfjsLib.AnnotationMode.ENABLE_STORAGE,
+  });
 }
 
 /** Browsers refuse canvases above ~16.7M pixels (less on iOS). */
-const MAX_CANVAS_PIXELS = 16_777_216;
+export const MAX_CANVAS_PIXELS = 16_777_216;
 
 function clampOutputScale(width: number, height: number, desired: number): number {
   const maxScale = Math.sqrt(MAX_CANVAS_PIXELS / Math.max(1, width * height));
   return Math.max(0.25, Math.min(desired, maxScale));
+}
+
+// ── Form fields ────────────────────────────────────────────────────────────
+
+export type FormFieldKind = "text" | "checkbox" | "radio" | "choice";
+export type FormValue = string | boolean | string[] | null;
+
+/** A fillable widget on a page, in PDF user space. */
+export interface FormWidget {
+  id: string;
+  fieldName: string;
+  kind: FormFieldKind;
+  rect: [number, number, number, number];
+  readOnly: boolean;
+  multiLine: boolean;
+  maxLen: number;
+  /** Value the field had in the original file. */
+  initialValue: FormValue;
+  /** Radio: the value this widget selects. Checkbox: its "on" value. */
+  onValue?: string;
+  options?: { value: string; label: string }[];
+  multiSelect: boolean;
+  fontSize: number;
+  textAlign: "left" | "center" | "right";
+}
+
+interface RawWidget {
+  id: string;
+  annotationType: number;
+  fieldType?: string;
+  fieldName?: string;
+  fieldValue?: unknown;
+  rect: number[];
+  readOnly?: boolean;
+  hidden?: boolean;
+  multiLine?: boolean;
+  maxLen?: number;
+  checkBox?: boolean;
+  radioButton?: boolean;
+  pushButton?: boolean;
+  exportValue?: string;
+  buttonValue?: string;
+  options?: { exportValue: string; displayValue: string }[];
+  multiSelect?: boolean;
+  textAlignment?: number;
+  defaultAppearanceData?: { fontSize?: number };
+}
+
+const WIDGET = 20;
+const widgetCache = new WeakMap<PDFPageProxy, Promise<FormWidget[]>>();
+
+function toWidget(raw: RawWidget): FormWidget | null {
+  if (raw.annotationType !== WIDGET || raw.hidden || !raw.fieldName) return null;
+  const rect = raw.rect as [number, number, number, number];
+  const base = {
+    id: raw.id,
+    fieldName: raw.fieldName,
+    rect,
+    readOnly: !!raw.readOnly,
+    multiLine: !!raw.multiLine,
+    maxLen: raw.maxLen ?? 0,
+    multiSelect: !!raw.multiSelect,
+    fontSize: raw.defaultAppearanceData?.fontSize ?? 0,
+    textAlign: (["left", "center", "right"] as const)[raw.textAlignment ?? 0] ?? "left",
+  };
+  if (raw.fieldType === "Tx") {
+    return { ...base, kind: "text", initialValue: typeof raw.fieldValue === "string" ? raw.fieldValue : "" };
+  }
+  if (raw.fieldType === "Ch") {
+    const options = (raw.options ?? []).map((o) => ({ value: o.exportValue, label: o.displayValue }));
+    const value = raw.fieldValue;
+    return {
+      ...base,
+      kind: "choice",
+      options,
+      initialValue: Array.isArray(value) ? (raw.multiSelect ? value.map(String) : String(value[0] ?? "")) : String(value ?? ""),
+    };
+  }
+  if (raw.fieldType === "Btn" && raw.checkBox) {
+    return { ...base, kind: "checkbox", onValue: raw.exportValue, initialValue: raw.fieldValue === raw.exportValue };
+  }
+  if (raw.fieldType === "Btn" && raw.radioButton) {
+    return {
+      ...base,
+      kind: "radio",
+      onValue: raw.buttonValue,
+      initialValue: raw.fieldValue && raw.fieldValue !== "Off" ? String(raw.fieldValue) : null,
+    };
+  }
+  return null;
+}
+
+/** Fillable widgets of a page (text, checkboxes, radio buttons and choices). */
+export function pageWidgets(page: PDFPageProxy): Promise<FormWidget[]> {
+  let widgets = widgetCache.get(page);
+  if (!widgets) {
+    widgets = page
+      .getAnnotations({ intent: "display" })
+      .then((annotations) =>
+        (annotations as RawWidget[]).map(toWidget).filter((w): w is FormWidget => w !== null),
+      )
+      .catch(() => []);
+    widgetCache.set(page, widgets);
+  }
+  return widgets;
+}
+
+interface FieldObject {
+  id: string;
+  type: string;
+  exportValues?: string;
+}
+
+const fieldCache = new WeakMap<PDFDocumentProxy, Promise<Map<string, FieldObject[]>>>();
+
+/** Every widget of every field in a document, grouped by field name. */
+export function documentFields(pdf: PDFDocumentProxy): Promise<Map<string, FieldObject[]>> {
+  let fields = fieldCache.get(pdf);
+  if (!fields) {
+    fields = pdf
+      .getFieldObjects()
+      .then((map) => {
+        const result = new Map<string, FieldObject[]>();
+        for (const [name, list] of map ?? []) {
+          // The first entry of a field with widgets is the field itself, without a type.
+          result.set(name, (list as FieldObject[]).filter((field) => field.id && field.type));
+        }
+        return result;
+      })
+      .catch(() => new Map());
+    fieldCache.set(pdf, fields);
+  }
+  return fields;
+}
+
+/**
+ * Writes form values into PDF.js's annotation storage, so pages and thumbnails
+ * render them. `values` maps field names to values; missing fields keep the
+ * value they have in the file.
+ */
+export async function syncFormStorage(
+  pdf: PDFDocumentProxy,
+  values: Record<string, FormValue>,
+  previous: Record<string, FormValue> = {},
+): Promise<void> {
+  const fields = await documentFields(pdf);
+  const storage = pdf.annotationStorage;
+  const names = new Set([...Object.keys(values), ...Object.keys(previous)]);
+  for (const name of names) {
+    const widgets = fields.get(name);
+    if (!widgets || values[name] === previous[name]) continue;
+    const value = values[name];
+    for (const widget of widgets) {
+      if (value === undefined) {
+        // Back to the value stored in the file (for example, after undo).
+        storage.remove(widget.id);
+        continue;
+      }
+      if (widget.type === "radiobutton") {
+        storage.setValue(widget.id, { value: value === widget.exportValues });
+      } else if (widget.type === "checkbox") {
+        storage.setValue(widget.id, { value: value === true });
+      } else {
+        storage.setValue(widget.id, { value: value ?? "" });
+      }
+    }
+  }
 }

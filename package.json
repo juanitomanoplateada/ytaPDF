@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json && tsc -p tsconfig.test.json",
     "test": "vitest run"
   },
   "devDependencies": {
@@ -23,7 +23,10 @@
     "vitest": "^5.0.3"
   },
   "dependencies": {
+    "@cantoo/fontkit": "^2.0.12",
     "@cantoo/pdf-lib": "^2.11.1",
+    "@expo-google-fonts/noto-sans": "^0.4.2",
+    "@expo-google-fonts/noto-serif": "^0.4.2",
     "fabric": "^7.2.0",
     "lucide-svelte": "^0.575.0",
     "pdfjs-dist": "^6.3.289"

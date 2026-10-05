@@ -1,12 +1,20 @@
 import {
+  degrees,
   EncryptedPDFError,
+  PDFCheckBox,
   PDFDict,
   PDFDocument,
+  PDFDropdown,
   PDFName,
   PDFObjectCopier,
+  PDFOptionList,
+  PDFRadioGroup,
   PDFRef,
+  PDFTextField,
+  type PDFFont,
   type PDFPage,
 } from "@cantoo/pdf-lib";
+import type { FormValue } from "../pdfjs";
 
 export interface ExportSource {
   id: string;
@@ -15,9 +23,29 @@ export interface ExportSource {
   pageCount: number;
 }
 
-export interface PagePlacement {
+/** A page taken from a source document, optionally rotated further. */
+export interface SourcePlacement {
+  kind?: "source";
   sourceId: string;
   sourceIndex: number;
+  /** Clockwise degrees added to the page's own rotation. */
+  rotation?: number;
+}
+
+/** A new, empty page of the given size, filled later with a rendered image. */
+export interface RasterPlacement {
+  kind: "raster";
+  width: number;
+  height: number;
+}
+
+export type PagePlacement = SourcePlacement | RasterPlacement;
+
+export interface AssembleOptions {
+  /** Values to write into each source's form fields, by source and field name. */
+  formValues?: Record<string, Record<string, FormValue>>;
+  /** Font for field appearances when values need characters beyond WinAnsi. */
+  fieldFont?: (doc: PDFDocument) => Promise<PDFFont>;
 }
 
 export interface AssembledDocument {
@@ -26,7 +54,11 @@ export interface AssembledDocument {
   pages: PDFPage[];
   /** True when the first source was edited in place, keeping all its structure. */
   inPlace: boolean;
+  /** Fields whose value could not be written. */
+  failedFields: string[];
 }
+
+const isRaster = (placement: PagePlacement): placement is RasterPlacement => placement.kind === "raster";
 
 /**
  * Parses a source with pdf-lib, decrypting it when needed. Encrypted files
@@ -51,33 +83,47 @@ export async function loadSource(source: ExportSource): Promise<PDFDocument> {
  * in place so bookmarks, links, forms, tags and metadata survive untouched.
  * Otherwise the pages are copied into a new document, which keeps deleted
  * pages out of the file, and the form fields on the copied pages are
- * re-attached so they stay fillable.
+ * re-attached so they stay fillable. Form values are written into each source
+ * before its pages are copied, so the copies carry them.
  */
 export async function assembleDocument(
   placements: PagePlacement[],
   sources: Map<string, ExportSource>,
+  options: AssembleOptions = {},
 ): Promise<AssembledDocument> {
   if (placements.length === 0) throw new Error("El documento no tiene páginas.");
-  const first = sources.get(placements[0].sourceId);
-  if (!first) throw new Error("Falta el documento de origen.");
+  const failedFields: string[] = [];
+  const fill = async (doc: PDFDocument, sourceId: string) => {
+    const values = options.formValues?.[sourceId];
+    if (values && Object.keys(values).length > 0) {
+      failedFields.push(...(await applyFormValues(doc, values, options.fieldFont)));
+    }
+  };
 
+  const first = placements[0];
+  const firstSource = !isRaster(first) ? sources.get(first.sourceId) : undefined;
   const isUnchangedOrder =
-    placements.length === first.pageCount &&
-    placements.every((p, i) => p.sourceId === first.id && p.sourceIndex === i);
+    firstSource !== undefined &&
+    placements.length === firstSource.pageCount &&
+    placements.every((p, i) => !isRaster(p) && p.sourceId === firstSource.id && p.sourceIndex === i);
 
   if (isUnchangedOrder) {
-    const doc = await loadSource(first);
-    return { doc, pages: doc.getPages(), inPlace: true };
+    const doc = await loadSource(firstSource);
+    await fill(doc, firstSource.id);
+    const pages = doc.getPages();
+    placements.forEach((placement, i) => rotate(pages[i], placement));
+    return { doc, pages, inPlace: true, failedFields };
   }
 
   const doc = await PDFDocument.create({ updateMetadata: false });
 
   // One copyPages call per source lets pages share fonts and images.
   const bySource = new Map<string, number[]>();
-  for (const { sourceId, sourceIndex } of placements) {
-    const indices = bySource.get(sourceId) ?? [];
-    indices.push(sourceIndex);
-    bySource.set(sourceId, indices);
+  for (const placement of placements) {
+    if (isRaster(placement)) continue;
+    const indices = bySource.get(placement.sourceId) ?? [];
+    indices.push(placement.sourceIndex);
+    bySource.set(placement.sourceId, indices);
   }
 
   const loaded: PDFDocument[] = [];
@@ -86,6 +132,7 @@ export async function assembleDocument(
     const source = sources.get(sourceId);
     if (!source) throw new Error("Falta el documento de origen.");
     const sourceDoc = await loadSource(source);
+    await fill(sourceDoc, sourceId);
     loaded.push(sourceDoc);
     const copied = await doc.copyPages(sourceDoc, indices);
     copied.forEach((page, i) => {
@@ -94,15 +141,73 @@ export async function assembleDocument(
     });
   }
 
-  const pages = placements.map(({ sourceId, sourceIndex }) => {
-    const page = copies.get(`${sourceId}:${sourceIndex}`)?.shift();
+  const pages = placements.map((placement) => {
+    if (isRaster(placement)) return doc.addPage([placement.width, placement.height]);
+    const page = copies.get(`${placement.sourceId}:${placement.sourceIndex}`)?.shift();
     if (!page) throw new Error("No se pudo copiar una página.");
+    rotate(page, placement);
     return doc.addPage(page);
   });
 
-  reattachFormFields(doc, pages, loaded);
-  copyDocumentInfo(loaded[0], doc);
-  return { doc, pages, inPlace: false };
+  reattachFormFields(
+    doc,
+    pages.filter((_, i) => !isRaster(placements[i])),
+    loaded,
+  );
+  if (loaded[0]) copyDocumentInfo(loaded[0], doc);
+  return { doc, pages, inPlace: false, failedFields };
+}
+
+function rotate(page: PDFPage, placement: PagePlacement): void {
+  if (isRaster(placement) || !placement.rotation) return;
+  page.setRotation(degrees((((page.getRotation().angle + placement.rotation) % 360) + 360) % 360));
+}
+
+/** Writes values into a document's form fields and regenerates their appearance. */
+export async function applyFormValues(
+  doc: PDFDocument,
+  values: Record<string, FormValue>,
+  fieldFont?: (doc: PDFDocument) => Promise<PDFFont>,
+): Promise<string[]> {
+  const form = doc.getForm();
+  const failed: string[] = [];
+  let needsUnicodeFont = false;
+
+  for (const [name, value] of Object.entries(values)) {
+    const field = form.getFieldMaybe(name);
+    if (!field) continue;
+    try {
+      if (field instanceof PDFTextField) {
+        const text = typeof value === "string" ? value : "";
+        if (/[^ -~ -ÿ\n\r]/.test(text)) needsUnicodeFont = true;
+        field.setText(text);
+      } else if (field instanceof PDFCheckBox) {
+        if (value === true) field.check();
+        else field.uncheck();
+      } else if (field instanceof PDFRadioGroup) {
+        if (typeof value === "string" && value) field.select(value);
+        else field.clear();
+      } else if (field instanceof PDFDropdown) {
+        if (typeof value === "string" && value) field.select(value);
+        else field.clear();
+      } else if (field instanceof PDFOptionList) {
+        const selected = Array.isArray(value) ? value : typeof value === "string" && value ? [value] : [];
+        if (selected.length > 0) field.select(selected);
+        else field.clear();
+      }
+    } catch (error) {
+      console.error(`No se pudo rellenar el campo ${name}:`, error);
+      failed.push(name);
+    }
+  }
+
+  const font = needsUnicodeFont && fieldFont ? await fieldFont(doc) : undefined;
+  try {
+    form.updateFieldAppearances(font);
+  } catch (error) {
+    console.error("No se pudo actualizar la apariencia de los campos:", error);
+  }
+  return failed;
 }
 
 function reattachFormFields(doc: PDFDocument, pages: PDFPage[], sourceDocs: PDFDocument[]): void {

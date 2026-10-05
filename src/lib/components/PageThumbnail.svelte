@@ -34,6 +34,7 @@
     const data = annotations;
     const ref = page;
     const cssWidth = width;
+    const formRevision = editor.formRevision[ref.sourceId] ?? 0;
     const source = editor.sources.get(ref.sourceId);
     if (!source) return;
 
@@ -41,7 +42,7 @@
     // Repaints caused by editing are debounced; the first paint is immediate.
     const delay = untrack(() => ready) ? 250 : 0;
     const timer = setTimeout(() => {
-      renderThumbnail(canvas, source, ref, cssWidth, data, controller.signal)
+      renderThumbnail(canvas, source, ref, cssWidth, data, formRevision, controller.signal)
         .then(() => {
           if (!controller.signal.aborted) ready = true;
         })

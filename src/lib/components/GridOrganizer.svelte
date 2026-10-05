@@ -1,7 +1,18 @@
 <script lang="ts">
   import { flip } from "svelte/animate";
-  import { MediaQuery } from "svelte/reactivity";
-  import { ArrowLeft, ChevronLeft, ChevronRight, Plus, Trash2 } from "lucide-svelte";
+  import { MediaQuery, SvelteSet } from "svelte/reactivity";
+  import {
+    ArrowLeft,
+    Check,
+    ChevronLeft,
+    ChevronRight,
+    FileDown,
+    FilePlus,
+    Plus,
+    RotateCw,
+    Trash2,
+    X,
+  } from "lucide-svelte";
   import { editor } from "../editor.svelte";
   import PageThumbnail from "./PageThumbnail.svelte";
 
@@ -14,8 +25,39 @@
   /** Insertion point in the current order (0…pages.length) while dragging. */
   let dropIndex = $state<number | null>(null);
 
+  const selected = new SvelteSet<string>();
+  let anchorId: string | null = null;
+  const selectedIds = $derived(editor.pages.filter((page) => selected.has(page.id)).map((page) => page.id));
+
+  // Forget selected pages that no longer exist (deleted or undone).
+  $effect(() => {
+    const ids = new Set(editor.pages.map((page) => page.id));
+    for (const id of selected) if (!ids.has(id)) selected.delete(id);
+  });
+
   function indexOf(pageId: string) {
     return editor.pages.findIndex((page) => page.id === pageId);
+  }
+
+  function onCardClick(event: MouseEvent, pageId: string) {
+    if (event.shiftKey && anchorId) {
+      const [from, to] = [indexOf(anchorId), indexOf(pageId)].sort((a, b) => a - b);
+      if (!(event.ctrlKey || event.metaKey)) selected.clear();
+      for (const page of editor.pages.slice(from, to + 1)) selected.add(page.id);
+      return;
+    }
+    if (event.ctrlKey || event.metaKey) toggle(pageId);
+    else {
+      selected.clear();
+      selected.add(pageId);
+    }
+    anchorId = pageId;
+  }
+
+  function toggle(pageId: string) {
+    if (selected.has(pageId)) selected.delete(pageId);
+    else selected.add(pageId);
+    anchorId = pageId;
   }
 
   function ondragstart(event: DragEvent, pageId: string) {
@@ -53,7 +95,23 @@
     editor.currentPageId = pageId;
     editor.view = "editor";
   }
+
+  function onkeydown(event: KeyboardEvent) {
+    const target = event.target as HTMLElement;
+    if (target.closest("input, textarea, select, [role='dialog']")) return;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+      event.preventDefault();
+      for (const page of editor.pages) selected.add(page.id);
+    } else if (event.key === "Escape" && selected.size > 0) {
+      selected.clear();
+    } else if ((event.key === "Delete" || event.key === "Backspace") && selected.size > 0) {
+      event.preventDefault();
+      editor.deletePages(selectedIds);
+    }
+  }
 </script>
+
+<svelte:window {onkeydown} />
 
 <section class="organizer" aria-labelledby="organizer-title">
   <header>
@@ -63,13 +121,40 @@
     </button>
     <div class="heading">
       <h2 id="organizer-title">Organizar páginas</h2>
-      <p>Arrastra una página para moverla o usa las flechas. Doble clic para editarla.</p>
+      <p>Arrastra para mover. Ctrl o Mayús + clic para seleccionar varias. Doble clic para editar una página.</p>
     </div>
     <button class="add" onclick={onaddfiles}>
       <Plus size={18} />
       <span>Añadir PDF</span>
     </button>
   </header>
+
+  {#if selectedIds.length > 0}
+    <div class="selection-bar" role="toolbar" aria-label="Páginas seleccionadas">
+      <span class="count">
+        {selectedIds.length === 1 ? "1 página seleccionada" : `${selectedIds.length} páginas seleccionadas`}
+      </span>
+      <button onclick={() => void editor.exportPages(selectedIds)}>
+        <FileDown size={16} />
+        Exportar selección
+      </button>
+      <button onclick={() => editor.rotatePages(selectedIds, 90)}>
+        <RotateCw size={16} />
+        Girar
+      </button>
+      <button class="danger" onclick={() => editor.deletePages(selectedIds)}>
+        <Trash2 size={16} />
+        Eliminar
+      </button>
+      <span class="spacer"></span>
+      {#if selectedIds.length < editor.pages.length}
+        <button onclick={() => editor.pages.forEach((page) => selected.add(page.id))}>Seleccionar todas</button>
+      {/if}
+      <button class="icon" aria-label="Quitar la selección" title="Quitar la selección (Esc)" onclick={() => selected.clear()}>
+        <X size={16} />
+      </button>
+    </div>
+  {/if}
 
   <div class="scroll">
     <ol
@@ -81,8 +166,10 @@
     >
       {#each editor.pages as page, index (page.id)}
         {@const last = index === editor.pages.length - 1}
+        {@const isSelected = selected.has(page.id)}
         <li
           class="card"
+          class:selected={isSelected}
           class:dragging={draggedId === page.id}
           class:drop-before={draggedId !== null && dropIndex === index}
           class:drop-after={draggedId !== null && last && dropIndex === index + 1}
@@ -93,7 +180,31 @@
           ondragend={resetDrag}
           ondblclick={() => openInEditor(page.id)}
         >
-          <div class="preview">
+          <button
+            class="check"
+            class:checked={isSelected}
+            role="checkbox"
+            aria-checked={isSelected}
+            aria-label="Seleccionar la página {index + 1}"
+            onclick={() => toggle(page.id)}
+          >
+            {#if isSelected}<Check size={14} strokeWidth={3} />{/if}
+          </button>
+          <!-- A div rather than a button: Firefox cannot start a drag from a button. -->
+          <div
+            class="preview"
+            role="button"
+            tabindex="0"
+            aria-label="Página {index + 1}"
+            aria-pressed={isSelected}
+            onclick={(event) => onCardClick(event, page.id)}
+            onkeydown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                toggle(page.id);
+              }
+            }}
+          >
             <PageThumbnail {page} width={thumbWidth} annotations={editor.annotations[page.id]} />
           </div>
           <div class="controls">
@@ -115,6 +226,24 @@
               onclick={() => editor.movePage(page.id, index + 1)}
             >
               <ChevronRight size={16} />
+            </button>
+          </div>
+          <div class="controls secondary">
+            <button
+              class="icon"
+              aria-label="Girar la página {index + 1}"
+              title="Girar 90°"
+              onclick={() => editor.rotatePages([page.id], 90)}
+            >
+              <RotateCw size={16} />
+            </button>
+            <button
+              class="icon"
+              aria-label="Insertar una página en blanco después de la {index + 1}"
+              title="Insertar página en blanco después"
+              onclick={() => void editor.insertBlankPage(page.id)}
+            >
+              <FilePlus size={16} />
             </button>
             <button
               class="icon danger"
@@ -182,6 +311,43 @@
     border-color: var(--color-primary);
     color: var(--color-primary);
   }
+  .selection-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 24px;
+    background: var(--color-primary-soft);
+    border-bottom: 1px solid #bcd9f5;
+  }
+  .selection-bar .count {
+    margin-right: 8px;
+    font-weight: 600;
+    color: var(--color-primary);
+  }
+  .selection-bar button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border: 1px solid #bcd9f5;
+    border-radius: var(--radius-sm);
+    background: var(--color-surface);
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .selection-bar button:hover {
+    border-color: var(--color-primary);
+  }
+  .selection-bar button.danger {
+    color: var(--color-danger);
+  }
+  .selection-bar .icon {
+    padding: 6px;
+  }
+  .spacer {
+    flex: 1;
+  }
   .scroll {
     flex: 1;
     overflow-y: auto;
@@ -201,8 +367,8 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 10px;
-    padding: 12px;
+    gap: 8px;
+    padding: 12px 12px 8px;
     border-radius: var(--radius-md);
     background: var(--color-surface);
     box-shadow: var(--shadow-sm), 0 0 0 1px var(--color-border);
@@ -214,6 +380,9 @@
   }
   .card:hover {
     box-shadow: var(--shadow-md), 0 0 0 1px #c9ced6;
+  }
+  .card.selected {
+    box-shadow: var(--shadow-md), 0 0 0 2px var(--color-primary);
   }
   .card.dragging {
     opacity: 0.4;
@@ -234,14 +403,49 @@
   .card.drop-after::after {
     right: -14px;
   }
+  .check {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1.5px solid #9aa4b2;
+    border-radius: 6px;
+    background: var(--color-surface);
+    color: white;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .card:hover .check,
+  .check:focus-visible,
+  .check.checked {
+    opacity: 1;
+  }
+  .check.checked {
+    border-color: var(--color-primary);
+    background: var(--color-primary);
+  }
+  @media (hover: none) {
+    .check {
+      opacity: 1;
+    }
+  }
   .preview {
     box-shadow: 0 0 0 1px var(--color-border);
-    pointer-events: none;
+    cursor: inherit;
   }
   .controls {
     display: flex;
     align-items: center;
     gap: 2px;
+  }
+  .controls.secondary {
+    gap: 4px;
   }
   .number {
     min-width: 32px;
@@ -269,7 +473,6 @@
     cursor: default;
   }
   .icon.danger {
-    margin-left: 6px;
     color: var(--color-danger);
   }
   .icon.danger:hover {
@@ -289,6 +492,9 @@
     }
     .add {
       margin-left: auto;
+    }
+    .selection-bar {
+      padding: 8px 12px;
     }
     .scroll {
       padding: 16px 12px 40px;

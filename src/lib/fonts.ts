@@ -1,13 +1,19 @@
-export type FontFamilyId = "helvetica" | "times" | "courier";
+export type StandardFamilyId = "helvetica" | "times" | "courier";
+export type EmbeddedFamilyId = "noto-sans" | "noto-serif";
+export type FontFamilyId = StandardFamilyId | EmbeddedFamilyId;
+export type FontVariant = "regular" | "bold" | "italic" | "boldItalic";
 
 export interface FontFamilyOption {
   id: FontFamilyId;
   label: string;
   /**
-   * CSS stack used on the canvas. Each entry is metrically compatible with the
-   * PDF standard font it maps to, so line breaks and widths match the export.
+   * CSS stack used on the canvas. Standard families list fonts metrically
+   * compatible with the PDF standard font they map to; embedded families use
+   * the exact font file that is embedded in the export.
    */
   css: string;
+  /** Embedded families support any script the font covers (Latin, Greek, Cyrillic…). */
+  embedded: boolean;
 }
 
 export const FONT_FAMILIES: FontFamilyOption[] = [
@@ -15,33 +21,78 @@ export const FONT_FAMILIES: FontFamilyOption[] = [
     id: "helvetica",
     label: "Helvetica",
     css: 'Helvetica, Arial, "Liberation Sans", sans-serif',
+    embedded: false,
   },
   {
     id: "times",
     label: "Times New Roman",
     css: '"Times New Roman", Times, "Liberation Serif", serif',
+    embedded: false,
   },
   {
     id: "courier",
     label: "Courier",
     css: '"Courier New", Courier, "Liberation Mono", monospace',
+    embedded: false,
+  },
+  {
+    id: "noto-sans",
+    label: "Noto Sans",
+    css: '"Noto Sans", sans-serif',
+    embedded: true,
+  },
+  {
+    id: "noto-serif",
+    label: "Noto Serif",
+    css: '"Noto Serif", serif',
+    embedded: true,
   },
 ];
 
 export const DEFAULT_FONT_FAMILY = FONT_FAMILIES[0];
+
+function family(id: FontFamilyId): FontFamilyOption {
+  return FONT_FAMILIES.find((f) => f.id === id) ?? DEFAULT_FONT_FAMILY;
+}
 
 export function familyFromCss(fontFamily: string | undefined): FontFamilyOption {
   if (!fontFamily) return DEFAULT_FONT_FAMILY;
   const exact = FONT_FAMILIES.find((f) => f.css === fontFamily);
   if (exact) return exact;
   const lower = fontFamily.toLowerCase();
+  if (lower.includes("noto serif")) return family("noto-serif");
+  if (lower.includes("noto")) return family("noto-sans");
   if (lower.includes("times") || (lower.includes("serif") && !lower.includes("sans"))) {
-    return FONT_FAMILIES[1];
+    return family("times");
   }
-  if (lower.includes("courier") || lower.includes("mono")) {
-    return FONT_FAMILIES[2];
-  }
+  if (lower.includes("courier") || lower.includes("mono")) return family("courier");
   return DEFAULT_FONT_FAMILY;
+}
+
+export function fontVariant(
+  fontWeight: string | number | undefined,
+  fontStyle: string | undefined,
+): FontVariant {
+  const bold = isBoldWeight(fontWeight);
+  const italic = isItalicStyle(fontStyle);
+  return bold && italic ? "boldItalic" : bold ? "bold" : italic ? "italic" : "regular";
+}
+
+/** How the export draws a text object: a standard PDF font or an embedded file. */
+export type ResolvedFont =
+  | { kind: "standard"; name: StandardFontName }
+  | { kind: "embedded"; family: EmbeddedFamilyId; variant: FontVariant };
+
+export function resolveFont(
+  fontFamily: string | undefined,
+  fontWeight: string | number | undefined,
+  fontStyle: string | undefined,
+): ResolvedFont {
+  const option = familyFromCss(fontFamily);
+  if (option.embedded) {
+    return { kind: "embedded", family: option.id as EmbeddedFamilyId, variant: fontVariant(fontWeight, fontStyle) };
+  }
+  return { kind: "standard", name: standardFontFor(fontFamily, fontWeight, fontStyle) };
 }
 
 export function isBoldWeight(fontWeight: string | number | undefined): boolean {
@@ -79,6 +130,9 @@ const STANDARD_FONTS: Record<FontFamilyId, [StandardFontName, StandardFontName, 
   helvetica: ["Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"],
   times: ["Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"],
   courier: ["Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"],
+  // Closest standard fonts, used for form field appearances that need one.
+  "noto-sans": ["Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"],
+  "noto-serif": ["Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"],
 };
 
 export function standardFontFor(

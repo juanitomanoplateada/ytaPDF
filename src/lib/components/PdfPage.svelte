@@ -1,20 +1,44 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { Canvas, IText, type TPointerEventInfo } from "fabric";
-  import type { RenderTask } from "pdfjs-dist";
+  import { Canvas, IText, type FabricObject, type TPointerEventInfo } from "fabric";
+  import type { PDFPageProxy, RenderTask } from "pdfjs-dist";
   import {
+    applyShapeStyle,
     applyTextStyle,
-    bakeTextScale,
+    arrange,
+    bakeScale,
+    clearTopLayer,
     createImage,
+    createShape,
+    createSignature,
     createText,
+    DEFAULT_SIZES,
     describeSelection,
+    drawShapePreview,
+    editableSelection,
+    installAlignmentGuides,
+    isLocked,
     isText,
+    pasteObjects,
+    prepareObject,
     selectedObjects,
+    selectionText,
+    serializeSelection,
+    setLocked,
+    syncSelectionLock,
   } from "../fabricSetup";
-  import { editor, type PageAnnotations, type PageController, type PageRef } from "../editor.svelte";
+  import {
+    editor,
+    type DrawTool,
+    type PageAnnotations,
+    type PageController,
+    type PageRef,
+  } from "../editor.svelte";
+  import { ensureFontsFor } from "../embeddedFonts";
   import { importImage } from "../images";
   import { notifications } from "../notifications.svelte";
   import { isRenderCancelled, renderPage } from "../pdfjs";
+  import FormLayer from "./FormLayer.svelte";
 
   interface Props {
     page: PageRef;
@@ -25,9 +49,13 @@
 
   let { page, index, active }: Props = $props();
 
+  const DRAW_TOOLS: DrawTool[] = ["rect", "ellipse", "line", "arrow", "highlight", "redact"];
+  const isDrawTool = (tool: string): tool is DrawTool => DRAW_TOOLS.includes(tool as DrawTool);
+
   let container: HTMLDivElement;
   let pdfCanvas = $state<HTMLCanvasElement>();
   let fabricElement = $state<HTMLCanvasElement>();
+  let pdfPage = $state.raw<PDFPageProxy | null>(null);
   let rendered = $state(false);
   /** Bumped whenever a Fabric canvas is created, so effects can react to it. */
   let canvasGeneration = $state(0);
@@ -40,6 +68,7 @@
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let saveKey: string | undefined;
   let pendingTextAt: { x: number; y: number } | null = null;
+  let drawStart: { x: number; y: number } | null = null;
   let cleanups: Array<() => void> = [];
 
   const width = $derived(page.width * editor.zoom);
@@ -52,22 +81,33 @@
   });
 
   $effect(() => {
-    const target = pdfCanvas;
-    const zoom = editor.zoom;
     const source = editor.sources.get(page.sourceId);
-    if (!target || !source) return;
+    if (!active || !source) return;
+    let cancelled = false;
+    void source.pdf.getPage(page.sourceIndex + 1).then((proxy) => {
+      if (!cancelled) pdfPage = proxy;
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  $effect(() => {
+    const target = pdfCanvas;
+    const proxy = pdfPage;
+    const zoom = editor.zoom;
+    const rotation = page.rotation;
+    // Form values reach PDF.js asynchronously; repaint when they arrive.
+    void editor.formRevision[page.sourceId];
+    if (!target || !proxy) return;
 
     let cancelled = false;
-    let task: RenderTask | null = null;
     // Render off-screen and swap, so zooming stretches the old bitmap instead
     // of flashing an empty page.
     const buffer = document.createElement("canvas");
-    source.pdf
-      .getPage(page.sourceIndex + 1)
-      .then(async (pdfPage) => {
-        if (cancelled) return;
-        task = renderPage(pdfPage, buffer, zoom);
-        await task.promise;
+    const task: RenderTask = renderPage(proxy, buffer, zoom, undefined, rotation);
+    task.promise
+      .then(() => {
         if (cancelled) return;
         target.width = buffer.width;
         target.height = buffer.height;
@@ -80,7 +120,7 @@
 
     return () => {
       cancelled = true;
-      task?.cancel();
+      task.cancel();
     };
   });
 
@@ -109,9 +149,12 @@
     void canvasGeneration;
     const tool = editor.tool;
     if (!canvas) return;
+    const drawing = isDrawTool(tool);
     canvas.selection = tool === "select";
-    canvas.defaultCursor = tool === "text" ? "text" : "default";
-    if (tool === "text") canvas.discardActiveObject();
+    // While drawing, clicks over existing objects start a new shape.
+    canvas.skipTargetFind = drawing;
+    canvas.defaultCursor = tool === "text" ? "text" : drawing ? "crosshair" : "default";
+    if (tool !== "select") canvas.discardActiveObject();
     canvas.requestRenderAll();
   });
 
@@ -140,7 +183,7 @@
     setTouchScrolling(true);
 
     instance.on("object:modified", ({ target }) => {
-      if (bakeTextScale(target)) instance.requestRenderAll();
+      if (bakeScale(target)) instance.requestRenderAll();
       scheduleSave();
       reportSelection();
     });
@@ -152,9 +195,13 @@
     });
     instance.on("selection:created", () => {
       setTouchScrolling(false);
+      syncSelectionLock(instance);
       reportSelection();
     });
-    instance.on("selection:updated", reportSelection);
+    instance.on("selection:updated", () => {
+      syncSelectionLock(instance);
+      reportSelection();
+    });
     instance.on("selection:cleared", () => {
       setTouchScrolling(true);
       editor.reportSelection(page.id, null);
@@ -163,9 +210,14 @@
     // which goes stale as the workspace scrolls.
     instance.on("mouse:down:before", () => instance.calcOffset());
     instance.on("mouse:down", onPointerDown);
+    instance.on("mouse:move", onPointerMove);
     instance.on("mouse:up", onPointerUp);
 
-    cleanups = [editor.registerPage(page.id, controller), editor.registerFlusher(flushSave)];
+    cleanups = [
+      editor.registerPage(page.id, controller),
+      editor.registerFlusher(flushSave),
+      installAlignmentGuides(instance, () => ({ width: page.width, height: page.height })),
+    ];
     lastSynced = undefined;
     canvasGeneration += 1;
     return instance;
@@ -204,7 +256,11 @@
     try {
       instance.discardActiveObject();
       if (data) {
+        // Embedded fonts must be ready before Fabric measures any text.
+        await ensureFontsFor(data.objects);
+        if (abort.signal.aborted) return;
         await instance.loadFromJSON(data, undefined, { signal: abort.signal });
+        instance.getObjects().forEach(prepareObject);
       } else {
         instance.remove(...instance.getObjects());
       }
@@ -246,24 +302,89 @@
     if (canvas) editor.reportSelection(page.id, describeSelection(canvas));
   }
 
+  /** Adds a new object, selects it and records the change. */
+  function place(object: FabricObject, at: { x: number; y: number }) {
+    if (!canvas) return;
+    object.set({ left: at.x, top: at.y });
+    object.setCoords();
+    canvas.add(object);
+    canvas.setActiveObject(object);
+    canvas.requestRenderAll();
+    scheduleSave();
+    reportSelection();
+  }
+
   // ── Interaction ───────────────────────────────────────────────────────────
 
   function onPointerDown({ target, e }: TPointerEventInfo) {
     pendingTextAt = null;
-    if (editor.tool !== "text" || target || !canvas) return;
-    pendingTextAt = canvas.getScenePoint(e);
+    drawStart = null;
+    if (!canvas) return;
+    const tool = editor.tool;
+    if (tool === "text" && !target) pendingTextAt = canvas.getScenePoint(e);
+    else if (isDrawTool(tool)) drawStart = canvas.getScenePoint(e);
+  }
+
+  /** With Shift, boxes become squares and lines snap to 45°. */
+  function constrain(tool: DrawTool, start: { x: number; y: number }, point: { x: number; y: number }, shift: boolean) {
+    if (!shift) return point;
+    const dx = point.x - start.x;
+    const dy = point.y - start.y;
+    if (tool === "line" || tool === "arrow") {
+      const angle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+      const length = Math.hypot(dx, dy);
+      return { x: start.x + Math.cos(angle) * length, y: start.y + Math.sin(angle) * length };
+    }
+    const size = Math.max(Math.abs(dx), Math.abs(dy));
+    return { x: start.x + Math.sign(dx || 1) * size, y: start.y + Math.sign(dy || 1) * size };
+  }
+
+  function onPointerMove({ e }: TPointerEventInfo) {
+    const tool = editor.tool;
+    if (!drawStart || !canvas || !isDrawTool(tool)) return;
+    const end = constrain(tool, drawStart, canvas.getScenePoint(e), e.shiftKey);
+    drawShapePreview(canvas, tool, drawStart, end, editor.shapeStyle, editor.highlightColor);
   }
 
   function onPointerUp({ e }: TPointerEventInfo) {
-    const start = pendingTextAt;
+    if (!canvas) return;
+    const tool = editor.tool;
+
+    if (drawStart && isDrawTool(tool)) {
+      const start = drawStart;
+      drawStart = null;
+      clearTopLayer(canvas);
+      let end = constrain(tool, start, canvas.getScenePoint(e), e.shiftKey);
+      // A click (no drag) creates a shape of a default size at that spot.
+      if (Math.hypot(end.x - start.x, end.y - start.y) < 4 / editor.zoom) {
+        const size = DEFAULT_SIZES[tool];
+        end = { x: start.x + size.width / 2, y: start.y + size.height / 2 };
+        if (tool === "line" || tool === "arrow") {
+          start.x -= size.width / 2;
+        } else {
+          start.x -= size.width / 2;
+          start.y -= size.height / 2;
+        }
+      }
+      const shape = prepareObject(createShape(tool, start, end, editor.shapeStyle, editor.highlightColor));
+      canvas.add(shape);
+      canvas.setActiveObject(shape);
+      editor.tool = "select";
+      canvas.requestRenderAll();
+      scheduleSave();
+      reportSelection();
+      return;
+    }
+
+    const textStart = pendingTextAt;
     pendingTextAt = null;
-    if (!start || !canvas || editor.tool !== "text") return;
+    if (!textStart || tool !== "text") return;
     // A drag is not a click: only place text where the pointer was released close by.
     const end = canvas.getScenePoint(e);
-    if (Math.hypot(end.x - start.x, end.y - start.y) > 8 / editor.zoom) return;
+    if (Math.hypot(end.x - textStart.x, end.y - textStart.y) > 8 / editor.zoom) return;
 
     const text = createText("Texto", editor.textStyle);
-    text.set({ left: start.x + text.width / 2, top: start.y });
+    text.set({ left: textStart.x + text.width / 2, top: textStart.y });
     text.setCoords();
     canvas.add(text);
     canvas.setActiveObject(text);
@@ -293,14 +414,7 @@
     if (!canvas) return;
     const image = await createImage(url, page.width * 0.6, page.height * 0.6);
     if (!canvas) return;
-    const point = at ?? visibleCenter();
-    image.set({ left: point.x, top: point.y });
-    image.setCoords();
-    canvas.add(image);
-    canvas.setActiveObject(image);
-    canvas.requestRenderAll();
-    scheduleSave();
-    reportSelection();
+    place(image, at ?? visibleCenter());
   }
 
   function hasImageFiles(event: DragEvent) {
@@ -333,8 +447,32 @@
     }
   }
 
+  /** Runs an edit on the selection unless something in it is locked. */
+  function editSelection(edit: (canvas: Canvas, active: FabricObject) => void, delay = 0, key?: string) {
+    const active = canvas?.getActiveObject();
+    if (!canvas || !active) return;
+    if (selectedObjects(canvas).some(isLocked)) {
+      notifications.info("La selección incluye objetos bloqueados. Desbloquéalos para modificarlos.");
+      return;
+    }
+    edit(canvas, active);
+    canvas.requestRenderAll();
+    scheduleSave(delay, key);
+    reportSelection();
+  }
+
   const controller: PageController = {
     addImage: (url) => placeImage(url),
+
+    addSignature(signature) {
+      if (!canvas) return;
+      place(createSignature(signature, Math.min(220, page.width * 0.4)), visibleCenter());
+    },
+
+    addText(content) {
+      if (!canvas) return;
+      place(createText(content, editor.textStyle), visibleCenter());
+    },
 
     applyTextStyle(style) {
       if (canvas && applyTextStyle(canvas, style)) {
@@ -343,50 +481,91 @@
       }
     },
 
+    applyShapeStyle(style, highlight) {
+      if (canvas && applyShapeStyle(canvas, style, highlight)) {
+        scheduleSave(150, `shape:${page.id}`);
+        reportSelection();
+      }
+    },
+
     rotateSelection(degrees) {
-      const active = canvas?.getActiveObject();
-      if (!canvas || !active) return;
-      active.rotate((((active.angle || 0) + degrees) % 360 + 360) % 360);
-      active.setCoords();
-      canvas.requestRenderAll();
-      scheduleSave();
-      reportSelection();
+      editSelection((_, active) => {
+        active.rotate((((active.angle || 0) + degrees) % 360 + 360) % 360);
+        active.setCoords();
+      });
     },
 
     flipSelection(axis) {
-      const active = canvas?.getActiveObject();
-      if (!canvas || !active) return;
-      if (axis === "x") active.set("flipX", !active.flipX);
-      else active.set("flipY", !active.flipY);
-      canvas.requestRenderAll();
-      scheduleSave();
-      reportSelection();
+      editSelection((_, active) => {
+        if (axis === "x") active.set("flipX", !active.flipX);
+        else active.set("flipY", !active.flipY);
+      });
     },
 
     setSelectionOpacity(opacity) {
+      editSelection((instance) => {
+        for (const object of selectedObjects(instance)) object.set("opacity", opacity);
+      }, 150, `opacity:${page.id}`);
+    },
+
+    arrangeSelection(action) {
+      if (!canvas || selectedObjects(canvas).length === 0) return;
+      if (arrange(canvas, action)) scheduleSave();
+      reportSelection();
+    },
+
+    toggleLockSelection() {
       if (!canvas) return;
-      for (const object of selectedObjects(canvas)) object.set("opacity", opacity);
+      const objects = selectedObjects(canvas);
+      if (objects.length === 0) return;
+      const lock = !objects.every(isLocked);
+      for (const object of objects) setLocked(object, lock);
+      syncSelectionLock(canvas);
       canvas.requestRenderAll();
-      scheduleSave(150, `opacity:${page.id}`);
+      scheduleSave();
       reportSelection();
     },
 
     deleteSelection() {
-      if (!canvas) return;
+      if (!canvas) return { removed: 0, locked: 0 };
       const objects = selectedObjects(canvas);
-      if (objects.length === 0) return;
-      canvas.discardActiveObject();
-      canvas.remove(...objects);
-      canvas.requestRenderAll();
+      const removable = editableSelection(canvas);
+      if (removable.length > 0) {
+        canvas.discardActiveObject();
+        canvas.remove(...removable);
+        canvas.requestRenderAll();
+      }
+      return { removed: removable.length, locked: objects.length - removable.length };
+    },
+
+    async duplicateSelection() {
+      if (!canvas) return;
+      const data = serializeSelection(canvas);
+      if (data.length === 0) return;
+      await pasteObjects(canvas, data, 14);
+      scheduleSave();
+      reportSelection();
+    },
+
+    copySelection() {
+      if (!canvas) return null;
+      const objects = serializeSelection(canvas);
+      return objects.length > 0 ? { objects, text: selectionText(canvas) } : null;
+    },
+
+    async pasteObjects(objects, offset) {
+      if (!canvas) return;
+      const pasted = await pasteObjects(canvas, objects, offset);
+      pasted.forEach(prepareObject);
+      scheduleSave();
+      reportSelection();
     },
 
     nudgeSelection(dx, dy) {
-      const active = canvas?.getActiveObject();
-      if (!canvas || !active) return;
-      active.set({ left: active.left + dx, top: active.top + dy });
-      active.setCoords();
-      canvas.requestRenderAll();
-      scheduleSave(300, `nudge:${page.id}`);
+      editSelection((_, active) => {
+        active.set({ left: active.left + dx, top: active.top + dy });
+        active.setCoords();
+      }, 300, `nudge:${page.id}`);
     },
 
     clearSelection() {
@@ -419,6 +598,9 @@
     <div class="annotation-layer">
       <canvas bind:this={fabricElement}></canvas>
     </div>
+    {#if pdfPage && editor.tool === "select"}
+      <FormLayer {page} {pdfPage} zoom={editor.zoom} />
+    {/if}
   {/if}
   {#if !rendered}
     <div class="placeholder" aria-hidden="true">

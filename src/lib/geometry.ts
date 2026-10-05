@@ -60,3 +60,18 @@ export function sceneToPdf(viewportTransform: number[]): Matrix {
 export function objectToPdf(sceneToPdfMatrix: Matrix, objectMatrix: Matrix): Matrix {
   return multiply(sceneToPdfMatrix, multiply(objectMatrix, FLIP_Y));
 }
+
+/** A Fabric path command: an operator (M, L, Q, C, Z) and its coordinates. */
+export type PathCommand = [string, ...number[]];
+
+/** Writes Fabric path commands (M, L, Q, C, Z) after mapping every point. */
+export function pathToSvg(commands: PathCommand[], map: (x: number, y: number) => [number, number]): string {
+  const round = (n: number) => Math.round(n * 1000) / 1000;
+  return commands
+    .map(([op, ...args]) => {
+      const points: number[] = [];
+      for (let i = 0; i + 1 < args.length; i += 2) points.push(...map(args[i], args[i + 1]).map(round));
+      return [op, ...points].join(" ");
+    })
+    .join(" ");
+}

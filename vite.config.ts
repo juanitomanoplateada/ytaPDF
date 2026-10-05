@@ -1,6 +1,7 @@
 /// <reference types="vitest/config" />
 import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import { createHash } from "node:crypto";
 import { createReadStream, readdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -52,9 +53,35 @@ function pdfjsAssets(): Plugin {
   };
 }
 
+/**
+ * Emits `sw.js`, a service worker that precaches this build's app shell and
+ * code (so the app opens and exports offline) and caches PDF.js assets and
+ * fonts the first time they are used.
+ */
+function serviceWorker(): Plugin {
+  const publicFiles = ["/", "/index.html", "/paty.png", "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png"];
+  return {
+    name: "service-worker",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      const precache = [
+        ...publicFiles,
+        ...Object.keys(bundle)
+          .filter((file) => !file.startsWith("pdfjs/") && !file.endsWith(".map") && !file.endsWith(".ttf") && file !== "index.html")
+          .map((file) => `/${file}`),
+      ];
+      const version = createHash("sha256").update(precache.join("\n")).digest("hex").slice(0, 12);
+      const source = readFileSync(new URL("./src/sw.js", import.meta.url), "utf8")
+        .replace("__VERSION__", version)
+        .replace("__PRECACHE__", JSON.stringify(precache));
+      this.emitFile({ type: "asset", fileName: "sw.js", source });
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [svelte(), pdfjsAssets()],
+  plugins: [svelte(), pdfjsAssets(), serviceWorker()],
   build: {
     // PDF.js, pdf-lib and Fabric are large by nature; split them so the app
     // shell stays small and vendors are cached independently.
