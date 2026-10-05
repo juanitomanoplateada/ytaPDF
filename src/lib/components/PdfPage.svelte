@@ -1,475 +1,460 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
-  import { editorStore } from "../store";
-  import * as fabric from "fabric";
-  import type { PDFPageProxy } from "pdfjs-dist";
+  import { untrack } from "svelte";
+  import { Canvas, IText, type TPointerEventInfo } from "fabric";
+  import type { RenderTask } from "pdfjs-dist";
+  import {
+    applyTextStyle,
+    bakeTextScale,
+    createImage,
+    createText,
+    describeSelection,
+    isText,
+    selectedObjects,
+  } from "../fabricSetup";
+  import { editor, type PageAnnotations, type PageController, type PageRef } from "../editor.svelte";
+  import { importImage } from "../images";
+  import { notifications } from "../notifications.svelte";
+  import { isRenderCancelled, renderPage } from "../pdfjs";
 
-  const deleteControl = new fabric.Control({
-    x: -0.5,
-    y: -0.5,
-    offsetY: -10,
-    offsetX: -10,
-    cursorStyle: "pointer",
-
-    mouseUpHandler: function (eventData: any, transform: any) {
-      const target = transform.target;
-      const canvas = target.canvas;
-      if (canvas) {
-        canvas.remove(target);
-        canvas.requestRenderAll();
-        canvas.fire("object:removed", { target });
-      }
-      return true;
-    },
-
-    render: function (
-      ctx: any,
-      left: number,
-      top: number,
-      styleOverride: any,
-      fabricObject: any,
-    ) {
-      const size = (this as any).cornerSize || 24;
-      ctx.save();
-      ctx.translate(left, top);
-      ctx.rotate(fabric.util.degreesToRadians(fabricObject.angle || 0));
-
-      // Draw red circle background
-      ctx.beginPath();
-      ctx.arc(0, 0, size / 2, 0, 2 * Math.PI, false);
-      ctx.fillStyle = "#ff4444";
-      ctx.fill();
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = "#fff";
-      ctx.stroke();
-
-      // Draw white 'X'
-      ctx.beginPath();
-      const crossSize = size / 4;
-      ctx.moveTo(-crossSize, -crossSize);
-      ctx.lineTo(crossSize, crossSize);
-      ctx.moveTo(crossSize, -crossSize);
-      ctx.lineTo(-crossSize, crossSize);
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = "#fff";
-      ctx.stroke();
-
-      ctx.restore();
-    },
-
-    // @ts-ignore
-    cornerSize: 22,
-  } as any);
-
-  // Initialize controls properly for Fabric.js v6/v7
-  // Force the control on the default Object prototype
-  fabric.Object.prototype.controls = {
-    ...fabric.Object.prototype.controls,
-    deleteControl: deleteControl,
-  };
-
-  export let pageProxy: PDFPageProxy;
-  export let pageNumber: number;
-
-  let baseCanvas: HTMLCanvasElement;
-  let interactiveCanvas: HTMLCanvasElement;
-  let fabricApp: fabric.Canvas;
-  let renderTask: any = null;
-
-  let lastRenderedZoom = 0;
-  let lastRenderedProxy: any = null;
-
-  $: if (pageProxy && baseCanvas && $editorStore.globalZoom) {
-    if (
-      lastRenderedZoom !== $editorStore.globalZoom ||
-      lastRenderedProxy !== pageProxy
-    ) {
-      lastRenderedZoom = $editorStore.globalZoom;
-      lastRenderedProxy = pageProxy;
-      triggerRender($editorStore.globalZoom);
-    }
+  interface Props {
+    page: PageRef;
+    index: number;
+    /** Whether the page is close enough to the viewport to be rendered. */
+    active: boolean;
   }
 
-  function triggerRender(zoom: number) {
-    renderPageLayers(zoom).catch((err) => {
-      if (err.name !== "RenderingCancelledException") {
-        console.error("PDF Render Error:", err);
-      }
-    });
-  }
+  let { page, index, active }: Props = $props();
 
-  let lastActiveTool = "";
-  $: if (fabricApp && $editorStore.activeTool !== lastActiveTool) {
-    lastActiveTool = $editorStore.activeTool;
-    if ($editorStore.activeTool === "TEXT") {
-      fabricApp.defaultCursor = "text";
-      fabricApp.discardActiveObject();
-      fabricApp.requestRenderAll();
-    } else {
-      fabricApp.defaultCursor = "default";
-    }
-  }
+  let container: HTMLDivElement;
+  let pdfCanvas = $state<HTMLCanvasElement>();
+  let fabricElement = $state<HTMLCanvasElement>();
+  let rendered = $state(false);
+  /** Bumped whenever a Fabric canvas is created, so effects can react to it. */
+  let canvasGeneration = $state(0);
 
-  async function renderPageLayers(currentZoom: number) {
-    const pixelRatio = window.devicePixelRatio || 1;
-    const viewport = pageProxy.getViewport({ scale: currentZoom });
-    const scaledViewport = pageProxy.getViewport({
-      scale: currentZoom * pixelRatio,
-    });
+  // Fabric objects are deliberately kept out of Svelte's reactivity.
+  let canvas: Canvas | null = null;
+  let lastSynced: PageAnnotations | undefined;
+  let loading = false;
+  let loadAbort: AbortController | null = null;
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let saveKey: string | undefined;
+  let pendingTextAt: { x: number; y: number } | null = null;
+  let cleanups: Array<() => void> = [];
 
-    const CSS_w = viewport.width;
-    const CSS_h = viewport.height;
+  const width = $derived(page.width * editor.zoom);
+  const height = $derived(page.height * editor.zoom);
 
-    if (
-      baseCanvas.width !== scaledViewport.width ||
-      baseCanvas.height !== scaledViewport.height
-    ) {
-      baseCanvas.width = scaledViewport.width;
-      baseCanvas.height = scaledViewport.height;
-      baseCanvas.style.width = `${CSS_w}px`;
-      baseCanvas.style.height = `${CSS_h}px`;
-    }
+  // ── PDF layer ─────────────────────────────────────────────────────────────
 
-    const ctx = baseCanvas.getContext("2d");
-    if (ctx) {
-      if (renderTask) {
-        renderTask.cancel();
-      }
+  $effect(() => {
+    if (!active) rendered = false;
+  });
 
-      renderTask = pageProxy.render({
-        canvasContext: ctx,
-        viewport: scaledViewport,
-      } as any);
-      await renderTask.promise;
-      renderTask = null;
-    }
+  $effect(() => {
+    const target = pdfCanvas;
+    const zoom = editor.zoom;
+    const source = editor.sources.get(page.sourceId);
+    if (!target || !source) return;
 
-    if (!fabricApp) {
-      fabricApp = new fabric.Canvas(interactiveCanvas, {
-        width: CSS_w,
-        height: CSS_h,
-        selection: true,
-        preserveObjectStacking: true,
+    let cancelled = false;
+    let task: RenderTask | null = null;
+    // Render off-screen and swap, so zooming stretches the old bitmap instead
+    // of flashing an empty page.
+    const buffer = document.createElement("canvas");
+    source.pdf
+      .getPage(page.sourceIndex + 1)
+      .then(async (pdfPage) => {
+        if (cancelled) return;
+        task = renderPage(pdfPage, buffer, zoom);
+        await task.promise;
+        if (cancelled) return;
+        target.width = buffer.width;
+        target.height = buffer.height;
+        target.getContext("2d")?.drawImage(buffer, 0, 0);
+        rendered = true;
+      })
+      .catch((error) => {
+        if (!isRenderCancelled(error)) console.error("Error al dibujar la página:", error);
       });
-
-      const setupEvents = () => {
-        fabricApp.on("object:modified", (e) => {
-          handleObjectScaling(e);
-          savePageToStore();
-        });
-        fabricApp.on("object:scaling", handleObjectScaling);
-        fabricApp.on("text:changed", savePageToStore);
-        fabricApp.on("object:removed", savePageToStore);
-
-        fabricApp.on("selection:created", updateStoreWithActiveObject);
-        fabricApp.on("selection:updated", updateStoreWithActiveObject);
-        fabricApp.on("selection:cleared", () => {
-          $editorStore.activeTextParams = null;
-        });
-
-        fabricApp.on("mouse:down", (options) => {
-          if ($editorStore.activeTool === "TEXT" && !options.target) {
-            const pointer = fabricApp.getScenePoint(options.e);
-            const text = new fabric.IText("Nuevo Texto", {
-              left: pointer.x,
-              top: pointer.y - 12,
-              fontFamily: "Helvetica",
-              fontSize: 24,
-              fill: "#000000",
-              editable: true,
-            });
-
-            // Make sure we have the default resize/rotate controls in V6/V7
-            const defaultControls =
-              (fabric as any).controlsUtils?.createObjectDefaultControls() ||
-              fabric.Object.prototype.controls;
-
-            text.controls = {
-              ...defaultControls,
-              deleteControl: deleteControl,
-            };
-
-            fabricApp.add(text);
-            fabricApp.setActiveObject(text);
-            text.enterEditing();
-            text.selectAll();
-            $editorStore.activeTool = "SELECT";
-            savePageToStore();
-          }
-        });
-      };
-
-      const existing = $editorStore.pagesAnnotations[pageNumber];
-      if (existing && existing.fabricJSON) {
-        fabricApp.loadFromJSON(existing.fabricJSON, () => {
-          fabricApp.setDimensions({ width: CSS_w, height: CSS_h });
-          fabricApp.setZoom(currentZoom);
-
-          // Ensure all loaded objects have the control but keep defaults
-          const defaultControls =
-            (fabric as any).controlsUtils?.createObjectDefaultControls() ||
-            fabric.Object.prototype.controls;
-
-          fabricApp.getObjects().forEach((obj) => {
-            obj.controls = {
-              ...defaultControls,
-              deleteControl: deleteControl,
-            };
-          });
-
-          fabricApp.requestRenderAll();
-          setupEvents();
-        });
-      } else {
-        fabricApp.setDimensions({ width: CSS_w, height: CSS_h });
-        fabricApp.setZoom(currentZoom);
-        setupEvents();
-      }
-    } else {
-      fabricApp.setDimensions({ width: CSS_w, height: CSS_h });
-      fabricApp.setZoom(currentZoom);
-    }
-  }
-
-  function updateStoreWithActiveObject() {
-    if (!fabricApp) return;
-    const activeObj = fabricApp.getActiveObject();
-
-    if (activeObj) {
-      $editorStore.activeObjectParams = {
-        angle: activeObj.angle || 0,
-        flipX: !!activeObj.flipX,
-        flipY: !!activeObj.flipY,
-        opacity: activeObj.opacity !== undefined ? activeObj.opacity : 1,
-      };
-
-      if (activeObj.type === "i-text" || activeObj.type === "text") {
-        const textObj = activeObj as fabric.IText;
-        $editorStore.activeTextParams = {
-          fontFamily: textObj.fontFamily || "Helvetica",
-          fontSize: textObj.fontSize || 24,
-          fill: (textObj.fill as string) || "#000000",
-          fontWeight: (textObj.fontWeight as string) || "normal",
-          fontStyle: (textObj.fontStyle as string) || "normal",
-          underline: !!textObj.underline,
-        };
-      } else {
-        $editorStore.activeTextParams = null;
-      }
-    } else {
-      $editorStore.activeObjectParams = null;
-      $editorStore.activeTextParams = null;
-    }
-  }
-
-  function handleObjectScaling(e: any) {
-    const obj = e.target;
-    if (!obj || (obj.type !== "i-text" && obj.type !== "text")) return;
-
-    const scaleY = obj.scaleY || 1;
-    const baseFontSize = obj.fontSize || 24;
-    const effectiveFontSize = Math.round(baseFontSize * scaleY);
-
-    if (
-      $editorStore.activeTextParams &&
-      $editorStore.activeTextParams.fontSize !== effectiveFontSize
-    ) {
-      $editorStore.activeTextParams.fontSize = effectiveFontSize;
-    }
-
-    if (e.type === "object:modified") {
-      obj.set({
-        fontSize: effectiveFontSize,
-        scaleX: 1,
-        scaleY: 1,
-      });
-      fabricApp.requestRenderAll();
-    }
-  }
-
-  onMount(() => {
-    const handleModifyObjectAct = (e: any) => {
-      if (!fabricApp) return;
-      const activeObj = fabricApp.getActiveObject();
-      if (!activeObj) return;
-
-      const { action, value } = e.detail;
-
-      if (action === "rotate") {
-        const currentAngle = activeObj.angle || 0;
-        activeObj.set("angle", (currentAngle + value) % 360);
-      } else if (action === "flipX") {
-        activeObj.set("flipX", !activeObj.flipX);
-      } else if (action === "flipY") {
-        activeObj.set("flipY", !activeObj.flipY);
-      } else if (action === "opacity") {
-        activeObj.set("opacity", value);
-      }
-
-      fabricApp.requestRenderAll();
-      updateStoreWithActiveObject();
-      savePageToStore();
-    };
-
-    const handleStyleUpdate = (e: any) => {
-      if (!fabricApp) return;
-      const activeObj = fabricApp.getActiveObject();
-      if (
-        activeObj &&
-        (activeObj.type === "i-text" || activeObj.type === "text")
-      ) {
-        const { key, value } = e.detail;
-
-        activeObj.set(key, value);
-        fabricApp.requestRenderAll();
-        savePageToStore();
-      }
-    };
-
-    const handleAddImage = (e: any) => {
-      if (!fabricApp || $editorStore.currentPage !== pageNumber) return;
-
-      const { dataUrl } = e.detail;
-      fabric.FabricImage.fromURL(dataUrl, { crossOrigin: "anonymous" }).then(
-        (img: any) => {
-          if (img.width! > fabricApp.width! * 0.6) {
-            img.scaleToWidth(fabricApp.width! * 0.6);
-          }
-          img.set({
-            left: fabricApp.width! / 2 - img.getScaledWidth() / 2,
-            top: fabricApp.height! / 2 - img.getScaledHeight() / 2,
-          });
-
-          // Re-apply explicit controls for images
-          const defaultControls =
-            (fabric as any).controlsUtils?.createObjectDefaultControls() ||
-            fabric.Object.prototype.controls;
-
-          img.controls = {
-            ...defaultControls,
-            deleteControl: deleteControl,
-          };
-
-          fabricApp.add(img);
-          fabricApp.setActiveObject(img);
-          savePageToStore();
-        },
-      );
-    };
-
-    const handleForceReload = () => {
-      if (!fabricApp) return;
-
-      fabricApp.off("object:modified", savePageToStore);
-      fabricApp.off("text:changed", savePageToStore);
-      fabricApp.off("object:removed", savePageToStore);
-
-      const restore = () => {
-        fabricApp.setZoom($editorStore.globalZoom);
-        fabricApp.requestRenderAll();
-        fabricApp.on("object:modified", savePageToStore);
-        fabricApp.on("text:changed", savePageToStore);
-        fabricApp.on("object:removed", savePageToStore);
-      };
-
-      const existing = $editorStore.pagesAnnotations[pageNumber];
-      if (existing && existing.fabricJSON) {
-        fabricApp.loadFromJSON(existing.fabricJSON, restore);
-      } else {
-        fabricApp.clear();
-        restore();
-      }
-    };
-
-    window.addEventListener("update-text-style", handleStyleUpdate);
-    window.addEventListener("add-image", handleAddImage);
-    window.addEventListener("modify-object", handleModifyObjectAct);
-    window.addEventListener("force-reload-annotations", handleForceReload);
 
     return () => {
-      window.removeEventListener("update-text-style", handleStyleUpdate);
-      window.removeEventListener("add-image", handleAddImage);
-      window.removeEventListener("modify-object", handleModifyObjectAct);
-      window.removeEventListener("force-reload-annotations", handleForceReload);
+      cancelled = true;
+      task?.cancel();
     };
   });
 
-  let saveTimeout: any;
+  // ── Annotation layer ──────────────────────────────────────────────────────
 
-  function savePageToStore() {
-    if (saveTimeout) clearTimeout(saveTimeout);
+  $effect(() => {
+    const element = fabricElement;
+    if (!element) return;
+    const instance = untrack(() => createCanvas(element));
+    return () => destroyCanvas(instance);
+  });
 
-    saveTimeout = setTimeout(() => {
-      const zoom = fabricApp.getZoom();
-      editorStore.update((s) => {
-        const newAnnotations = {
-          ...s.pagesAnnotations,
-          [pageNumber]: {
-            viewportDimensions: {
-              width: fabricApp.width! / zoom,
-              height: fabricApp.height! / zoom,
-            },
-            fabricJSON: fabricApp.toJSON(),
-          },
-        };
+  $effect(() => {
+    void canvasGeneration;
+    const zoom = editor.zoom;
+    const w = width;
+    const h = height;
+    if (!canvas) return;
+    canvas.setDimensions({ width: w, height: h });
+    canvas.setZoom(zoom);
+    canvas.calcOffset();
+    canvas.requestRenderAll();
+  });
 
-        const newHistory = s.history.slice(0, s.historyIndex + 1);
-        newHistory.push(newAnnotations);
+  $effect(() => {
+    void canvasGeneration;
+    const tool = editor.tool;
+    if (!canvas) return;
+    canvas.selection = tool === "select";
+    canvas.defaultCursor = tool === "text" ? "text" : "default";
+    if (tool === "text") canvas.discardActiveObject();
+    canvas.requestRenderAll();
+  });
 
-        let newIndex = s.historyIndex + 1;
-        if (newHistory.length > 40) {
-          newHistory.shift();
-          newIndex--;
-        }
+  // Undo, redo and other external changes flow from the editor state into Fabric.
+  $effect(() => {
+    void canvasGeneration;
+    const data = editor.annotations[page.id];
+    if (!canvas) return;
+    untrack(() => {
+      if (data !== lastSynced) void loadAnnotations(data);
+    });
+  });
 
-        return {
-          ...s,
-          pagesAnnotations: newAnnotations,
-          history: newHistory,
-          historyIndex: newIndex,
-        };
-      });
-    }, 300);
+  function createCanvas(element: HTMLCanvasElement): Canvas {
+    const instance = new Canvas(element, {
+      width,
+      height,
+      preserveObjectStacking: true,
+      selection: editor.tool === "select",
+      targetFindTolerance: 6,
+      // Lets touch users scroll the document unless an object is selected.
+      allowTouchScrolling: true,
+    });
+    instance.setZoom(editor.zoom);
+    canvas = instance;
+    setTouchScrolling(true);
+
+    instance.on("object:modified", ({ target }) => {
+      if (bakeTextScale(target)) instance.requestRenderAll();
+      scheduleSave();
+      reportSelection();
+    });
+    instance.on("object:removed", () => scheduleSave());
+    instance.on("text:changed", () => scheduleSave(500, `typing:${page.id}`));
+    instance.on("text:editing:exited", ({ target }) => {
+      if (isText(target) && target.text.trim() === "") instance.remove(target);
+      scheduleSave();
+    });
+    instance.on("selection:created", () => {
+      setTouchScrolling(false);
+      reportSelection();
+    });
+    instance.on("selection:updated", reportSelection);
+    instance.on("selection:cleared", () => {
+      setTouchScrolling(true);
+      editor.reportSelection(page.id, null);
+    });
+    // Fabric places the hidden textarea used for typing from a cached offset,
+    // which goes stale as the workspace scrolls.
+    instance.on("mouse:down:before", () => instance.calcOffset());
+    instance.on("mouse:down", onPointerDown);
+    instance.on("mouse:up", onPointerUp);
+
+    cleanups = [editor.registerPage(page.id, controller), editor.registerFlusher(flushSave)];
+    lastSynced = undefined;
+    canvasGeneration += 1;
+    return instance;
   }
 
-  onDestroy(() => {
-    if (saveTimeout) clearTimeout(saveTimeout);
-    if (fabricApp) {
-      try {
-        fabricApp.dispose();
-      } catch (e) {
-        console.warn("Fabric dispose warning:", e);
+  function destroyCanvas(instance: Canvas) {
+    // Ending the edit removes Fabric's hidden textarea and keeps the typed text.
+    const active = instance.getActiveObject();
+    if (active instanceof IText && active.isEditing) active.exitEditing();
+    flushSave();
+    for (const cleanup of cleanups) cleanup();
+    cleanups = [];
+    loadAbort?.abort();
+    loadAbort = null;
+    loading = false;
+    canvas = null;
+    instance.dispose().catch(() => {});
+  }
+
+  function setTouchScrolling(enabled: boolean) {
+    // While something is selected, touch gestures move it instead of scrolling.
+    if (canvas) canvas.upperCanvasEl.style.touchAction = enabled ? "pan-x pan-y pinch-zoom" : "none";
+  }
+
+  async function loadAnnotations(data: PageAnnotations | undefined) {
+    const instance = canvas;
+    if (!instance) return;
+    lastSynced = data;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+
+    loadAbort?.abort();
+    const abort = new AbortController();
+    loadAbort = abort;
+    loading = true;
+    try {
+      instance.discardActiveObject();
+      if (data) {
+        await instance.loadFromJSON(data, undefined, { signal: abort.signal });
+      } else {
+        instance.remove(...instance.getObjects());
+      }
+      instance.requestRenderAll();
+    } catch (error) {
+      if (!abort.signal.aborted) console.error("Error al cargar las anotaciones:", error);
+    } finally {
+      if (loadAbort === abort) {
+        loadAbort = null;
+        loading = false;
       }
     }
-  });
+  }
+
+  // ── Saving ────────────────────────────────────────────────────────────────
+
+  /** Edits are written to the editor state (and undo history) after `delay`. */
+  function scheduleSave(delay = 0, coalesceKey?: string) {
+    if (loading || !canvas) return;
+    saveKey = coalesceKey;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSave, delay);
+  }
+
+  function flushSave() {
+    if (!saveTimer) return;
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    if (!canvas) return;
+    const { version, objects } = canvas.toObject() as PageAnnotations;
+    lastSynced = editor.setPageAnnotations(
+      page.id,
+      objects.length > 0 ? { version, objects } : null,
+      saveKey,
+    );
+  }
+
+  function reportSelection() {
+    if (canvas) editor.reportSelection(page.id, describeSelection(canvas));
+  }
+
+  // ── Interaction ───────────────────────────────────────────────────────────
+
+  function onPointerDown({ target, e }: TPointerEventInfo) {
+    pendingTextAt = null;
+    if (editor.tool !== "text" || target || !canvas) return;
+    pendingTextAt = canvas.getScenePoint(e);
+  }
+
+  function onPointerUp({ e }: TPointerEventInfo) {
+    const start = pendingTextAt;
+    pendingTextAt = null;
+    if (!start || !canvas || editor.tool !== "text") return;
+    // A drag is not a click: only place text where the pointer was released close by.
+    const end = canvas.getScenePoint(e);
+    if (Math.hypot(end.x - start.x, end.y - start.y) > 8 / editor.zoom) return;
+
+    const text = createText("Texto", editor.textStyle);
+    text.set({ left: start.x + text.width / 2, top: start.y });
+    text.setCoords();
+    canvas.add(text);
+    canvas.setActiveObject(text);
+    text.enterEditing();
+    text.selectAll();
+    editor.tool = "select";
+    canvas.requestRenderAll();
+    scheduleSave();
+  }
+
+  /** Centre of the part of the page currently on screen, in scene units. */
+  function visibleCenter(): { x: number; y: number } {
+    const rect = container.getBoundingClientRect();
+    const viewport = container.closest(".workspace")?.getBoundingClientRect() ?? rect;
+    const top = Math.max(rect.top, viewport.top);
+    const bottom = Math.min(rect.bottom, viewport.bottom);
+    const left = Math.max(rect.left, viewport.left);
+    const right = Math.min(rect.right, viewport.right);
+    if (bottom <= top || right <= left) return { x: page.width / 2, y: page.height / 2 };
+    return {
+      x: ((left + right) / 2 - rect.left) / editor.zoom,
+      y: ((top + bottom) / 2 - rect.top) / editor.zoom,
+    };
+  }
+
+  async function placeImage(url: string, at?: { x: number; y: number }) {
+    if (!canvas) return;
+    const image = await createImage(url, page.width * 0.6, page.height * 0.6);
+    if (!canvas) return;
+    const point = at ?? visibleCenter();
+    image.set({ left: point.x, top: point.y });
+    image.setCoords();
+    canvas.add(image);
+    canvas.setActiveObject(image);
+    canvas.requestRenderAll();
+    scheduleSave();
+    reportSelection();
+  }
+
+  function hasImageFiles(event: DragEvent) {
+    return [...(event.dataTransfer?.items ?? [])].some(
+      (item) => item.kind === "file" && item.type.startsWith("image/"),
+    );
+  }
+
+  function ondragover(event: DragEvent) {
+    if (!canvas || !hasImageFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  }
+
+  async function ondrop(event: DragEvent) {
+    const files = [...(event.dataTransfer?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+    if (!canvas || files.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = canvas.getScenePoint(event);
+    for (const [offset, file] of files.entries()) {
+      try {
+        const url = await importImage(file);
+        await placeImage(url, { x: point.x + offset * 16, y: point.y + offset * 16 });
+      } catch (error) {
+        console.error("Error al importar la imagen:", error);
+        notifications.error(`No se pudo usar «${file.name}» como imagen.`);
+      }
+    }
+  }
+
+  const controller: PageController = {
+    addImage: (url) => placeImage(url),
+
+    applyTextStyle(style) {
+      if (canvas && applyTextStyle(canvas, style)) {
+        scheduleSave(150, `style:${page.id}`);
+        reportSelection();
+      }
+    },
+
+    rotateSelection(degrees) {
+      const active = canvas?.getActiveObject();
+      if (!canvas || !active) return;
+      active.rotate((((active.angle || 0) + degrees) % 360 + 360) % 360);
+      active.setCoords();
+      canvas.requestRenderAll();
+      scheduleSave();
+      reportSelection();
+    },
+
+    flipSelection(axis) {
+      const active = canvas?.getActiveObject();
+      if (!canvas || !active) return;
+      if (axis === "x") active.set("flipX", !active.flipX);
+      else active.set("flipY", !active.flipY);
+      canvas.requestRenderAll();
+      scheduleSave();
+      reportSelection();
+    },
+
+    setSelectionOpacity(opacity) {
+      if (!canvas) return;
+      for (const object of selectedObjects(canvas)) object.set("opacity", opacity);
+      canvas.requestRenderAll();
+      scheduleSave(150, `opacity:${page.id}`);
+      reportSelection();
+    },
+
+    deleteSelection() {
+      if (!canvas) return;
+      const objects = selectedObjects(canvas);
+      if (objects.length === 0) return;
+      canvas.discardActiveObject();
+      canvas.remove(...objects);
+      canvas.requestRenderAll();
+    },
+
+    nudgeSelection(dx, dy) {
+      const active = canvas?.getActiveObject();
+      if (!canvas || !active) return;
+      active.set({ left: active.left + dx, top: active.top + dy });
+      active.setCoords();
+      canvas.requestRenderAll();
+      scheduleSave(300, `nudge:${page.id}`);
+    },
+
+    clearSelection() {
+      if (!canvas) return;
+      const active = canvas.getActiveObject();
+      if (active instanceof IText && active.isEditing) active.exitEditing();
+      canvas.discardActiveObject();
+      canvas.requestRenderAll();
+    },
+
+    isEditingText() {
+      const active = canvas?.getActiveObject();
+      return active instanceof IText && active.isEditing;
+    },
+  };
 </script>
 
-<div class="page-wrapper glass-shadow" style="width: intrinsic;">
-  <canvas bind:this={baseCanvas} class="layer-base"></canvas>
-  <div class="layer-fabric">
-    <canvas bind:this={interactiveCanvas}></canvas>
-  </div>
+<div
+  class="page"
+  bind:this={container}
+  style:width="{width}px"
+  style:height="{height}px"
+  role="group"
+  aria-label="Página {index + 1}"
+  {ondragover}
+  {ondrop}
+>
+  {#if active}
+    <canvas class="pdf-layer" bind:this={pdfCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+    <div class="annotation-layer">
+      <canvas bind:this={fabricElement}></canvas>
+    </div>
+  {/if}
+  {#if !rendered}
+    <div class="placeholder" aria-hidden="true">
+      <span class="spinner"></span>
+    </div>
+  {/if}
 </div>
 
 <style>
-  .page-wrapper {
+  .page {
     position: relative;
     background: white;
-    margin: 0 auto;
+    box-shadow:
+      0 1px 3px rgba(16, 24, 40, 0.12),
+      0 8px 28px rgba(16, 24, 40, 0.08);
   }
-  .glass-shadow {
-    box-shadow: 0px 8px 30px rgba(0, 0, 0, 0.08);
-  }
-  .layer-base {
+  .pdf-layer {
+    position: absolute;
+    inset: 0;
     display: block;
     pointer-events: none;
   }
-  .layer-fabric {
+  .annotation-layer {
     position: absolute;
-    top: 0;
-    left: 0;
+    inset: 0;
   }
-  :global(.layer-fabric .canvas-container) {
+  .annotation-layer :global(.canvas-container) {
     margin: 0 !important;
+  }
+  .placeholder {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: #b5bcc7;
+    background: white;
+    pointer-events: none;
   }
 </style>

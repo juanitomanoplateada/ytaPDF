@@ -1,5 +1,34 @@
-# Logs
-logs
+# ── Dependencias ──────────────────────────────────────────────────────────
+node_modules/
+
+# ── Compilación y cachés ──────────────────────────────────────────────────
+dist/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+# Vite crea estos archivos temporales al cargar la configuración.
+vite.config.*.timestamp-*
+
+# ── Pruebas y calidad ─────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+test-results/
+# SonarQube: la configuración local incluye un token y no debe versionarse.
+sonar-project.properties
+.scannerwork/
+.sonar/
+
+# ── Variables de entorno ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.local
+
+# ── Despliegue ────────────────────────────────────────────────────────────
+.vercel/
+
+# ── Registros ─────────────────────────────────────────────────────────────
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,18 +36,27 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# ── PDF exportados durante las pruebas manuales ───────────────────────────
+*_ytaPDF.pdf
 
-# Editor directories and files
+# ── Herramientas de asistentes de código ──────────────────────────────────
+.claude/
+
+# ── Editores ──────────────────────────────────────────────────────────────
 .vscode/*
 !.vscode/extensions.json
-.idea
-.DS_Store
+.idea/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+*~
+
+# ── Sistema operativo ─────────────────────────────────────────────────────
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

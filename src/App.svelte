@@ -1,493 +1,311 @@
 <script lang="ts">
-  import { editorStore } from "./lib/store";
-  import Toolbar from "./lib/components/Toolbar.svelte";
-  import Sidebar from "./lib/components/Sidebar.svelte";
-  import Workspace from "./lib/components/Workspace.svelte";
+  import "./lib/fabricSetup";
+  import { editor } from "./lib/editor.svelte";
+  import { notifications } from "./lib/notifications.svelte";
   import GridOrganizer from "./lib/components/GridOrganizer.svelte";
-  import { Plus, LayoutGrid, Trash2, Type } from "lucide-svelte";
-  import * as pdfjsLib from "pdfjs-dist";
+  import PasswordModal from "./lib/components/PasswordModal.svelte";
+  import Sidebar from "./lib/components/Sidebar.svelte";
+  import Toasts from "./lib/components/Toasts.svelte";
+  import Toolbar from "./lib/components/Toolbar.svelte";
+  import Welcome from "./lib/components/Welcome.svelte";
+  import Workspace from "./lib/components/Workspace.svelte";
 
-  import workerSrc from "pdfjs-dist/build/pdf.worker.mjs?url";
-  pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
+  let fileInput: HTMLInputElement;
+  let dragDepth = $state(0);
 
-  import { PDFDocument, rgb, degrees } from "pdf-lib";
+  function openFilePicker() {
+    fileInput.click();
+  }
 
-  async function handleFileUpload(e: Event) {
-    const files = (e.target as HTMLInputElement).files;
-    if (!files || files.length === 0) return;
+  function onFilesChosen(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const files = [...(input.files ?? [])];
+    input.value = "";
+    void editor.openFiles(files);
+  }
 
-    let finalBytes = $editorStore.originalPdfBytes;
-    let existingDoc: PDFDocument | null = null;
+  // ── Drag & drop from the operating system ────────────────────────────────
 
-    try {
-      if (finalBytes) {
-        existingDoc = await PDFDocument.load(finalBytes, {
-          ignoreEncryption: true,
-        });
-      }
+  function carriesFiles(event: DragEvent) {
+    return event.dataTransfer?.types.includes("Files") ?? false;
+  }
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const arrayBuffer = await file.arrayBuffer();
-        const newBytes = new Uint8Array(arrayBuffer as ArrayBuffer);
+  function isPdf(file: File) {
+    return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  }
 
-        if (!existingDoc) {
-          existingDoc = await PDFDocument.load(newBytes, {
-            ignoreEncryption: true,
-          });
-          editorStore.update((s) => ({
-            ...s,
-            documentId: file.name,
-            activeTool: "SELECT",
-            pagesAnnotations: {},
-            errorMessage: null,
-            history: [{}],
-            historyIndex: 0,
-          }));
-        } else {
-          const newDoc = await PDFDocument.load(newBytes, {
-            ignoreEncryption: true,
-          });
-          const newPageIndices = newDoc.getPageIndices();
-          const copiedPages = await existingDoc.copyPages(
-            newDoc,
-            newPageIndices,
-          );
+  function ondragenter(event: DragEvent) {
+    if (carriesFiles(event)) dragDepth += 1;
+  }
 
-          for (const page of copiedPages) {
-            existingDoc.addPage(page);
-          }
-        }
-      }
+  function ondragleave(event: DragEvent) {
+    if (carriesFiles(event)) dragDepth = Math.max(0, dragDepth - 1);
+  }
 
-      if (existingDoc) {
-        finalBytes = await existingDoc.save();
-        editorStore.update((s) => ({
-          ...s,
-          originalPdfBytes: finalBytes,
-          errorMessage: null,
-          history: [s.pagesAnnotations],
-          historyIndex: 0,
-        }));
+  function ondragover(event: DragEvent) {
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  }
 
-        const loadingTask = pdfjsLib.getDocument({
-          data: finalBytes.slice(),
-          fontExtraProperties: true,
-          disableFontFace: false,
-          standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/standard_fonts/`,
-        });
-        const pdf = await loadingTask.promise;
-
-        $editorStore.numPages = pdf.numPages;
-      }
-    } catch (error) {
-      console.error("Error loading PDF:", error);
-      editorStore.update((s) => ({
-        ...s,
-        errorMessage:
-          "No se pudo cargar o abrir uno de los documentos PDF. Asegúrate de que el archivo no esté corrupto o protegido con contraseña.",
-      }));
-    } finally {
-      (e.target as HTMLInputElement).value = "";
+  async function ondrop(event: DragEvent) {
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    const files = [...(event.dataTransfer?.files ?? [])];
+    const pdfs = files.filter(isPdf);
+    const images = files.filter((file) => file.type.startsWith("image/"));
+    if (pdfs.length === 0 && images.length === 0) {
+      notifications.info("Solo se pueden abrir archivos PDF o añadir imágenes.");
+      return;
+    }
+    if (pdfs.length > 0) await editor.openFiles(pdfs);
+    if (images.length === 0) return;
+    if (editor.hasDocument && editor.view === "editor") {
+      for (const image of images) await editor.addImage(image);
+    } else if (!editor.hasDocument) {
+      notifications.info("Abre primero un PDF para poder añadir imágenes.");
     }
   }
 
-  async function handleExport() {
-    if (!$editorStore.originalPdfBytes) return;
+  // ── Keyboard shortcuts ───────────────────────────────────────────────────
 
-    const pdfDoc = await PDFDocument.load($editorStore.originalPdfBytes);
-    const pages = pdfDoc.getPages();
-
-    for (const [pageStr, annotation] of Object.entries(
-      $editorStore.pagesAnnotations,
-    )) {
-      const pageIndex = parseInt(pageStr) - 1;
-      const page = pages[pageIndex];
-      const { height: pdfHeight } = page.getSize();
-      const pageRotation = page.getRotation().angle;
-      const cropBox = page.getCropBox();
-      const cLeft = cropBox.x || 0;
-      const cBottom = cropBox.y || 0;
-      const cWidth = cropBox.width;
-      const cHeight = cropBox.height;
-
-      const { viewportDimensions, fabricJSON } = annotation;
-      const objects = fabricJSON.objects || [];
-      const textDrawPromises: Promise<void>[] = [];
-
-      for (const obj of objects) {
-        const scaleY = obj.scaleY || 1;
-        const scaleX = obj.scaleX || 1;
-        const fabricAngle = obj.angle || 0;
-        const rad = (fabricAngle * Math.PI) / 180;
-
-        if (
-          obj.type === "i-text" ||
-          obj.type === "text" ||
-          obj.type === "IText" ||
-          obj.type === "Text"
-        ) {
-          const isBold = obj.fontWeight === "bold";
-          const isItalic = obj.fontStyle === "italic";
-          let fontType = "Helvetica";
-
-          if (obj.fontFamily === "Times New Roman") fontType = "TimesRoman";
-          if (obj.fontFamily === "Courier") fontType = "Courier";
-
-          let pdfLibFontId = fontType;
-          if (isBold && isItalic) pdfLibFontId += "BoldOblique";
-          else if (isBold) pdfLibFontId += "Bold";
-          else if (isItalic) pdfLibFontId += "Oblique";
-
-          if (pdfLibFontId === "TimesRomanOblique")
-            pdfLibFontId = "TimesRomanItalic";
-          if (pdfLibFontId === "TimesRomanBoldOblique")
-            pdfLibFontId = "TimesRomanBoldItalic";
-
-          textDrawPromises.push(
-            import("pdf-lib").then(async ({ StandardFonts }) => {
-              const fontToUse = await pdfDoc.embedFont(
-                StandardFonts[pdfLibFontId as keyof typeof StandardFonts] ||
-                  StandardFonts.Helvetica,
-              );
-
-              const { drawFabricTextToPdf } =
-                await import("./lib/pdfTextMatrix");
-              const cropBoxData = {
-                x: cLeft,
-                y: cBottom,
-                width: cWidth,
-                height: cHeight,
-              };
-
-              await drawFabricTextToPdf(
-                page,
-                obj,
-                viewportDimensions,
-                cropBoxData,
-                pageRotation,
-                fontToUse,
-              );
-            }),
-          );
-        } else if (
-          obj.type === "image" ||
-          obj.type === "Image" ||
-          obj.type === "FabricImage"
-        ) {
-          textDrawPromises.push(
-            (async () => {
-              if (!obj.src) return;
-              try {
-                let imgToDraw;
-                if (obj.src.includes("image/png")) {
-                  imgToDraw = await pdfDoc.embedPng(obj.src);
-                } else {
-                  imgToDraw = await pdfDoc.embedJpg(obj.src);
-                }
-
-                const { drawFabricImageToPdf } =
-                  await import("./lib/pdfTextMatrix");
-                const cropBoxData = {
-                  x: cLeft,
-                  y: cBottom,
-                  width: cWidth,
-                  height: cHeight,
-                };
-
-                await drawFabricImageToPdf(
-                  page,
-                  obj,
-                  viewportDimensions,
-                  cropBoxData,
-                  pageRotation,
-                  imgToDraw,
-                );
-              } catch (e) {
-                console.error("Failed to embed image into PDF", e);
-              }
-            })(),
-          );
-        }
-      }
-      await Promise.all(textDrawPromises);
-    }
-
-    const modifiedBytes = await pdfDoc.save();
-
-    const blob = new Blob([modifiedBytes as any], { type: "application/pdf" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const originalName = $editorStore.documentId || "document";
-    const nameWithoutExt = originalName.toLowerCase().endsWith(".pdf")
-      ? originalName.slice(0, -4)
-      : originalName;
-    a.download = `${nameWithoutExt}_ytaPDF.pdf`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-  function handleTextStyleUpdate(e: CustomEvent) {
-    window.dispatchEvent(
-      new CustomEvent("update-text-style", { detail: e.detail }),
+  function isTypingTarget(target: EventTarget | null) {
+    return (
+      target instanceof HTMLElement &&
+      (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
     );
+  }
+
+  function onkeydown(event: KeyboardEvent) {
+    if (editor.passwordRequest) return;
+    const mod = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+    const typing = isTypingTarget(event.target);
+
+    if (mod && key === "o") {
+      event.preventDefault();
+      openFilePicker();
+      return;
+    }
+    if (!editor.hasDocument) return;
+
+    if (mod && key === "s") {
+      event.preventDefault();
+      void editor.exportPdf();
+      return;
+    }
+    // While typing, undo/redo belong to the text field.
+    if (typing) {
+      if (event.key === "Escape" && editor.isEditingText()) editor.clearSelection();
+      return;
+    }
+    if (mod && (key === "z" || key === "y")) {
+      event.preventDefault();
+      if (key === "y" || event.shiftKey) editor.redo();
+      else editor.undo();
+      return;
+    }
+    if (mod && (key === "+" || key === "=")) {
+      event.preventDefault();
+      editor.zoomIn();
+      return;
+    }
+    if (mod && key === "-") {
+      event.preventDefault();
+      editor.zoomOut();
+      return;
+    }
+    if (mod && key === "0") {
+      event.preventDefault();
+      editor.setZoom(1);
+      return;
+    }
+    if (mod || event.altKey || editor.view !== "editor") return;
+
+    if (event.key === "Escape") {
+      editor.clearSelection();
+      editor.tool = "select";
+      editor.sidebarOpen = false;
+      return;
+    }
+    if (key === "t") editor.tool = "text";
+    if (key === "v") editor.tool = "select";
+    if (!editor.selection) return;
+
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      editor.deleteSelection();
+      return;
+    }
+    const step = event.shiftKey ? 10 : 1;
+    const nudges: Record<string, [number, number]> = {
+      ArrowLeft: [-step, 0],
+      ArrowRight: [step, 0],
+      ArrowUp: [0, -step],
+      ArrowDown: [0, step],
+    };
+    const nudge = nudges[event.key];
+    if (nudge) {
+      event.preventDefault();
+      editor.nudgeSelection(nudge[0] / editor.zoom, nudge[1] / editor.zoom);
+    }
+  }
+
+  function onbeforeunload(event: BeforeUnloadEvent) {
+    if (!editor.isDirty) return;
+    event.preventDefault();
+    // Legacy browsers only show the prompt when returnValue is set.
+    event.returnValue = "";
+  }
+
+  // Focusing Fabric's hidden textarea can scroll the (overflow: hidden) page.
+  function onscroll() {
+    if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
   }
 </script>
 
-<div class="app-container">
-  <Toolbar
-    on:exportPdf={handleExport}
-    on:updateTextStyle={handleTextStyleUpdate}
+<svelte:window
+  {onkeydown}
+  {onbeforeunload}
+  {onscroll}
+  {ondragenter}
+  {ondragleave}
+  {ondragover}
+  {ondrop}
+  ondropcapture={() => (dragDepth = 0)}
+/>
+
+<div class="app">
+  <Toolbar onopenfiles={openFilePicker} />
+
+  <main>
+    {#if !editor.hasDocument}
+      <Welcome onopenfiles={openFilePicker} />
+    {:else if editor.view === "organizer"}
+      <GridOrganizer onaddfiles={openFilePicker} />
+    {:else}
+      {#if editor.sidebarOpen}
+        <button class="sidebar-backdrop" aria-label="Cerrar panel de páginas" onclick={() => (editor.sidebarOpen = false)}
+        ></button>
+      {/if}
+      <Sidebar onaddfiles={openFilePicker} />
+      <Workspace />
+    {/if}
+  </main>
+
+  <input
+    bind:this={fileInput}
+    type="file"
+    accept="application/pdf,.pdf"
+    multiple
+    hidden
+    onchange={onFilesChosen}
   />
 
-  {#if $editorStore.errorMessage}
-    <div class="error-banner">
-      <span class="error-text">{$editorStore.errorMessage}</span>
-      <button
-        class="close-error-btn"
-        on:click={() => ($editorStore.errorMessage = null)}>✕</button
-      >
+  {#if dragDepth > 0}
+    <div class="drop-overlay" aria-hidden="true">
+      <div>
+        <strong>Suelta los archivos aquí</strong>
+        <span>
+          {editor.hasDocument
+            ? "Los PDF se añaden al final del documento y las imágenes a la página actual."
+            : "Se abrirán los archivos PDF."}
+        </span>
+      </div>
     </div>
   {/if}
 
-  <div class="main-content">
-    {#if !$editorStore.originalPdfBytes}
-      <div class="empty-state">
-        <div class="upload-card">
-          <div class="logo-container">
-            <img src="/paty.png" alt="Paty Logo" />
-          </div>
-          <h2>
-            Bienvenido a <span class="brand-yta">yta</span><span
-              class="brand-pdf">PDF</span
-            >
-          </h2>
-          <p class="subtitle">
-            La herramienta web rápida y privada para gestionar tus documentos.
-          </p>
-
-          <div class="features-grid">
-            <div class="feature-item">
-              <Plus size={20} class="feat-icon" />
-              <span>Unir múltiples PDFs</span>
-            </div>
-            <div class="feature-item">
-              <LayoutGrid size={20} class="feat-icon" />
-              <span>Reorganizar páginas</span>
-            </div>
-            <div class="feature-item">
-              <Trash2 size={20} class="feat-icon" />
-              <span>Eliminar hojas</span>
-            </div>
-            <div class="feature-item">
-              <Type size={20} class="feat-icon" />
-              <span>Añadir texto e imágenes</span>
-            </div>
-          </div>
-
-          <label class="upload-btn">
-            Cargar PDFs
-            <input
-              type="file"
-              accept="application/pdf"
-              multiple
-              on:change={handleFileUpload}
-            />
-          </label>
-        </div>
+  {#if editor.busy}
+    <div class="busy" role="status" aria-live="polite">
+      <div class="busy-card">
+        <span class="spinner"></span>
+        {editor.busy}
       </div>
-    {:else}
-      {#if $editorStore.isOrganizerMode}
-        <GridOrganizer />
-      {:else}
-        {#if $editorStore.isMobileSidebarOpen}
-          <!-- svelte-ignore a11y-click-events-have-key-events -->
-          <!-- svelte-ignore a11y-no-static-element-interactions -->
-          <div
-            class="sidebar-overlay"
-            on:click={() => ($editorStore.isMobileSidebarOpen = false)}
-          ></div>
-        {/if}
-        <Sidebar
-          on:addPdf={() => document.getElementById("merge-pdf-input")?.click()}
-        />
-        <Workspace />
-      {/if}
+    </div>
+  {/if}
 
-      <input
-        id="merge-pdf-input"
-        type="file"
-        accept="application/pdf"
-        multiple
-        on:change={handleFileUpload}
-        style="display: none;"
-      />
-    {/if}
-  </div>
+  {#if editor.passwordRequest}
+    {#key editor.passwordRequest}
+      <PasswordModal request={editor.passwordRequest} />
+    {/key}
+  {/if}
+
+  <Toasts />
 </div>
 
 <style>
-  :global(body) {
-    margin: 0;
-    font-family:
-      "Inter",
-      -apple-system,
-      BlinkMacSystemFont,
-      "Segoe UI",
-      Roboto,
-      sans-serif;
-    background: #f5f5f5;
-    color: #333;
-    overflow: hidden;
-  }
-  .app-container {
+  .app {
     display: flex;
     flex-direction: column;
     height: 100vh;
-    width: 100vw;
+    height: 100dvh;
   }
-  .main-content {
+  main {
+    position: relative;
     display: flex;
     flex: 1;
-    overflow: hidden;
+    min-height: 0;
   }
-  .empty-state {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #fafafa;
+  .sidebar-backdrop {
+    display: none;
   }
-  .upload-card {
-    background: white;
-    padding: 60px;
-    border-radius: 12px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05);
-    text-align: center;
-    border: 1px dashed #ccc;
-    max-width: 600px;
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1500;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(25, 118, 210, 0.12);
+    border: 3px dashed var(--color-primary);
+    pointer-events: none;
+  }
+  .drop-overlay div {
     display: flex;
     flex-direction: column;
-    align-items: center;
+    gap: 6px;
+    padding: 20px 28px;
+    border-radius: var(--radius-lg);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-lg);
+    text-align: center;
   }
-  .logo-container {
-    margin-bottom: 24px;
-    max-width: 160px;
-    display: flex;
-    justify-content: center;
+  .drop-overlay strong {
+    font-size: 18px;
+    color: var(--color-primary);
   }
-  .logo-container img {
-    max-width: 100%;
-    height: auto;
+  .drop-overlay span {
+    color: var(--color-text-muted);
   }
-  .upload-card h2 {
-    margin: 0 0 8px 0;
-    font-size: 28px;
-    font-weight: 600;
-  }
-  .subtitle {
-    color: #666;
-    margin-bottom: 32px;
-    font-size: 15px;
-  }
-  .features-grid {
+  .busy {
+    position: fixed;
+    inset: 0;
+    z-index: 1800;
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-    text-align: left;
-    margin-bottom: 32px;
-    background: #f8fafc;
-    padding: 24px;
-    border-radius: 12px;
-    border: 1px solid #e2e8f0;
-    width: 100%;
-    box-sizing: border-box;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.55);
+    cursor: progress;
   }
-  @media (max-width: 600px) {
-    .features-grid {
-      grid-template-columns: 1fr;
-    }
-    .upload-card {
-      padding: 30px 20px;
-    }
-  }
-  .feature-item {
+  .busy-card {
     display: flex;
     align-items: center;
     gap: 12px;
-    font-size: 15px;
+    padding: 16px 24px;
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-lg);
+    color: var(--color-primary);
     font-weight: 500;
-    color: #334155;
   }
-  :global(.feat-icon) {
-    color: #1976d2;
-  }
-  .brand-yta {
-    color: #333;
-  }
-  .brand-pdf {
-    color: #1976d2;
-  }
-  .upload-btn {
-    display: inline-block;
-    margin-top: 24px;
-    padding: 12px 28px;
-    background: #1976d2;
-    color: white;
-    font-size: 16px;
-    font-weight: 500;
-    border-radius: 8px;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-  .upload-btn:hover {
-    background: #1565c0;
-  }
-  .upload-btn input {
-    display: none;
-  }
-  .error-banner {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background-color: #fee2e2;
-    color: #b91c1c;
-    padding: 12px 24px;
-    font-size: 14px;
-    font-weight: 500;
-    border-bottom: 1px solid #fca5a5;
-    z-index: 1000;
-  }
-  .error-text {
-    flex: 1;
-  }
-  .close-error-btn {
-    background: transparent;
-    border: none;
-    color: #b91c1c;
-    font-size: 16px;
-    cursor: pointer;
-    padding: 0 8px;
-  }
-  .close-error-btn:hover {
-    color: #7f1d1d;
-  }
-  .sidebar-overlay {
-    display: none;
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.4);
-    z-index: 90;
-    backdrop-filter: blur(2px);
-  }
+
   @media (max-width: 768px) {
-    .sidebar-overlay {
+    .sidebar-backdrop {
       display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 150;
+      border: none;
+      background: rgba(15, 23, 42, 0.4);
     }
   }
 </style>

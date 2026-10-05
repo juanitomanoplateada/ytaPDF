@@ -1,523 +1,300 @@
 <script lang="ts">
-  import { editorStore } from "../store";
-  import * as fabric from "fabric";
-  import { ArrowLeft, Trash2 } from "lucide-svelte";
-  import { PDFDocument } from "pdf-lib";
-  import * as pdfjsLib from "pdfjs-dist";
-  import ConfirmModal from "./ConfirmModal.svelte";
+  import { flip } from "svelte/animate";
+  import { MediaQuery } from "svelte/reactivity";
+  import { ArrowLeft, ChevronLeft, ChevronRight, Plus, Trash2 } from "lucide-svelte";
+  import { editor } from "../editor.svelte";
+  import PageThumbnail from "./PageThumbnail.svelte";
 
-  let draggedIndex: number | null = null;
-  let dropTargetIndex: number | null = null;
-  let dropPosition: "left" | "right" | null = null;
+  let { onaddfiles }: { onaddfiles: () => void } = $props();
 
-  function renderGridThumbnail(
-    node: HTMLCanvasElement,
-    params: { doc: pdfjsLib.PDFDocumentProxy; pageIndex: number },
-  ) {
-    let renderTask: any;
-    let isActive = true;
+  const compact = new MediaQuery("max-width: 768px");
+  const thumbWidth = $derived(compact.current ? 136 : 168);
 
-    async function paint() {
-      if (!params.doc) return;
-      try {
-        const page = await params.doc.getPage(params.pageIndex);
-        if (!isActive) return;
+  let draggedId = $state<string | null>(null);
+  /** Insertion point in the current order (0…pages.length) while dragging. */
+  let dropIndex = $state<number | null>(null);
 
-        const viewport = page.getViewport({ scale: 0.4 });
-        node.width = viewport.width;
-        node.height = viewport.height;
-
-        const ctx = node.getContext("2d");
-        if (ctx) {
-          renderTask = page.render({ canvasContext: ctx, viewport } as any);
-          await renderTask.promise;
-        }
-      } catch (err: any) {}
-    }
-
-    paint();
-
-    return {
-      update(newParams: { doc: pdfjsLib.PDFDocumentProxy; pageIndex: number }) {
-        if (renderTask) renderTask.cancel();
-        params = newParams;
-        paint();
-      },
-      destroy() {
-        isActive = false;
-        if (renderTask) renderTask.cancel();
-      },
-    };
+  function indexOf(pageId: string) {
+    return editor.pages.findIndex((page) => page.id === pageId);
   }
 
-  function renderGridOverlay(
-    node: HTMLCanvasElement,
-    params: {
-      annotation: any;
-      width: number;
-      height: number;
-    },
-  ) {
-    let staticCanvas: fabric.StaticCanvas;
-
-    function paint() {
-      if (!params.width || !params.height) return;
-      node.width = params.width;
-      node.height = params.height;
-
-      const ctx = node.getContext("2d");
-      if (!ctx) return;
-      ctx.clearRect(0, 0, node.width, node.height);
-
-      if (params.annotation && params.annotation.fabricJSON) {
-        if (!staticCanvas) staticCanvas = new fabric.StaticCanvas(node);
-
-        staticCanvas.loadFromJSON(params.annotation.fabricJSON, () => {
-          const ratioX =
-            node.width / params.annotation.viewportDimensions.width;
-          const ratioY =
-            node.height / params.annotation.viewportDimensions.height;
-
-          const objects = staticCanvas.getObjects();
-          objects.forEach((obj: any) => {
-            obj.scaleX = (obj.scaleX || 1) * ratioX;
-            obj.scaleY = (obj.scaleY || 1) * ratioY;
-            obj.left = (obj.left || 0) * ratioX;
-            obj.top = (obj.top || 0) * ratioY;
-            obj.setCoords();
-          });
-          staticCanvas.renderAll();
-        });
-      } else if (staticCanvas) {
-        staticCanvas.clear();
-      }
-    }
-
-    paint();
-
-    return {
-      update(newParams: any) {
-        params = newParams;
-        paint();
-      },
-      destroy() {
-        if (staticCanvas) staticCanvas.dispose();
-      },
-    };
-  }
-
-  function handleDragStart(e: DragEvent, index: number) {
-    draggedIndex = index;
-    if (e.dataTransfer) {
-      e.dataTransfer.effectAllowed = "move";
-
-      e.dataTransfer.setData("text/plain", index.toString());
+  function ondragstart(event: DragEvent, pageId: string) {
+    draggedId = pageId;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", pageId);
     }
   }
 
-  function handleDragOver(e: DragEvent, index: number) {
-    e.preventDefault();
-    if (draggedIndex === index) return;
-
-    dropTargetIndex = index;
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    if (x < rect.width / 2) {
-      dropPosition = "left";
-    } else {
-      dropPosition = "right";
-    }
+  function ondragover(event: DragEvent, index: number) {
+    if (!draggedId) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    dropIndex = event.clientX > rect.left + rect.width / 2 ? index + 1 : index;
   }
 
-  async function handleDrop(e: DragEvent, targetIndex: number) {
-    e.preventDefault();
-    if (draggedIndex === null || draggedIndex === targetIndex) {
-      dropTargetIndex = null;
-      return;
+  function ondrop(event: DragEvent) {
+    if (!draggedId) return;
+    event.preventDefault();
+    if (dropIndex !== null) {
+      const from = indexOf(draggedId);
+      editor.movePage(draggedId, dropIndex > from ? dropIndex - 1 : dropIndex);
     }
-
-    const fromIndex = draggedIndex;
-    const toIndex = targetIndex;
-
-    draggedIndex = null;
-    dropTargetIndex = null;
-
-    if (!$editorStore.originalPdfBytes) return;
-
-    const oldAnnotations = { ...$editorStore.pagesAnnotations };
-    const newAnnotations: typeof oldAnnotations = {};
-
-    const pageMapping: number[] = [];
-    for (let i = 1; i <= $editorStore.numPages; i++) {
-      pageMapping.push(i);
-    }
-
-    let insertAt = toIndex - 1;
-    if (dropPosition === "right") {
-      insertAt += 1;
-    }
-
-    const removeIndex = fromIndex - 1;
-    const [moved] = pageMapping.splice(removeIndex, 1);
-
-    if (insertAt > removeIndex) {
-      insertAt -= 1;
-    }
-
-    pageMapping.splice(insertAt, 0, moved);
-
-    for (let i = 0; i < pageMapping.length; i++) {
-      const oldPageNum = pageMapping[i];
-      const newPageNum = i + 1;
-      if (oldAnnotations[oldPageNum]) {
-        newAnnotations[newPageNum] = oldAnnotations[oldPageNum];
-      }
-    }
-
-    $editorStore.pagesAnnotations = newAnnotations;
-    $editorStore.history = [newAnnotations];
-    $editorStore.historyIndex = 0;
-
-    const pdfDoc = await PDFDocument.load($editorStore.originalPdfBytes!);
-
-    const pageToMove = fromIndex - 1;
-    const targetSpot = toIndex - 1;
-
-    const newPdf = await PDFDocument.create();
-
-    const indicesToCopy = pageMapping.map((num) => num - 1);
-
-    const copiedPages = await newPdf.copyPages(pdfDoc, indicesToCopy);
-    copiedPages.forEach((p) => newPdf.addPage(p));
-
-    const finalBytes = await newPdf.save();
-
-    $editorStore.originalPdfBytes = finalBytes;
-
-    const loadingTask = pdfjsLib.getDocument({ data: finalBytes.slice() });
-    const newPdfDocument = await loadingTask.promise;
-    $editorStore.loadedPdfDocument = newPdfDocument;
+    resetDrag();
   }
 
-  let pageToDelete: number | null = null;
-  let showDeleteModal = false;
-
-  function requestDeletePage(index: number) {
-    if (!$editorStore.originalPdfBytes) return;
-    pageToDelete = index;
-    showDeleteModal = true;
+  function resetDrag() {
+    draggedId = null;
+    dropIndex = null;
   }
 
-  function cancelDelete() {
-    showDeleteModal = false;
-    pageToDelete = null;
-  }
-
-  async function confirmDelete() {
-    if (pageToDelete === null) return;
-
-    const index = pageToDelete;
-    showDeleteModal = false;
-    pageToDelete = null;
-
-    if ($editorStore.numPages <= 1) {
-      $editorStore.originalPdfBytes = null;
-      $editorStore.loadedPdfDocument = null;
-      $editorStore.numPages = 0;
-      $editorStore.currentPage = 1;
-      $editorStore.pagesAnnotations = {};
-      $editorStore.history = [{}];
-      $editorStore.historyIndex = 0;
-      $editorStore.documentId = "";
-      $editorStore.isOrganizerMode = false;
-      return;
-    }
-
-    const oldAnnotations = { ...$editorStore.pagesAnnotations };
-    const newAnnotations: typeof oldAnnotations = {};
-
-    const pageMapping: number[] = [];
-    for (let i = 1; i <= $editorStore.numPages; i++) {
-      if (i !== index) {
-        pageMapping.push(i);
-      }
-    }
-
-    for (let i = 0; i < pageMapping.length; i++) {
-      const oldPageNum = pageMapping[i];
-      const newPageNum = i + 1;
-      if (oldAnnotations[oldPageNum]) {
-        newAnnotations[newPageNum] = oldAnnotations[oldPageNum];
-      }
-    }
-
-    $editorStore.pagesAnnotations = newAnnotations;
-    $editorStore.history = [newAnnotations];
-    $editorStore.historyIndex = 0;
-
-    const pdfDoc = await PDFDocument.load($editorStore.originalPdfBytes!);
-    pdfDoc.removePage(index - 1);
-
-    const finalBytes = await pdfDoc.save();
-    $editorStore.originalPdfBytes = finalBytes;
-
-    const loadingTask = pdfjsLib.getDocument({ data: finalBytes.slice() });
-    const newPdfDocument = await loadingTask.promise;
-    $editorStore.loadedPdfDocument = newPdfDocument;
-    $editorStore.numPages = newPdfDocument.numPages;
-
-    if ($editorStore.currentPage > newPdfDocument.numPages) {
-      $editorStore.currentPage = newPdfDocument.numPages;
-    }
+  function openInEditor(pageId: string) {
+    editor.currentPageId = pageId;
+    editor.view = "editor";
   }
 </script>
 
-<div class="organizer-container">
-  <div class="header">
-    <div class="header-left">
-      <button
-        class="back-btn"
-        on:click={() => ($editorStore.isOrganizerMode = false)}
-      >
-        <ArrowLeft size={20} />
-        <span>Volver al Editor</span>
-      </button>
-      <h2>Organizador de Páginas</h2>
+<section class="organizer" aria-labelledby="organizer-title">
+  <header>
+    <button class="back" onclick={() => (editor.view = "editor")}>
+      <ArrowLeft size={18} />
+      <span>Volver al editor</span>
+    </button>
+    <div class="heading">
+      <h2 id="organizer-title">Organizar páginas</h2>
+      <p>Arrastra una página para moverla o usa las flechas. Doble clic para editarla.</p>
     </div>
-  </div>
+    <button class="add" onclick={onaddfiles}>
+      <Plus size={18} />
+      <span>Añadir PDF</span>
+    </button>
+  </header>
 
-  <div class="grid-scroll-area">
-    <div class="grid" role="list">
-      {#each Array($editorStore.numPages) as _, i}
-        <div
-          class="grid-item"
-          role="listitem"
-          class:dragging={draggedIndex === i + 1}
-          class:drop-target-left={dropTargetIndex === i + 1 &&
-            dropPosition === "left"}
-          class:drop-target-right={dropTargetIndex === i + 1 &&
-            dropPosition === "right"}
+  <div class="scroll">
+    <ol
+      class="grid"
+      ondragover={(event) => {
+        if (draggedId) event.preventDefault();
+      }}
+      {ondrop}
+    >
+      {#each editor.pages as page, index (page.id)}
+        {@const last = index === editor.pages.length - 1}
+        <li
+          class="card"
+          class:dragging={draggedId === page.id}
+          class:drop-before={draggedId !== null && dropIndex === index}
+          class:drop-after={draggedId !== null && last && dropIndex === index + 1}
           draggable="true"
-          on:dragstart={(e) => handleDragStart(e, i + 1)}
-          on:dragover={(e) => handleDragOver(e, i + 1)}
-          on:drop={(e) => handleDrop(e, i + 1)}
-          on:dragenter={() => (dropTargetIndex = i + 1)}
-          on:dragleave={() => {
-            if (dropTargetIndex === i + 1) {
-              dropTargetIndex = null;
-              dropPosition = null;
-            }
-          }}
+          animate:flip={{ duration: 200 }}
+          ondragstart={(event) => ondragstart(event, page.id)}
+          ondragover={(event) => ondragover(event, index)}
+          ondragend={resetDrag}
+          ondblclick={() => openInEditor(page.id)}
         >
-          <div class="page-number-badge">{i + 1}</div>
-          <div class="canvas-wrapper">
-            <canvas
-              class="grid-base"
-              use:renderGridThumbnail={{
-                doc: $editorStore.loadedPdfDocument!,
-                pageIndex: i + 1,
-              }}
-            ></canvas>
-            <canvas
-              class="grid-overlay"
-              use:renderGridOverlay={{
-                annotation: $editorStore.pagesAnnotations[i + 1],
-
-                width: 200,
-                height: 282,
-              }}
-            ></canvas>
+          <div class="preview">
+            <PageThumbnail {page} width={thumbWidth} annotations={editor.annotations[page.id]} />
+          </div>
+          <div class="controls">
             <button
-              class="delete-page-btn"
+              class="icon"
+              aria-label="Mover la página {index + 1} hacia atrás"
+              title="Mover hacia atrás"
+              disabled={index === 0}
+              onclick={() => editor.movePage(page.id, index - 1)}
+            >
+              <ChevronLeft size={16} />
+            </button>
+            <span class="number">{index + 1}</span>
+            <button
+              class="icon"
+              aria-label="Mover la página {index + 1} hacia delante"
+              title="Mover hacia delante"
+              disabled={last}
+              onclick={() => editor.movePage(page.id, index + 1)}
+            >
+              <ChevronRight size={16} />
+            </button>
+            <button
+              class="icon danger"
+              aria-label="Eliminar la página {index + 1}"
               title="Eliminar página"
-              on:click|stopPropagation={() => requestDeletePage(i + 1)}
+              onclick={() => editor.deletePage(page.id)}
             >
               <Trash2 size={16} />
             </button>
           </div>
-        </div>
+        </li>
       {/each}
-    </div>
+    </ol>
   </div>
-</div>
-
-{#if showDeleteModal}
-  <ConfirmModal
-    title="Eliminar Página"
-    message={`¿Estás seguro de que deseas eliminar la página ${pageToDelete}? Esta acción no se puede deshacer.`}
-    on:confirm={confirmDelete}
-    on:cancel={cancelDelete}
-  />
-{/if}
+</section>
 
 <style>
-  .organizer-container {
-    width: 100%;
-    height: 100%;
+  .organizer {
     display: flex;
     flex-direction: column;
-    background: #f0f2f5;
+    flex: 1;
+    min-width: 0;
+    background: var(--color-surface-muted);
   }
-  .header {
-    height: 64px;
-    background: white;
-    border-bottom: 1px solid #e0e0e0;
+  header {
     display: flex;
     align-items: center;
-    padding: 0 24px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    gap: 20px;
+    padding: 12px 24px;
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
   }
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 24px;
+  .heading {
+    flex: 1;
+    min-width: 0;
   }
-  .header h2 {
+  h2 {
     margin: 0;
-    font-size: 18px;
+    font-size: 17px;
     font-weight: 600;
-    color: #333;
   }
-  .back-btn {
+  .heading p {
+    margin: 2px 0 0;
+    color: var(--color-text-muted);
+    font-size: 13px;
+  }
+  .back,
+  .add {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 16px;
-    background: transparent;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    color: #333;
-    cursor: pointer;
+    padding: 8px 14px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface);
     font-weight: 500;
-    transition: all 0.2s;
+    cursor: pointer;
+    white-space: nowrap;
   }
-  .back-btn:hover {
-    background: #f5f5f5;
+  .back:hover,
+  .add:hover {
+    background: var(--color-surface-muted);
   }
-  .grid-scroll-area {
+  .add {
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+  .scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 40px;
+    padding: 28px 24px 48px;
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 32px;
-    max-width: 1400px;
+    grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+    gap: 24px;
     margin: 0 auto;
+    padding: 0;
+    max-width: 1400px;
+    list-style: none;
   }
-  .grid-item {
+  .card {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
+    gap: 10px;
+    padding: 12px;
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-sm), 0 0 0 1px var(--color-border);
     cursor: grab;
+    user-select: none;
     transition:
-      transform 0.2s,
-      box-shadow 0.2s;
-    position: relative;
+      box-shadow 0.15s,
+      opacity 0.15s;
   }
-  .grid-item:active {
-    cursor: grabbing;
+  .card:hover {
+    box-shadow: var(--shadow-md), 0 0 0 1px #c9ced6;
   }
-  .grid-item.dragging {
+  .card.dragging {
     opacity: 0.4;
-    transform: scale(0.95);
   }
-  .grid-item.drop-target-left .canvas-wrapper {
-    border-left: 6px solid #1976d2;
-    box-shadow:
-      -8px 0 16px rgba(25, 118, 210, 0.3),
-      0 8px 24px rgba(0, 0, 0, 0.15);
-    transform: translateX(8px) scale(0.98);
-    border-top-left-radius: 2px;
-    border-bottom-left-radius: 2px;
-  }
-  .grid-item.drop-target-right .canvas-wrapper {
-    border-right: 6px solid #1976d2;
-    box-shadow:
-      8px 0 16px rgba(25, 118, 210, 0.3),
-      0 8px 24px rgba(0, 0, 0, 0.15);
-    transform: translateX(-8px) scale(0.98);
-    border-top-right-radius: 2px;
-    border-bottom-right-radius: 2px;
-  }
-  .page-number-badge {
-    background: #333;
-    color: white;
-    font-size: 12px;
-    font-weight: bold;
-    padding: 4px 12px;
-    border-radius: 12px;
-    margin-bottom: 12px;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-  }
-  .canvas-wrapper {
-    width: 100%;
-    aspect-ratio: 1 / 1.414;
-    background: white;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-    border: 2px solid transparent;
-    border-radius: 8px;
-    overflow: hidden;
-    position: relative;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    transition: all 0.2s;
-  }
-  .grid-item:hover .canvas-wrapper {
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
-  }
-  .grid-base {
-    max-width: 100%;
-    max-height: 100%;
-    display: block;
-  }
-  .grid-overlay {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    pointer-events: none;
-  }
-  .delete-page-btn {
+  .card.drop-before::before,
+  .card.drop-after::after {
+    content: "";
     position: absolute;
     top: 8px;
-    right: 8px;
-    background: rgba(255, 0, 0, 0.8);
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 28px;
-    height: 28px;
+    bottom: 8px;
+    width: 4px;
+    border-radius: 2px;
+    background: var(--color-primary);
+  }
+  .card.drop-before::before {
+    left: -14px;
+  }
+  .card.drop-after::after {
+    right: -14px;
+  }
+  .preview {
+    box-shadow: 0 0 0 1px var(--color-border);
+    pointer-events: none;
+  }
+  .controls {
     display: flex;
     align-items: center;
-    justify-content: center;
+    gap: 2px;
+  }
+  .number {
+    min-width: 32px;
+    text-align: center;
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .icon {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-text-muted);
     cursor: pointer;
-    opacity: 0;
-    transition:
-      opacity 0.2s,
-      background 0.2s;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
   }
-  .delete-page-btn:hover {
-    background: rgba(255, 0, 0, 1);
+  .icon:hover:not(:disabled) {
+    background: var(--color-surface-muted);
+    color: var(--color-text);
   }
-  .grid-item:hover .delete-page-btn {
-    opacity: 1;
+  .icon:disabled {
+    opacity: 0.35;
+    cursor: default;
   }
-  @media (max-width: 600px) {
-    .header {
-      padding: 0 16px;
+  .icon.danger {
+    margin-left: 6px;
+    color: var(--color-danger);
+  }
+  .icon.danger:hover {
+    background: var(--color-danger-soft);
+    color: var(--color-danger);
+  }
+
+  @media (max-width: 768px) {
+    header {
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 12px 16px;
     }
-    .header h2 {
-      display: none;
+    .heading {
+      order: 3;
+      flex-basis: 100%;
     }
-    .grid-scroll-area {
-      padding: 16px;
+    .add {
+      margin-left: auto;
+    }
+    .scroll {
+      padding: 16px 12px 40px;
     }
     .grid {
-      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
       gap: 16px;
     }
   }

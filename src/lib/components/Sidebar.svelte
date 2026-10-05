@@ -1,422 +1,235 @@
 <script lang="ts">
-  import { createEventDispatcher } from "svelte";
-  import { editorStore } from "../store";
   import { LayoutGrid, Plus, Trash2, X } from "lucide-svelte";
-  import { PDFDocument } from "pdf-lib";
-  import * as pdfjsLib from "pdfjs-dist";
-  import ConfirmModal from "./ConfirmModal.svelte";
+  import { editor } from "../editor.svelte";
+  import PageThumbnail from "./PageThumbnail.svelte";
 
-  const dispatch = createEventDispatcher();
+  let { onaddfiles }: { onaddfiles: () => void } = $props();
 
-  function requestScrollTo(pageNumber: number) {
-    if ($editorStore.currentPage !== pageNumber) {
-      $editorStore.currentPage = pageNumber;
-    }
-    window.dispatchEvent(
-      new CustomEvent("request-page-scroll", { detail: { pageNumber } }),
-    );
-  }
+  let list: HTMLOListElement;
 
-  let thumbnailsContainer: HTMLDivElement;
+  // Keep the current page's thumbnail in view while the user scrolls the document.
+  $effect(() => {
+    const id = editor.currentPageId;
+    if (!id) return;
+    list.querySelector(`[data-thumb-id="${id}"]`)?.scrollIntoView({ block: "nearest" });
+  });
 
-  $: if (thumbnailsContainer && $editorStore.currentPage) {
-    const activeThumb = document.getElementById(
-      `sidebar-thumb-${$editorStore.currentPage}`,
-    );
-    if (activeThumb) {
-      activeThumb.scrollIntoView({
-        behavior: "smooth",
-        block: "nearest",
-      });
-    }
-  }
-
-  function renderThumbnail(
-    node: HTMLCanvasElement,
-    params: { doc: pdfjsLib.PDFDocumentProxy; pageIndex: number },
-  ) {
-    let renderTask: any;
-    let isActive = true;
-
-    async function paint() {
-      if (!params.doc) return;
-      try {
-        const page = await params.doc.getPage(params.pageIndex);
-        if (!isActive) return;
-
-        const viewport = page.getViewport({ scale: 0.3 });
-        node.width = viewport.width;
-        node.height = viewport.height;
-
-        const ctx = node.getContext("2d");
-        if (ctx) {
-          renderTask = page.render({ canvasContext: ctx, viewport } as any);
-          await renderTask.promise;
-        }
-      } catch (err: any) {}
-    }
-
-    paint();
-
-    return {
-      update(newParams: { doc: pdfjsLib.PDFDocumentProxy; pageIndex: number }) {
-        if (renderTask) renderTask.cancel();
-        params = newParams;
-        paint();
-      },
-      destroy() {
-        isActive = false;
-        if (renderTask) renderTask.cancel();
-      },
-    };
-  }
-
-  let pageToDelete: number | null = null;
-  let showDeleteModal = false;
-
-  function requestDeletePage(index: number, e: Event) {
-    e.stopPropagation();
-    if (!$editorStore.originalPdfBytes) return;
-    pageToDelete = index;
-    showDeleteModal = true;
-  }
-
-  function cancelDelete() {
-    showDeleteModal = false;
-    pageToDelete = null;
-  }
-
-  async function confirmDelete() {
-    if (pageToDelete === null) return;
-
-    const index = pageToDelete;
-    showDeleteModal = false;
-    pageToDelete = null;
-
-    if ($editorStore.numPages <= 1) {
-      $editorStore.originalPdfBytes = null;
-      $editorStore.loadedPdfDocument = null;
-      $editorStore.numPages = 0;
-      $editorStore.currentPage = 1;
-      $editorStore.pagesAnnotations = {};
-      $editorStore.history = [{}];
-      $editorStore.historyIndex = 0;
-      $editorStore.documentId = "";
-      $editorStore.isOrganizerMode = false;
-      return;
-    }
-
-    const oldAnnotations = { ...$editorStore.pagesAnnotations };
-    const newAnnotations: typeof oldAnnotations = {};
-
-    const pageMapping: number[] = [];
-    for (let i = 1; i <= $editorStore.numPages; i++) {
-      if (i !== index) {
-        pageMapping.push(i);
-      }
-    }
-
-    for (let i = 0; i < pageMapping.length; i++) {
-      const oldPageNum = pageMapping[i];
-      const newPageNum = i + 1;
-      if (oldAnnotations[oldPageNum]) {
-        newAnnotations[newPageNum] = oldAnnotations[oldPageNum];
-      }
-    }
-
-    $editorStore.pagesAnnotations = newAnnotations;
-    $editorStore.history = [newAnnotations];
-    $editorStore.historyIndex = 0;
-
-    const pdfDoc = await PDFDocument.load($editorStore.originalPdfBytes!);
-    pdfDoc.removePage(index - 1);
-
-    const finalBytes = await pdfDoc.save();
-    $editorStore.originalPdfBytes = finalBytes;
-
-    const loadingTask = pdfjsLib.getDocument({ data: finalBytes.slice() });
-    const newPdfDocument = await loadingTask.promise;
-    $editorStore.loadedPdfDocument = newPdfDocument;
-    $editorStore.numPages = newPdfDocument.numPages;
-
-    if ($editorStore.currentPage > newPdfDocument.numPages) {
-      $editorStore.currentPage = newPdfDocument.numPages;
-    } else if ($editorStore.currentPage === index) {
-      $editorStore.currentPage = Math.max(1, index - 1);
-    }
+  function open(pageId: string) {
+    editor.goToPage(pageId);
+    editor.sidebarOpen = false;
   }
 </script>
 
-<div class="sidebar" class:open={$editorStore.isMobileSidebarOpen}>
-  <div class="sidebar-header">
+<aside class="sidebar" class:open={editor.sidebarOpen} aria-label="Páginas del documento">
+  <header>
+    <h2>Páginas <span class="count">{editor.pages.length}</span></h2>
     <button
-      class="organizer-btn"
-      on:click={() => {
-        $editorStore.isOrganizerMode = true;
-        $editorStore.isMobileSidebarOpen = false;
+      class="icon"
+      title="Organizar páginas"
+      aria-label="Organizar páginas"
+      onclick={() => {
+        editor.view = "organizer";
+        editor.sidebarOpen = false;
       }}
     >
       <LayoutGrid size={18} />
-      <span>Vista de Organizador</span>
     </button>
-    <button
-      class="close-sidebar-btn"
-      on:click={() => ($editorStore.isMobileSidebarOpen = false)}
-      title="Cerrar menú"
-    >
-      <X size={20} />
+    <button class="icon close" aria-label="Cerrar panel" onclick={() => (editor.sidebarOpen = false)}>
+      <X size={18} />
     </button>
-  </div>
+  </header>
 
-  <div class="thumbnails" bind:this={thumbnailsContainer}>
-    {#each Array($editorStore.numPages) as _, i}
-      <div
-        id="sidebar-thumb-{i + 1}"
-        class="thumbnail-item"
-        class:active={$editorStore.currentPage === i + 1}
-        role="button"
-        tabindex="0"
-        on:click={() => requestScrollTo(i + 1)}
-        on:keydown={(e) =>
-          (e.key === "Enter" || e.key === " ") && requestScrollTo(i + 1)}
-      >
-        <span class="page-number">{i + 1}</span>
-        <div class="thumb-box">
-          <canvas
-            class="thumb-base"
-            use:renderThumbnail={{
-              doc: $editorStore.loadedPdfDocument!,
-              pageIndex: i + 1,
-            }}
-          ></canvas>
-          <button
-            class="delete-page-btn"
-            title="Eliminar página"
-            on:click={(e) => requestDeletePage(i + 1, e)}
-          >
-            <Trash2 size={16} />
-          </button>
-        </div>
-      </div>
+  <ol class="pages" bind:this={list}>
+    {#each editor.pages as page, index (page.id)}
+      {@const current = page.id === editor.currentPageId}
+      <li data-thumb-id={page.id} class:current>
+        <button
+          class="thumb"
+          aria-label="Ir a la página {index + 1}"
+          aria-current={current ? "page" : undefined}
+          onclick={() => open(page.id)}
+        >
+          <PageThumbnail {page} width={132} annotations={editor.annotations[page.id]} />
+        </button>
+        <span class="number">{index + 1}</span>
+        <button
+          class="delete"
+          title="Eliminar página {index + 1}"
+          aria-label="Eliminar página {index + 1}"
+          onclick={() => editor.deletePage(page.id)}
+        >
+          <Trash2 size={14} />
+        </button>
+      </li>
     {/each}
+  </ol>
 
-    <button class="add-pdf-btn" on:click={() => dispatch("addPdf")}>
-      <Plus size={24} />
-      <span>Añadir PDF...</span>
+  <footer>
+    <button class="add" onclick={onaddfiles}>
+      <Plus size={18} />
+      Añadir PDF
     </button>
-
-    <div class="logo-container">
-      <img src="/paty.png" alt="Paty Logo" />
-    </div>
-  </div>
-</div>
-
-{#if showDeleteModal}
-  <ConfirmModal
-    title="Eliminar Página"
-    message={`¿Estás seguro de que deseas eliminar la página ${pageToDelete}? Esta acción no se puede deshacer.`}
-    on:confirm={confirmDelete}
-    on:cancel={cancelDelete}
-  />
-{/if}
+  </footer>
+</aside>
 
 <style>
   .sidebar {
-    width: 220px;
-    background: #f9f9f9;
-    border-right: 1px solid #e0e0e0;
+    display: flex;
+    flex-direction: column;
+    width: 200px;
+    flex-shrink: 0;
+    background: var(--color-surface);
+    border-right: 1px solid var(--color-border);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 12px 8px 12px 16px;
+    border-bottom: 1px solid var(--color-border);
+  }
+  h2 {
+    flex: 1;
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-muted);
+  }
+  .count {
+    margin-left: 4px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--color-surface-muted);
+    font-size: 12px;
+  }
+  .icon {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-text-muted);
+    cursor: pointer;
+  }
+  .icon:hover {
+    background: var(--color-surface-muted);
+    color: var(--color-text);
+  }
+  .close {
+    display: none;
+  }
+  .pages {
+    flex: 1;
     overflow-y: auto;
-    padding: 16px;
+    margin: 0;
+    padding: 16px 0;
+    list-style: none;
+  }
+  li {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
-    transition: transform 0.3s ease;
+    gap: 6px;
+    padding: 8px 0;
   }
+  .thumb {
+    padding: 0;
+    border: 2px solid transparent;
+    border-radius: 4px;
+    background: none;
+    box-shadow: var(--shadow-sm), 0 0 0 1px var(--color-border);
+    cursor: pointer;
+    transition:
+      border-color 0.15s,
+      box-shadow 0.15s;
+  }
+  .thumb:hover {
+    box-shadow: var(--shadow-md), 0 0 0 1px #c9ced6;
+  }
+  .current .thumb {
+    border-color: var(--color-primary);
+  }
+  .number {
+    font-size: 12px;
+    color: var(--color-text-muted);
+  }
+  .current .number {
+    color: var(--color-primary);
+    font-weight: 600;
+  }
+  .delete {
+    position: absolute;
+    top: 14px;
+    right: 26px;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 50%;
+    background: var(--color-surface);
+    color: var(--color-danger);
+    box-shadow: var(--shadow-md);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  li:hover .delete,
+  .delete:focus-visible {
+    opacity: 1;
+  }
+  .delete:hover {
+    background: var(--color-danger-soft);
+  }
+  @media (hover: none) {
+    .delete {
+      opacity: 1;
+    }
+  }
+  footer {
+    padding: 12px;
+    border-top: 1px solid var(--color-border);
+  }
+  .add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 10px;
+    border: 1px dashed #b8c0cc;
+    border-radius: var(--radius-md);
+    background: var(--color-surface-muted);
+    color: var(--color-text-muted);
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .add:hover {
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+    background: var(--color-primary-soft);
+  }
+
   @media (max-width: 768px) {
     .sidebar {
       position: fixed;
-      top: 0;
-      bottom: 0;
-      left: 0;
-      z-index: 100;
-      box-shadow: 4px 0 16px rgba(0, 0, 0, 0.1);
-      transform: translateX(-100%);
+      inset: 0 auto 0 0;
+      z-index: 200;
+      width: min(260px, 80vw);
+      box-shadow: var(--shadow-lg);
+      transform: translateX(-105%);
+      transition: transform 0.25s ease;
     }
     .sidebar.open {
       transform: translateX(0);
     }
-  }
-  .logo-container {
-    margin-top: auto;
-    width: 100%;
-    padding-top: 24px;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    opacity: 0.8;
-  }
-  .logo-container img {
-    max-width: 140px;
-    height: auto;
-  }
-  .sidebar-header {
-    width: 100%;
-    margin-bottom: 24px;
-    display: flex;
-    justify-content: center;
-    gap: 8px;
-  }
-  .organizer-btn {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
-    background: white;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    color: #333;
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.2s;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-    width: 100%;
-    justify-content: center;
-  }
-  .organizer-btn:hover {
-    background: #f0f0f0;
-    border-color: #bbb;
-  }
-  .add-pdf-btn {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    width: 120px;
-    height: 160px;
-    background: transparent;
-    border: 2px dashed #ccc;
-    border-radius: 8px;
-    color: #666;
-    cursor: pointer;
-    transition: all 0.2s;
-    margin-top: 8px;
-    margin-bottom: 32px;
-  }
-  .add-pdf-btn:hover {
-    border-color: #1976d2;
-    color: #1976d2;
-    background: rgba(25, 118, 210, 0.05);
-  }
-  .add-pdf-btn span {
-    font-size: 13px;
-    font-weight: 500;
-  }
-  .thumbnails {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 16px;
-  }
-  .thumbnail-item {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    cursor: pointer;
-    width: 100%;
-    padding: 8px 0;
-    border-radius: 8px;
-    transition: background-color 0.2s;
-  }
-  .thumbnail-item.active {
-    background-color: #e3f2fd;
-  }
-  .thumbnail-item.active .page-number {
-    color: #1976d2;
-    font-weight: 600;
-  }
-  .thumbnail-item.active .thumb-box {
-    border-color: #1976d2;
-    box-shadow: 0 0 0 2px rgba(25, 118, 210, 0.3);
-  }
-  .page-number {
-    font-size: 13px;
-    color: #666;
-    margin-bottom: 6px;
-  }
-  .thumb-box {
-    width: 120px;
-    min-height: 160px;
-    background: white;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    overflow: hidden;
-    position: relative;
-    display: flex;
-    justify-content: center;
-    transition: all 0.2s;
-  }
-  .thumb-base {
-    max-width: 100%;
-    height: auto;
-    display: block;
-  }
-
-  .thumbnail-item:hover .thumb-box {
-    border-color: #90caf9;
-  }
-  .delete-page-btn {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    background: rgba(255, 0, 0, 0.8);
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    opacity: 0;
-    transition:
-      opacity 0.2s,
-      background 0.2s;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-  }
-  .delete-page-btn:hover {
-    background: rgba(255, 0, 0, 1);
-  }
-  .thumbnail-item:hover .delete-page-btn {
-    opacity: 1;
-  }
-  .close-sidebar-btn {
-    display: none;
-    background: transparent;
-    border: none;
-    color: #666;
-    cursor: pointer;
-    padding: 4px;
-    border-radius: 4px;
-  }
-  .close-sidebar-btn:hover {
-    background: #e0e0e0;
-  }
-  @media (max-width: 768px) {
-    .close-sidebar-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .organizer-btn {
-      padding: 10px 8px;
-    }
-    .organizer-btn span {
-      display: none;
+    .close {
+      display: grid;
     }
   }
 </style>

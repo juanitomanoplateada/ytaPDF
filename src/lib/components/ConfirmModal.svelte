@@ -1,104 +1,70 @@
 <script lang="ts">
-  import { createEventDispatcher } from "svelte";
-  const dispatch = createEventDispatcher();
+  import Modal from "./Modal.svelte";
 
-  export let title: string = "Confirmación";
-  export let message: string = "¿Estás seguro?";
-  export let confirmText: string = "Sí, eliminar";
-  export let cancelText: string = "Cancelar";
-
-  function handleConfirm() {
-    dispatch("confirm");
+  interface Props {
+    title: string;
+    message: string;
+    confirmText?: string;
+    cancelText?: string;
+    danger?: boolean;
+    onconfirm: () => void;
+    oncancel: () => void;
   }
 
-  function handleCancel() {
-    dispatch("cancel");
-  }
-
-  function handleKeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
-      handleCancel();
-    }
-  }
+  let {
+    title,
+    message,
+    confirmText = "Confirmar",
+    cancelText = "Cancelar",
+    danger = false,
+    onconfirm,
+    oncancel,
+  }: Props = $props();
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
-
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="modal-backdrop" on:click={handleCancel}>
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-content" on:click|stopPropagation>
-    <h3>{title}</h3>
-    <p>{message}</p>
-    <div class="modal-actions">
-      <button class="cancel-btn" on:click={handleCancel}>{cancelText}</button>
-      <button class="confirm-btn" on:click={handleConfirm}>{confirmText}</button
-      >
-    </div>
+<Modal {title} onclose={oncancel}>
+  <p>{message}</p>
+  <div class="actions">
+    <button class="secondary" onclick={oncancel} data-autofocus>{cancelText}</button>
+    <button class="primary" class:danger onclick={onconfirm}>{confirmText}</button>
   </div>
-</div>
+</Modal>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    background: rgba(0, 0, 0, 0.5);
+  p {
+    margin: 0 0 24px;
+    color: var(--color-text-muted);
+  }
+  .actions {
     display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 9999;
-  }
-  .modal-content {
-    background: white;
-    padding: 24px;
-    border-radius: 12px;
-    width: 400px;
-    max-width: 90%;
-    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
-    text-align: center;
-  }
-  .modal-content h3 {
-    margin-top: 0;
-    font-size: 20px;
-    color: #333;
-  }
-  .modal-content p {
-    color: #666;
-    margin-bottom: 24px;
-    line-height: 1.5;
-  }
-  .modal-actions {
-    display: flex;
-    justify-content: center;
-    gap: 16px;
+    justify-content: flex-end;
+    gap: 8px;
   }
   button {
-    padding: 10px 20px;
-    border-radius: 6px;
-    font-size: 14px;
+    padding: 9px 16px;
+    border: none;
+    border-radius: var(--radius-sm);
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.2s;
   }
-  .cancel-btn {
-    background: transparent;
-    border: 1px solid #ccc;
-    color: #555;
+  .secondary {
+    background: var(--color-surface-muted);
+    border: 1px solid var(--color-border);
   }
-  .cancel-btn:hover {
-    background: #f5f5f5;
+  .secondary:hover {
+    background: #eceef1;
   }
-  .confirm-btn {
-    background: #ef4444;
-    border: 1px solid #ef4444;
+  .primary {
+    background: var(--color-primary);
     color: white;
   }
-  .confirm-btn:hover {
-    background: #dc2626;
+  .primary:hover {
+    background: var(--color-primary-hover);
+  }
+  .primary.danger {
+    background: var(--color-danger);
+  }
+  .primary.danger:hover {
+    background: #c03535;
   }
 </style>
