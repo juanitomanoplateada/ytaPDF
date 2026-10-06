@@ -21,10 +21,7 @@ export function rotateAnnotations(
   delta: QuarterTurn,
 ): PageAnnotations {
   const objects = data.objects.map((object) => {
-    const x = Number(object.left ?? 0);
-    const y = Number(object.top ?? 0);
-    const [left, top] =
-      delta === 90 ? [height - y, x] : delta === 180 ? [width - x, height - y] : [y, width - x];
+    const [left, top] = rotatePoint(Number(object.left ?? 0), Number(object.top ?? 0), width, height, delta);
     return {
       ...object,
       left,
@@ -33,6 +30,18 @@ export function rotateAnnotations(
     };
   });
   return { ...data, objects };
+}
+
+/** Where a point lands when a `width` × `height` page turns clockwise by `delta`. */
+function rotatePoint(x: number, y: number, width: number, height: number, delta: QuarterTurn): [number, number] {
+  switch (delta) {
+    case 90:
+      return [height - y, x];
+    case 180:
+      return [width - x, height - y];
+    case 270:
+      return [y, width - x];
+  }
 }
 
 function normalizeAngle(angle: number): number {

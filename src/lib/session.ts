@@ -29,12 +29,17 @@ const STORE = "session";
 const KEY = "current";
 const PREFERENCE = "ytapdf.recovery";
 
+/** IndexedDB reports failures as a DOMException that may be missing (for example, on abort). */
+function storageError(error: DOMException | null): Error {
+  return error ?? new Error("No se pudo acceder al almacenamiento local.");
+}
+
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1);
     request.onupgradeneeded = () => request.result.createObjectStore(STORE);
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => reject(storageError(request.error));
   });
 }
 
@@ -45,8 +50,8 @@ async function run<T>(mode: IDBTransactionMode, action: (store: IDBObjectStore) 
       const transaction = db.transaction(STORE, mode);
       const request = action(transaction.objectStore(STORE));
       transaction.oncomplete = () => resolve(request.result);
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(storageError(transaction.error));
+      transaction.onabort = () => reject(storageError(transaction.error));
     });
   } finally {
     db.close();

@@ -268,7 +268,7 @@ describe("embedded fonts", () => {
     const text = { ...textAt([1, 0, 0, 1, 40, 80], "Привет κόσμε, ñandú"), fontFamily: '"Noto Sans", sans-serif' };
     await drawOnPage(doc.getPage(0), [text], vt, context);
     expect(context.missingGlyphs.size).toBe(0);
-    expect((await pageTexts(await doc.save()))[0].replace(/\s+/g, " ")).toBe("Привет κόσμε, ñandú");
+    expect((await pageTexts(await doc.save()))[0].replaceAll(/\s+/g, " ")).toBe("Привет κόσμε, ñandú");
   });
 
   it("reports glyphs missing from the embedded font", async () => {

@@ -86,24 +86,29 @@ export function readJpegOrientation(bytes: Uint8Array): number {
     const length = view.getUint16(offset + 2);
     // Start of scan: no more metadata segments.
     if (marker === 0xda) return 1;
+    // APP1 segment starting with "Exif\0\0", followed by a TIFF header.
     if (marker === 0xe1 && offset + 10 <= view.byteLength && view.getUint32(offset + 4) === 0x45786966) {
-      const tiff = offset + 10;
-      if (tiff + 8 > view.byteLength) return 1;
-      const little = view.getUint16(tiff) === 0x4949;
-      const ifd = tiff + view.getUint32(tiff + 4, little);
-      if (ifd + 2 > view.byteLength) return 1;
-      const entries = view.getUint16(ifd, little);
-      for (let i = 0; i < entries; i++) {
-        const entry = ifd + 2 + i * 12;
-        if (entry + 10 > view.byteLength) return 1;
-        if (view.getUint16(entry, little) === 0x0112) {
-          const value = view.getUint16(entry + 8, little);
-          return value >= 1 && value <= 8 ? value : 1;
-        }
-      }
-      return 1;
+      return exifOrientation(view, offset + 10);
     }
     offset += 2 + length;
+  }
+  return 1;
+}
+
+/** Orientation tag of the TIFF block at `tiff`, or 1 when absent or malformed. */
+function exifOrientation(view: DataView, tiff: number): number {
+  if (tiff + 8 > view.byteLength) return 1;
+  const little = view.getUint16(tiff) === 0x4949;
+  const ifd = tiff + view.getUint32(tiff + 4, little);
+  if (ifd + 2 > view.byteLength) return 1;
+  const entries = view.getUint16(ifd, little);
+  for (let i = 0; i < entries; i++) {
+    const entry = ifd + 2 + i * 12;
+    if (entry + 10 > view.byteLength) return 1;
+    if (view.getUint16(entry, little) === 0x0112) {
+      const value = view.getUint16(entry + 8, little);
+      return value >= 1 && value <= 8 ? value : 1;
+    }
   }
   return 1;
 }

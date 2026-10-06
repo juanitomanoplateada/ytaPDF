@@ -350,7 +350,7 @@ function readTextStyle(text: FabricText): TextStyle {
   };
 }
 
-const STROKED: ObjectKind[] = ["rect", "ellipse", "line", "arrow", "signature"];
+const STROKED = new Set<ObjectKind>(["rect", "ellipse", "line", "arrow", "signature"]);
 
 function readShapeStyle(object: FabricObject): ShapeStyle {
   return {
@@ -374,7 +374,7 @@ export function describeSelection(canvas: Canvas): SelectionInfo | null {
   if (!active) return null;
   const objects = selectedObjects(canvas);
   const firstText = objects.find(isText);
-  const firstShape = objects.find((o) => STROKED.includes(kindOf(o)));
+  const firstShape = objects.find((o) => STROKED.has(kindOf(o)));
   const firstHighlight = objects.find((o) => kindOf(o) === "highlight");
   return {
     kind: objects.length > 1 ? "multiple" : kindOf(active),
@@ -420,16 +420,21 @@ export function applyShapeStyle(canvas: Canvas, style: Partial<ShapeStyle>, high
     if (kind === "highlight" && highlight) {
       object.set("fill", highlight);
       changed = true;
-    } else if (STROKED.includes(kind)) {
-      if (style.stroke !== undefined) object.set("stroke", style.stroke);
-      if (style.strokeWidth !== undefined) object.set("strokeWidth", style.strokeWidth);
-      if (style.fill !== undefined && (kind === "rect" || kind === "ellipse")) object.set("fill", style.fill);
-      object.setCoords();
+    } else if (STROKED.has(kind)) {
+      setShapeStyle(object, kind, style);
       changed = true;
     }
   }
   if (changed) canvas.requestRenderAll();
   return changed;
+}
+
+function setShapeStyle(object: FabricObject, kind: ObjectKind, style: Partial<ShapeStyle>): void {
+  if (style.stroke !== undefined) object.set("stroke", style.stroke);
+  if (style.strokeWidth !== undefined) object.set("strokeWidth", style.strokeWidth);
+  // Only closed shapes take a fill.
+  if (style.fill !== undefined && (kind === "rect" || kind === "ellipse")) object.set("fill", style.fill);
+  object.setCoords();
 }
 
 /** Changes the stacking order of the selection, keeping its internal order. */
@@ -649,7 +654,7 @@ export function clearTopLayer(canvas: Canvas): void {
 function normalizeHex(color: string): string {
   if (/^#[0-9a-f]{6}$/i.test(color)) return color.toLowerCase();
   if (/^#[0-9a-f]{3}$/i.test(color)) {
-    return `#${[...color.slice(1)].map((c) => c + c).join("")}`.toLowerCase();
+    return `#${Array.from(color.slice(1), (c) => c + c).join("")}`.toLowerCase();
   }
   return color;
 }

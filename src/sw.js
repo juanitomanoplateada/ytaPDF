@@ -7,31 +7,33 @@ const PRECACHE = __PRECACHE__;
 const SHELL = `ytapdf-shell-${VERSION}`;
 const RUNTIME = `ytapdf-runtime-${VERSION}`;
 
-self.addEventListener("install", (event) => {
+globalThis.addEventListener("install", (event) => {
   event.waitUntil(caches.open(SHELL).then((cache) => cache.addAll(PRECACHE)));
 });
 
-self.addEventListener("activate", (event) => {
+globalThis.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
       for (const key of await caches.keys()) {
         if (key.startsWith("ytapdf-") && key !== SHELL && key !== RUNTIME) await caches.delete(key);
       }
-      await self.clients.claim();
+      await globalThis.clients.claim();
     })(),
   );
 });
 
-// The page asks for this when the user accepts the update.
-self.addEventListener("message", (event) => {
-  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+// The page asks for this when the user accepts the update. Only pages of this
+// app may ask.
+globalThis.addEventListener("message", (event) => {
+  if (event.origin !== globalThis.location.origin) return;
+  if (event.data?.type === "SKIP_WAITING") globalThis.skipWaiting();
 });
 
-self.addEventListener("fetch", (event) => {
+globalThis.addEventListener("fetch", (event) => {
   const { request } = event;
   if (request.method !== "GET") return;
   const url = new URL(request.url);
-  if (url.origin !== self.location.origin) return;
+  if (url.origin !== globalThis.location.origin) return;
 
   // Pages: network first so updates arrive, cached shell when offline.
   if (request.mode === "navigate") {

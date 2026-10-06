@@ -19,6 +19,7 @@ import {
   sanitizeForStandardFont,
   type EmbeddedFamilyId,
   type FontVariant,
+  type FontWeight,
   type ResolvedFont,
 } from "../fonts";
 
@@ -48,7 +49,7 @@ export interface TextDrawable extends Placed {
   lines: TextLine[];
   fontSize: number;
   fontFamily?: string;
-  fontWeight?: string | number;
+  fontWeight?: FontWeight;
   fontStyle?: string;
   color: Rgb;
   underline: boolean;
@@ -132,9 +133,9 @@ export class DrawContext {
   readonly missingGlyphs = new Set<string>();
   readonly failedImages = new Set<string>();
   readonly doc: PDFDocument;
-  #resources: DrawResources;
-  #fonts = new Map<string, Promise<UsableFont>>();
-  #images = new Map<string, Promise<PDFImage>>();
+  readonly #resources: DrawResources;
+  readonly #fonts = new Map<string, Promise<UsableFont>>();
+  readonly #images = new Map<string, Promise<PDFImage>>();
 
   constructor(doc: PDFDocument, resources: DrawResources) {
     this.doc = doc;

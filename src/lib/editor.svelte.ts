@@ -224,9 +224,9 @@ class Editor {
   #savedIndex = $state(0);
   #lastCommit: { key: string | null; at: number } = { key: null, at: 0 };
 
-  #controllers = new Map<string, PageController>();
+  readonly #controllers = new Map<string, PageController>();
   #selectionOwner: string | null = null;
-  #flushers = new Set<() => void>();
+  readonly #flushers = new Set<() => void>();
   #viewport: ViewportHooks | null = null;
   /** Copied objects, the page they came from and how many times each page received them. */
   #clipboard: (CopiedObjects & { pageId: string; pastes: Record<string, number> }) | null = null;
@@ -271,18 +271,18 @@ class Editor {
     for (const message of failures) notifications.error(message);
     if (added.length === 0) return;
 
-    if (!this.hasDocument) {
-      this.documentName = baseName(firstName ?? "documento");
-      this.#resetHistory({ pages: added, annotations: {}, formValues: {} });
-      this.currentPageId = added[0].id;
-      this.view = "editor";
-      this.recovery = null;
-    } else {
+    if (this.hasDocument) {
       this.#commit({ pages: [...this.pages, ...added] });
       notifications.success(`Se añadieron ${pagesLabel(added.length)} al final.`, {
         label: "Deshacer",
         run: () => this.undo(),
       });
+    } else {
+      this.documentName = baseName(firstName ?? "documento");
+      this.#resetHistory({ pages: added, annotations: {}, formValues: {} });
+      this.currentPageId = added[0].id;
+      this.view = "editor";
+      this.recovery = null;
     }
   }
 
@@ -482,7 +482,7 @@ class Editor {
   /** Inserts a blank page after `afterPageId` (or at the end), sized like it. */
   async insertBlankPage(afterPageId: string | null): Promise<void> {
     const index = afterPageId ? this.pages.findIndex((page) => page.id === afterPageId) : this.pages.length - 1;
-    const reference = this.pages[index] ?? this.pages[this.pages.length - 1];
+    const reference = this.pages[index] ?? this.pages.at(-1);
     const width = reference?.width ?? 595.28;
     const height = reference?.height ?? 841.89;
     const source = await this.#loadSource("Página en blanco", makeBlankPdf(width, height));
@@ -567,7 +567,7 @@ class Editor {
   }
 
   addTextFromClipboard(content: string): void {
-    const text = content.replace(/\r\n?/g, "\n").trim();
+    const text = content.replaceAll(/\r\n?/g, "\n").trim();
     if (text) this.#targetController()?.addText(text);
   }
 
@@ -626,22 +626,30 @@ class Editor {
   /** Called by a page when its selection changes; only one page owns it. */
   reportSelection(pageId: string, info: SelectionInfo | null): void {
     if (info) {
-      if (this.#selectionOwner && this.#selectionOwner !== pageId) {
-        const previous = this.#controllers.get(this.#selectionOwner);
-        this.#selectionOwner = null;
-        previous?.clearSelection();
-      }
-      this.#selectionOwner = pageId;
+      this.#takeSelection(pageId);
       this.selection = info;
-      if (info.count === 1) {
-        if (info.text) this.textStyle = { ...info.text };
-        if (info.shape) this.shapeStyle = { ...info.shape };
-        if (info.highlight) this.highlightColor = info.highlight;
-      }
+      if (info.count === 1) this.#adoptStyles(info);
     } else if (this.#selectionOwner === pageId) {
       this.#selectionOwner = null;
       this.selection = null;
     }
+  }
+
+  /** Makes `pageId` the selection owner, clearing the selection of the previous one. */
+  #takeSelection(pageId: string): void {
+    if (this.#selectionOwner && this.#selectionOwner !== pageId) {
+      const previous = this.#controllers.get(this.#selectionOwner);
+      this.#selectionOwner = null;
+      previous?.clearSelection();
+    }
+    this.#selectionOwner = pageId;
+  }
+
+  /** New content takes the style of the single object the user selected. */
+  #adoptStyles(info: SelectionInfo): void {
+    if (info.text) this.textStyle = { ...info.text };
+    if (info.shape) this.shapeStyle = { ...info.shape };
+    if (info.highlight) this.highlightColor = info.highlight;
   }
 
   #owner(): PageController | undefined {

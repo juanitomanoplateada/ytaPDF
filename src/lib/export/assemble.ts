@@ -11,6 +11,7 @@ import {
   PDFRadioGroup,
   PDFRef,
   PDFTextField,
+  type PDFField,
   type PDFFont,
   type PDFPage,
 } from "@cantoo/pdf-lib";
@@ -101,10 +102,9 @@ export async function assembleDocument(
   };
 
   const first = placements[0];
-  const firstSource = !isRaster(first) ? sources.get(first.sourceId) : undefined;
+  const firstSource = isRaster(first) ? undefined : sources.get(first.sourceId);
   const isUnchangedOrder =
-    firstSource !== undefined &&
-    placements.length === firstSource.pageCount &&
+    placements.length === firstSource?.pageCount &&
     placements.every((p, i) => !isRaster(p) && p.sourceId === firstSource.id && p.sourceIndex === i);
 
   if (isUnchangedOrder) {
@@ -177,24 +177,7 @@ export async function applyFormValues(
     const field = form.getFieldMaybe(name);
     if (!field) continue;
     try {
-      if (field instanceof PDFTextField) {
-        const text = typeof value === "string" ? value : "";
-        if (/[^ -~ -ÿ\n\r]/.test(text)) needsUnicodeFont = true;
-        field.setText(text);
-      } else if (field instanceof PDFCheckBox) {
-        if (value === true) field.check();
-        else field.uncheck();
-      } else if (field instanceof PDFRadioGroup) {
-        if (typeof value === "string" && value) field.select(value);
-        else field.clear();
-      } else if (field instanceof PDFDropdown) {
-        if (typeof value === "string" && value) field.select(value);
-        else field.clear();
-      } else if (field instanceof PDFOptionList) {
-        const selected = Array.isArray(value) ? value : typeof value === "string" && value ? [value] : [];
-        if (selected.length > 0) field.select(selected);
-        else field.clear();
-      }
+      if (writeField(field, value)) needsUnicodeFont = true;
     } catch (error) {
       console.error(`No se pudo rellenar el campo ${name}:`, error);
       failed.push(name);
@@ -210,49 +193,98 @@ export async function applyFormValues(
   return failed;
 }
 
+/** Characters outside WinAnsi, which the standard fonts cannot draw. */
+const NON_WIN_ANSI = /[^\x20-\x7e\xa0-\xff\n\r]/;
+
+/**
+ * Writes one value into a field. Returns true when the text written needs a
+ * font beyond WinAnsi for its appearance.
+ */
+function writeField(field: PDFField, value: FormValue): boolean {
+  if (field instanceof PDFTextField) {
+    const text = typeof value === "string" ? value : "";
+    field.setText(text);
+    return NON_WIN_ANSI.test(text);
+  }
+  if (field instanceof PDFCheckBox) {
+    if (value === true) field.check();
+    else field.uncheck();
+  } else if (field instanceof PDFRadioGroup || field instanceof PDFDropdown || field instanceof PDFOptionList) {
+    selectOptions(field, chosenOptions(value, field instanceof PDFOptionList));
+  }
+  return false;
+}
+
+/** Options a value selects: only lists take several, and an empty string selects none. */
+function chosenOptions(value: FormValue, multiple: boolean): string[] {
+  if (multiple && Array.isArray(value)) return value;
+  return typeof value === "string" && value ? [value] : [];
+}
+
+/** Selects `options` in a choice field, or clears it when there are none. */
+function selectOptions(field: PDFRadioGroup | PDFDropdown | PDFOptionList, options: string[]): void {
+  if (options.length === 0) field.clear();
+  else if (field instanceof PDFRadioGroup) field.select(options[0]);
+  else field.select(options);
+}
+
 function reattachFormFields(doc: PDFDocument, pages: PDFPage[], sourceDocs: PDFDocument[]): void {
   const fields = new Set<PDFRef>();
   for (const page of pages) {
-    const annots = page.node.Annots();
-    if (!annots) continue;
-    for (let i = 0; i < annots.size(); i++) {
-      const ref = annots.get(i);
-      if (!(ref instanceof PDFRef)) continue;
-      const annot = doc.context.lookupMaybe(ref, PDFDict);
-      if (!annot || annot.get(PDFName.of("Subtype")) !== PDFName.of("Widget")) continue;
-
-      // Climb from the widget to the top-level field it belongs to.
-      let fieldRef = ref;
-      let field = annot;
-      for (let depth = 0; depth < 32; depth++) {
-        const parentRef = field.get(PDFName.of("Parent"));
-        const parent = parentRef instanceof PDFRef ? doc.context.lookupMaybe(parentRef, PDFDict) : undefined;
-        if (!parent || !(parentRef instanceof PDFRef)) break;
-        fieldRef = parentRef;
-        field = parent;
-      }
-      if (field.has(PDFName.of("T")) || field.has(PDFName.of("FT"))) fields.add(fieldRef);
+    for (const [ref, widget] of pageWidgets(doc, page)) {
+      const field = topLevelField(doc, ref, widget);
+      if (field) fields.add(field);
     }
   }
   if (fields.size === 0) return;
 
-  const acroForm = doc.context.obj({ Fields: [...fields] }) as PDFDict;
+  const acroForm = doc.context.obj({ Fields: [...fields] });
+  copyFormDefaults(doc, acroForm, sourceDocs);
+  doc.catalog.set(PDFName.of("AcroForm"), doc.context.register(acroForm));
+}
+
+/** Widget annotations of a page, with their references. */
+function pageWidgets(doc: PDFDocument, page: PDFPage): [PDFRef, PDFDict][] {
+  const annots = page.node.Annots();
+  if (!annots) return [];
+  const widgets: [PDFRef, PDFDict][] = [];
+  for (let i = 0; i < annots.size(); i++) {
+    const ref = annots.get(i);
+    if (!(ref instanceof PDFRef)) continue;
+    const annot = doc.context.lookupMaybe(ref, PDFDict);
+    if (annot?.get(PDFName.of("Subtype")) === PDFName.of("Widget")) widgets.push([ref, annot]);
+  }
+  return widgets;
+}
+
+/** Climbs from a widget to the top-level field it belongs to, if it is part of one. */
+function topLevelField(doc: PDFDocument, ref: PDFRef, widget: PDFDict): PDFRef | undefined {
+  let fieldRef = ref;
+  let field = widget;
+  for (let depth = 0; depth < 32; depth++) {
+    const parentRef = field.get(PDFName.of("Parent"));
+    if (!(parentRef instanceof PDFRef)) break;
+    const parent = doc.context.lookupMaybe(parentRef, PDFDict);
+    if (!parent) break;
+    fieldRef = parentRef;
+    field = parent;
+  }
+  return field.has(PDFName.of("T")) || field.has(PDFName.of("FT")) ? fieldRef : undefined;
+}
+
+/** Copies the form-wide defaults (appearance, alignment, resources) of the first source with a form. */
+function copyFormDefaults(doc: PDFDocument, acroForm: PDFDict, sourceDocs: PDFDocument[]): void {
   const sourceForm = sourceDocs
     .map((source) => ({ source, form: source.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict) }))
     .find(({ form }) => form !== undefined);
+  if (!sourceForm?.form) return;
 
-  if (sourceForm?.form) {
-    const { source, form } = sourceForm;
-    const copier = PDFObjectCopier.for(source.context, doc.context);
-    for (const key of ["DA", "Q", "NeedAppearances"]) {
-      const value = form.get(PDFName.of(key));
-      if (value) acroForm.set(PDFName.of(key), copier.copy(value));
-    }
-    const resources = form.get(PDFName.of("DR"));
-    if (resources) acroForm.set(PDFName.of("DR"), copier.copy(resources));
+  const { source, form } = sourceForm;
+  const copier = PDFObjectCopier.for(source.context, doc.context);
+  for (const key of ["DA", "Q", "NeedAppearances", "DR"]) {
+    const value = form.get(PDFName.of(key));
+    if (value) acroForm.set(PDFName.of(key), copier.copy(value));
   }
-
-  doc.catalog.set(PDFName.of("AcroForm"), doc.context.register(acroForm));
 }
 
 function copyDocumentInfo(from: PDFDocument, to: PDFDocument): void {

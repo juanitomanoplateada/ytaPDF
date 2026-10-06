@@ -18,18 +18,18 @@ class Pwa {
   #prompt: InstallPromptEvent | null = null;
 
   init(onFiles: (files: File[]) => void): void {
-    window.addEventListener("beforeinstallprompt", (event) => {
+    globalThis.addEventListener("beforeinstallprompt", (event) => {
       event.preventDefault();
       this.#prompt = event as InstallPromptEvent;
       this.canInstall = true;
     });
-    window.addEventListener("appinstalled", () => {
+    globalThis.addEventListener("appinstalled", () => {
       this.#prompt = null;
       this.canInstall = false;
     });
 
     // PDFs opened from the operating system with the installed app.
-    const launchQueue = (window as unknown as { launchQueue?: { setConsumer(fn: (params: LaunchParams) => void): void } })
+    const launchQueue = (globalThis as unknown as { launchQueue?: { setConsumer(fn: (params: LaunchParams) => void): void } })
       .launchQueue;
     launchQueue?.setConsumer(async (params) => {
       const files = await Promise.all(params.files.map((handle) => handle.getFile()));

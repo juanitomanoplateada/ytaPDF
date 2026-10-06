@@ -155,11 +155,35 @@ const widgetCache = new WeakMap<PDFPageProxy, Promise<FormWidget[]>>();
 
 function toWidget(raw: RawWidget): FormWidget | null {
   if (raw.annotationType !== WIDGET || raw.hidden || !raw.fieldName) return null;
-  const rect = raw.rect as [number, number, number, number];
-  const base = {
+  const base = widgetBase(raw, raw.fieldName);
+  if (raw.fieldType === "Tx") {
+    return { ...base, kind: "text", initialValue: typeof raw.fieldValue === "string" ? raw.fieldValue : "" };
+  }
+  if (raw.fieldType === "Ch") {
+    const options = (raw.options ?? []).map((o) => ({ value: o.exportValue, label: o.displayValue }));
+    return { ...base, kind: "choice", options, initialValue: choiceValue(raw.fieldValue, !!raw.multiSelect) };
+  }
+  if (raw.fieldType === "Btn" && raw.checkBox) {
+    return { ...base, kind: "checkbox", onValue: raw.exportValue, initialValue: raw.fieldValue === raw.exportValue };
+  }
+  if (raw.fieldType === "Btn" && raw.radioButton) {
+    const selected = textOf(raw.fieldValue);
+    return {
+      ...base,
+      kind: "radio",
+      onValue: raw.buttonValue,
+      initialValue: selected && selected !== "Off" ? selected : null,
+    };
+  }
+  return null;
+}
+
+/** Properties shared by every kind of widget. */
+function widgetBase(raw: RawWidget, fieldName: string): Omit<FormWidget, "kind" | "initialValue" | "onValue" | "options"> {
+  return {
     id: raw.id,
-    fieldName: raw.fieldName,
-    rect,
+    fieldName,
+    rect: raw.rect as [number, number, number, number],
     readOnly: !!raw.readOnly,
     multiLine: !!raw.multiLine,
     maxLen: raw.maxLen ?? 0,
@@ -167,31 +191,17 @@ function toWidget(raw: RawWidget): FormWidget | null {
     fontSize: raw.defaultAppearanceData?.fontSize ?? 0,
     textAlign: (["left", "center", "right"] as const)[raw.textAlignment ?? 0] ?? "left",
   };
-  if (raw.fieldType === "Tx") {
-    return { ...base, kind: "text", initialValue: typeof raw.fieldValue === "string" ? raw.fieldValue : "" };
-  }
-  if (raw.fieldType === "Ch") {
-    const options = (raw.options ?? []).map((o) => ({ value: o.exportValue, label: o.displayValue }));
-    const value = raw.fieldValue;
-    return {
-      ...base,
-      kind: "choice",
-      options,
-      initialValue: Array.isArray(value) ? (raw.multiSelect ? value.map(String) : String(value[0] ?? "")) : String(value ?? ""),
-    };
-  }
-  if (raw.fieldType === "Btn" && raw.checkBox) {
-    return { ...base, kind: "checkbox", onValue: raw.exportValue, initialValue: raw.fieldValue === raw.exportValue };
-  }
-  if (raw.fieldType === "Btn" && raw.radioButton) {
-    return {
-      ...base,
-      kind: "radio",
-      onValue: raw.buttonValue,
-      initialValue: raw.fieldValue && raw.fieldValue !== "Off" ? String(raw.fieldValue) : null,
-    };
-  }
-  return null;
+}
+
+/** Initial value of a choice field: every selected option of a list, or the single choice. */
+function choiceValue(value: unknown, multiSelect: boolean): FormValue {
+  if (!Array.isArray(value)) return textOf(value);
+  return multiSelect ? value.map(textOf) : textOf(value[0]);
+}
+
+/** A value PDF.js read from the file, as text; anything but a string or a number is empty. */
+function textOf(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
 }
 
 /** Fillable widgets of a page (text, checkboxes, radio buttons and choices). */

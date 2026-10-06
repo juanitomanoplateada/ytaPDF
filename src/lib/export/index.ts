@@ -119,7 +119,11 @@ export async function exportDocument(input: ExportInput): Promise<ExportResult> 
   }
 
   const bytes = await doc.save({ useObjectStreams: true });
+  return { bytes, warnings: exportWarnings(context, failedFields, rasters.size) };
+}
 
+/** What the exported file could not keep exactly as the editor showed it. */
+function exportWarnings(context: DrawContext, failedFields: string[], rasterCount: number): string[] {
   const warnings: string[] = [];
   if (context.unsupportedChars.size > 0) {
     const chars = [...context.unsupportedChars].slice(0, 12).join(" ");
@@ -141,12 +145,12 @@ export async function exportDocument(input: ExportInput): Promise<ExportResult> 
   if (failedFields.length > 0) {
     warnings.push(`No se pudieron rellenar algunos campos del formulario: ${failedFields.slice(0, 5).join(", ")}.`);
   }
-  if (rasters.size > 0) {
+  if (rasterCount > 0) {
     warnings.push(
-      rasters.size === 1
+      rasterCount === 1
         ? "La página con zonas censuradas se exportó como imagen: su texto ya no se puede seleccionar ni buscar."
-        : `Las ${rasters.size} páginas con zonas censuradas se exportaron como imagen: su texto ya no se puede seleccionar ni buscar.`,
+        : `Las ${rasterCount} páginas con zonas censuradas se exportaron como imagen: su texto ya no se puede seleccionar ni buscar.`,
     );
   }
-  return { bytes, warnings };
+  return warnings;
 }

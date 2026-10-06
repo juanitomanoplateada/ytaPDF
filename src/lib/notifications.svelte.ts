@@ -22,7 +22,7 @@ const DURATION: Record<NoticeKind, number> = {
 class Notifications {
   items = $state<Notice[]>([]);
   #nextId = 1;
-  #timers = new Map<number, ReturnType<typeof setTimeout>>();
+  readonly #timers = new Map<number, ReturnType<typeof setTimeout>>();
 
   push(kind: NoticeKind, message: string, action?: NoticeAction): number {
     const id = this.#nextId++;

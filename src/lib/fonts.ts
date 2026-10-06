@@ -2,6 +2,8 @@ export type StandardFamilyId = "helvetica" | "times" | "courier";
 export type EmbeddedFamilyId = "noto-sans" | "noto-serif";
 export type FontFamilyId = StandardFamilyId | EmbeddedFamilyId;
 export type FontVariant = "regular" | "bold" | "italic" | "boldItalic";
+/** CSS font weight: a keyword such as "bold", or a number from 100 to 900. */
+export type FontWeight = string | number;
 
 export interface FontFamilyOption {
   id: FontFamilyId;
@@ -70,12 +72,14 @@ export function familyFromCss(fontFamily: string | undefined): FontFamilyOption 
 }
 
 export function fontVariant(
-  fontWeight: string | number | undefined,
+  fontWeight: FontWeight | undefined,
   fontStyle: string | undefined,
 ): FontVariant {
   const bold = isBoldWeight(fontWeight);
   const italic = isItalicStyle(fontStyle);
-  return bold && italic ? "boldItalic" : bold ? "bold" : italic ? "italic" : "regular";
+  if (bold && italic) return "boldItalic";
+  if (bold) return "bold";
+  return italic ? "italic" : "regular";
 }
 
 /** How the export draws a text object: a standard PDF font or an embedded file. */
@@ -85,7 +89,7 @@ export type ResolvedFont =
 
 export function resolveFont(
   fontFamily: string | undefined,
-  fontWeight: string | number | undefined,
+  fontWeight: FontWeight | undefined,
   fontStyle: string | undefined,
 ): ResolvedFont {
   const option = familyFromCss(fontFamily);
@@ -95,7 +99,7 @@ export function resolveFont(
   return { kind: "standard", name: standardFontFor(fontFamily, fontWeight, fontStyle) };
 }
 
-export function isBoldWeight(fontWeight: string | number | undefined): boolean {
+export function isBoldWeight(fontWeight: FontWeight | undefined): boolean {
   if (fontWeight === undefined) return false;
   if (typeof fontWeight === "number") return fontWeight >= 600;
   if (fontWeight === "bold" || fontWeight === "bolder") return true;
@@ -137,7 +141,7 @@ const STANDARD_FONTS: Record<FontFamilyId, [StandardFontName, StandardFontName, 
 
 export function standardFontFor(
   fontFamily: string | undefined,
-  fontWeight: string | number | undefined,
+  fontWeight: FontWeight | undefined,
   fontStyle: string | undefined,
 ): StandardFontName {
   const variants = STANDARD_FONTS[familyFromCss(fontFamily).id];
@@ -232,7 +236,7 @@ export function sanitizeForStandardFont(
     }
     // Compatibility forms (full-width letters, ligatures, superscripts...) and
     // letters with diacritics that WinAnsi lacks fall back to their base form.
-    const decomposed = char.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+    const decomposed = char.normalize("NFKD").replaceAll(/[̀-ͯ]/g, "");
     if (decomposed && decomposed !== char && [...decomposed].every(canEncode)) {
       out += decomposed;
       continue;
