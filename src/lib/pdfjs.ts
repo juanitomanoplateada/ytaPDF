@@ -56,6 +56,11 @@ export async function openPdf(
   }
 }
 
+/** Opens bytes produced by the app itself (edited previews), which are never encrypted. */
+export function openDerivedPdf(bytes: Uint8Array): Promise<PDFDocumentProxy> {
+  return pdfjsLib.getDocument({ data: bytes, ...assetOptions }).promise;
+}
+
 export function isRenderCancelled(error: unknown): boolean {
   return error instanceof pdfjsLib.RenderingCancelledException;
 }

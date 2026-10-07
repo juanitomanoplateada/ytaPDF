@@ -1,6 +1,7 @@
 import { Color, Ellipse, FabricImage, FabricText, Path, Rect, util, type FabricObject } from "fabric";
 import { applyToPoint, IDENTITY, multiply, pathToSvg, type Matrix, type PathCommand } from "../geometry";
 import type { PageAnnotations } from "../editor.svelte";
+import { isNative } from "../nativeText";
 import type { Drawable, PathDrawable, Rgb, TextLine } from "./drawing";
 
 /**
@@ -54,7 +55,7 @@ export async function fabricToDrawables(data: PageAnnotations): Promise<Drawable
   for (const object of objects) {
     if (!object.visible) continue;
     const kind = (object as unknown as { ytaKind?: string }).ytaKind;
-    if (kind === "redact") continue;
+    if (kind === "redact" || isNative(object)) continue;
     const drawable = toDrawable(object);
     if (drawable) drawables.push(drawable);
   }

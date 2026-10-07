@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { Canvas, IText, type FabricObject, type TPointerEventInfo } from "fabric";
+  import { ActiveSelection, Canvas, IText, type FabricObject, type TPointerEventInfo } from "fabric";
   import type { PDFPageProxy, RenderTask } from "pdfjs-dist";
   import {
     applyShapeStyle,
@@ -21,6 +21,7 @@
     isText,
     pasteObjects,
     prepareObject,
+    removeObjects,
     selectedObjects,
     selectionText,
     serializeSelection,
@@ -35,9 +36,22 @@
     type PageRef,
   } from "../editor.svelte";
   import { ensureFontsFor } from "../embeddedFonts";
+  import { applyToPoint, type Matrix } from "../geometry";
   import { importImage } from "../images";
+  import {
+    createNativeText,
+    isNative,
+    markDeleted,
+    nativeSpec,
+    pointInQuad,
+    toScene,
+    type NativeText,
+  } from "../nativeText";
   import { notifications } from "../notifications.svelte";
-  import { isRenderCancelled, renderPage } from "../pdfjs";
+  import { isRenderCancelled, renderPage, viewportOf } from "../pdfjs";
+  import { parseEraseRanges } from "../pdfText/ranges";
+  import { specKey, textEditing, type PreviewHandle } from "../pdfText/service";
+  import type { NativeSpec, PageTextAnalysis, Point, TextUnit } from "../pdfText/types";
   import FormLayer from "./FormLayer.svelte";
 
   interface Props {
@@ -97,32 +111,347 @@
     const proxy = pdfPage;
     const zoom = editor.zoom;
     const rotation = page.rotation;
+    const specs = previewSpecs;
+    const drawn = previewDrawn;
+    const source = editor.sources.get(page.sourceId);
     // Form values reach PDF.js asynchronously; repaint when they arrive.
     void editor.formRevision[page.sourceId];
-    if (!target || !proxy) return;
+    if (!target || !proxy || !source) return;
 
     let cancelled = false;
+    let task: RenderTask | null = null;
+    let handle: PreviewHandle | null = null;
     // Render off-screen and swap, so zooming stretches the old bitmap instead
     // of flashing an empty page.
     const buffer = document.createElement("canvas");
-    const task: RenderTask = renderPage(proxy, buffer, zoom, undefined, rotation);
-    task.promise
-      .then(() => {
+    (async () => {
+      let renderProxy = proxy;
+      if (specs.length > 0) {
+        // Edited document text: render the page of a preview with the changes.
+        handle = textEditing.preview(source, page.sourceIndex, specs);
+        const pdf = await handle.pdf;
         if (cancelled) return;
-        target.width = buffer.width;
-        target.height = buffer.height;
-        target.getContext("2d")?.drawImage(buffer, 0, 0);
-        rendered = true;
-      })
-      .catch((error) => {
-        if (!isRenderCancelled(error)) console.error("Error al dibujar la página:", error);
-      });
+        await textEditing.syncForms(pdf, untrack(() => editor.formValues[page.sourceId] ?? {}));
+        renderProxy = await pdf.getPage(page.sourceIndex + 1);
+        if (cancelled) return;
+      }
+      task = renderPage(renderProxy, buffer, zoom, undefined, rotation);
+      await task.promise;
+      if (cancelled) return;
+      target.width = buffer.width;
+      target.height = buffer.height;
+      target.getContext("2d")?.drawImage(buffer, 0, 0);
+      rendered = true;
+      // The preview shown stays alive until another one replaces it.
+      displayedPreview?.release();
+      displayedPreview = handle;
+      handle = null;
+      displayedErased = new Set(specs.map((spec) => spec.id));
+      displayedDrawn = drawn;
+      syncGhosts();
+    })().catch((error) => {
+      if (cancelled || isRenderCancelled(error)) return;
+      console.error("Error al dibujar la página:", error);
+      if (specs.length > 0) notifications.error("No se pudo mostrar el texto editado en la página.");
+    });
 
     return () => {
       cancelled = true;
-      task.cancel();
+      task?.cancel();
+      handle?.release();
     };
   });
+
+  $effect(() => {
+    // Without a rendered page there is nothing to keep a preview for.
+    if (!active) {
+      displayedPreview?.release();
+      displayedPreview = null;
+      displayedErased = new Set();
+      displayedDrawn = new Map();
+      masks = [];
+    }
+  });
+
+  // ── Document text ─────────────────────────────────────────────────────────
+
+  /** Specs drawn into the PDF layer, and the hash of each native object they draw. */
+  let previewSpecs = $state.raw<NativeSpec[]>([]);
+  let previewDrawn = new Map<string, string>();
+  let previewKey = "";
+  let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  /** What the bitmap on screen shows: the edits it erases and the ones it draws. */
+  let displayedPreview: PreviewHandle | null = null;
+  let displayedErased = new Set<string>();
+  let displayedDrawn = new Map<string, string>();
+  /** Areas painted with the page colour, over text the bitmap still shows but should not. */
+  let masks: { points: Point[]; color: string }[] = [];
+  /** Native objects being moved, resized or rotated. */
+  const transforming = new Set<NativeText>();
+
+  let analysis = $state.raw<PageTextAnalysis | null>(null);
+  let analysisState = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let hovered: TextUnit | null = null;
+  /** A click made while the page's text was still being read. */
+  let pendingEdit: { point: Point; lineOnly: boolean } | null = null;
+
+  function viewportTransform(): Matrix | null {
+    return pdfPage ? (viewportOf(pdfPage, 1, page.rotation).transform as Matrix) : null;
+  }
+
+  function natives(): NativeText[] {
+    return canvas ? canvas.getObjects().filter(isNative) : [];
+  }
+
+  function isActive(object: NativeText): boolean {
+    return canvas ? canvas.getActiveObjects().includes(object) : false;
+  }
+
+  /**
+   * Recomputes what the PDF layer must show: every edit of document text is
+   * erased, and the text of those not being edited is drawn by the PDF itself.
+   */
+  function refreshPreview(delay = 60) {
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      const viewport = viewportTransform();
+      if (!canvas || !viewport) return;
+      const specs: NativeSpec[] = [];
+      const drawn = new Map<string, string>();
+      for (const object of natives()) {
+        const draw = !isActive(object);
+        const spec = nativeSpec(object, viewport, draw);
+        specs.push(spec);
+        if (draw && spec.runs.length > 0) drawn.set(object.ytaNative.unit, specKey(spec));
+      }
+      const key = specKey(specs);
+      if (key === previewKey) {
+        syncGhosts();
+        return;
+      }
+      previewKey = key;
+      previewDrawn = drawn;
+      previewSpecs = specs;
+      syncGhosts();
+    }, delay);
+  }
+
+  /**
+   * A native object is not drawn by Fabric while the page bitmap already
+   * shows it exactly (with the document's own font); otherwise it is.
+   */
+  function syncGhosts() {
+    const viewport = viewportTransform();
+    if (!canvas || !viewport) return;
+    let changed = masks.length > 0;
+    const nextMasks: typeof masks = [];
+    for (const object of natives()) {
+      const id = object.ytaNative.unit;
+      const shown = displayedDrawn.get(id);
+      const ghost =
+        shown !== undefined &&
+        !object.isEditing &&
+        !transforming.has(object) &&
+        shown === specKey(nativeSpec(object, viewport, true));
+      if (object.ytaGhost !== ghost) {
+        object.ytaGhost = ghost;
+        object.dirty = true;
+        changed = true;
+      }
+      // The bitmap still shows the original text (or an older version of the
+      // edit) under text Fabric is drawing: cover it until the preview arrives.
+      const original = !displayedErased.has(id);
+      const older = shown !== undefined && !transforming.has(object);
+      if (!ghost && (original || older) && object.visible) {
+        const color = pageColorAround(object.ytaNative.area.flat().map(([x, y]) => applyToPoint(viewport, x, y)));
+        if (original) {
+          for (const quad of object.ytaNative.area) nextMasks.push({ points: grow(toScene(viewport, quad), 1.5), color });
+        }
+        if (older) {
+          const box = object.getBoundingRect();
+          const corners: Point[] = [
+            [box.left, box.top],
+            [box.left + box.width, box.top],
+            [box.left + box.width, box.top + box.height],
+            [box.left, box.top + box.height],
+          ];
+          nextMasks.push({ points: grow(corners, 1.5), color });
+        }
+      }
+    }
+    masks = nextMasks;
+    if (changed || masks.length > 0) canvas.requestRenderAll();
+  }
+
+  /** Enlarges a polygon around its centre by `by` scene units. */
+  function grow(points: Point[], by: number): Point[] {
+    const cx = points.reduce((sum, p) => sum + p[0], 0) / points.length;
+    const cy = points.reduce((sum, p) => sum + p[1], 0) / points.length;
+    return points.map(([x, y]) => {
+      const dx = x - cx;
+      const dy = y - cy;
+      const d = Math.hypot(dx, dy) || 1;
+      return [x + (dx / d) * by, y + (dy / d) * by];
+    });
+  }
+
+  /** The most common colour of the page just around some points (the paper, usually). */
+  function pageColorAround(points: Point[]): string {
+    const ctx = pdfCanvas?.getContext("2d", { willReadFrequently: true });
+    if (!ctx || !pdfCanvas || points.length === 0) return "#ffffff";
+    const scale = pdfCanvas.width / page.width / editor.zoom;
+    const xs = points.map((p) => p[0]);
+    const ys = points.map((p) => p[1]);
+    const [minX, maxX, minY, maxY] = [Math.min(...xs) - 3, Math.max(...xs) + 3, Math.min(...ys) - 3, Math.max(...ys) + 3];
+    const samples: Point[] = [];
+    for (let i = 0; i <= 6; i++) {
+      const t = i / 6;
+      samples.push([minX + (maxX - minX) * t, minY], [minX + (maxX - minX) * t, maxY]);
+    }
+    samples.push([minX, (minY + maxY) / 2], [maxX, (minY + maxY) / 2]);
+    const counts = new Map<string, number>();
+    for (const [x, y] of samples) {
+      const px = Math.round(x * editor.zoom * scale);
+      const py = Math.round(y * editor.zoom * scale);
+      if (px < 0 || py < 0 || px >= pdfCanvas.width || py >= pdfCanvas.height) continue;
+      const [r, g, b] = ctx.getImageData(px, py, 1, 1).data;
+      const key = `rgb(${r}, ${g}, ${b})`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "#ffffff";
+  }
+
+  $effect(() => {
+    const source = editor.sources.get(page.sourceId);
+    if (!active || !source || editor.tool !== "edit" || analysisState !== "idle") return;
+    analysisState = "loading";
+    textEditing
+      .analyze(source, page.sourceIndex)
+      .then((result) => {
+        analysis = result;
+        analysisState = "ready";
+        const pending = pendingEdit;
+        pendingEdit = null;
+        if (pending && editor.tool === "edit") editTextAt(pending.point, pending.lineOnly, null);
+      })
+      .catch((error) => {
+        console.error("No se pudo analizar el texto de la página:", error);
+        analysisState = "error";
+        notifications.error("No se pudo leer el texto de esta página para editarlo.");
+      });
+  });
+
+  $effect(() => {
+    if (editor.tool !== "edit" && canvas) clearHover();
+  });
+
+  /** Glyph keys already replaced by an edit on this page. */
+  function takenGlyphs(): Set<string> {
+    const taken = new Set<string>();
+    for (const object of natives()) {
+      for (const [op, indices] of parseEraseRanges(object.ytaNative.erase)) {
+        for (const index of indices) taken.add(`${op}:${index}`);
+      }
+    }
+    return taken;
+  }
+
+  function isTaken(unit: TextUnit, taken: Set<string>): boolean {
+    for (const [op, indices] of parseEraseRanges(unit.erase)) {
+      for (const index of indices) if (taken.has(`${op}:${index}`)) return true;
+    }
+    return false;
+  }
+
+  /** The line or paragraph under a scene point (a line alone with Alt). */
+  function unitAt(point: Point, lineOnly: boolean): TextUnit | null {
+    const viewport = viewportTransform();
+    if (!analysis || !viewport) return null;
+    const margin = 2 / editor.zoom;
+    const index = analysis.lines.findIndex((line) =>
+      line.quads.some((quad) => pointInQuad(point, toScene(viewport, quad), margin)),
+    );
+    if (index < 0) return null;
+    const taken = takenGlyphs();
+    const paragraphIndex = analysis.paragraphOf[index];
+    const paragraph = paragraphIndex >= 0 ? analysis.paragraphs[paragraphIndex] : undefined;
+    if (!lineOnly && paragraph && paragraph.editable && !isTaken(paragraph, taken)) return paragraph;
+    const line = analysis.lines[index];
+    return isTaken(line, taken) ? null : line;
+  }
+
+  function clearHover() {
+    hovered = null;
+    if (canvas) {
+      clearTopLayer(canvas);
+      canvas.setCursor(canvas.defaultCursor);
+    }
+  }
+
+  /** Outlines the text that a click would turn editable. */
+  function showHover(unit: TextUnit | null) {
+    if (!canvas) return;
+    const viewport = viewportTransform();
+    if (unit === hovered) return;
+    hovered = unit;
+    clearTopLayer(canvas);
+    if (!unit || !viewport) {
+      canvas.setCursor("text");
+      return;
+    }
+    const ctx = canvas.contextTop;
+    const vpt = canvas.viewportTransform;
+    const ratio = canvas.getRetinaScaling();
+    ctx.save();
+    ctx.setTransform(ratio * vpt[0], 0, 0, ratio * vpt[3], ratio * vpt[4], ratio * vpt[5]);
+    ctx.fillStyle = unit.editable ? "rgba(25, 118, 210, 0.10)" : "rgba(229, 72, 77, 0.10)";
+    ctx.strokeStyle = unit.editable ? "rgba(25, 118, 210, 0.85)" : "rgba(229, 72, 77, 0.85)";
+    ctx.lineWidth = 1 / editor.zoom;
+    ctx.setLineDash([4 / editor.zoom, 3 / editor.zoom]);
+    for (const quad of unit.quads) {
+      const points = toScene(viewport, quad);
+      ctx.beginPath();
+      points.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
+    canvas.setCursor(unit.editable ? "text" : "not-allowed");
+  }
+
+  /** Turns the text under the pointer into an editable object. */
+  function editTextAt(point: Point, lineOnly: boolean, event: TPointerEventInfo["e"] | null): boolean {
+    const viewport = viewportTransform();
+    if (!canvas || !viewport || !analysis) return false;
+    if (analysis.lines.length === 0) {
+      notifications.info(
+        "Esta página no tiene texto que se pueda editar. Si es un documento escaneado, el texto forma parte de una imagen.",
+      );
+      return false;
+    }
+    const unit = unitAt(point, lineOnly);
+    if (!unit) return false;
+    if (!unit.editable) {
+      notifications.info(unit.reason ?? "Este texto no se puede editar.");
+      return true;
+    }
+    clearHover();
+    const object = createNativeText(unit, analysis, viewport);
+    canvas.add(object);
+    canvas.setActiveObject(object);
+    object.enterEditing();
+    // The caret goes where the user clicked (this also moves Fabric's hidden textarea).
+    const caret = event ? object.getSelectionStartFromPointer(event) : object.text.length;
+    object.setSelectionStart(caret);
+    object.setSelectionEnd(caret);
+    canvas.requestRenderAll();
+    scheduleSave();
+    reportSelection();
+    refreshPreview(0);
+    return true;
+  }
 
   // ── Annotation layer ──────────────────────────────────────────────────────
 
@@ -153,7 +482,7 @@
     canvas.selection = tool === "select";
     // While drawing, clicks over existing objects start a new shape.
     canvas.skipTargetFind = drawing;
-    canvas.defaultCursor = tool === "text" ? "text" : drawing ? "crosshair" : "default";
+    canvas.defaultCursor = tool === "text" || tool === "edit" ? "text" : drawing ? "crosshair" : "default";
     if (tool !== "select") canvas.discardActiveObject();
     canvas.requestRenderAll();
   });
@@ -184,27 +513,81 @@
 
     instance.on("object:modified", ({ target }) => {
       if (bakeScale(target)) instance.requestRenderAll();
+      transforming.clear();
       scheduleSave();
       reportSelection();
+      refreshPreview();
     });
-    instance.on("object:removed", () => scheduleSave());
-    instance.on("text:changed", () => scheduleSave(500, `typing:${page.id}`));
-    instance.on("text:editing:exited", ({ target }) => {
-      if (isText(target) && target.text.trim() === "") instance.remove(target);
+    instance.on("object:removed", () => {
       scheduleSave();
+      refreshPreview();
+    });
+    const startTransform = ({ target }: { target: FabricObject }) => {
+      const moving = target instanceof ActiveSelection ? target.getObjects() : [target];
+      for (const object of moving) {
+        if (!isNative(object) || transforming.has(object)) continue;
+        transforming.add(object);
+        object.ytaGhost = false;
+        object.dirty = true;
+      }
+    };
+    instance.on("object:moving", startTransform);
+    instance.on("object:scaling", startTransform);
+    instance.on("object:rotating", startTransform);
+    instance.on("object:resizing", startTransform);
+    instance.on("text:changed", () => scheduleSave(500, `typing:${page.id}`));
+    instance.on("text:editing:entered", ({ target }) => {
+      if (isNative(target) && target.ytaGhost) {
+        target.ytaGhost = false;
+        target.dirty = true;
+        instance.requestRenderAll();
+      }
+    });
+    instance.on("text:editing:exited", ({ target }) => {
+      if (isText(target) && target.text.trim() === "") {
+        if (isNative(target)) {
+          // Emptied document text: the original stays erased.
+          markDeleted(target);
+          instance.discardActiveObject();
+        } else {
+          instance.remove(target);
+        }
+      }
+      scheduleSave();
+      refreshPreview();
     });
     instance.on("selection:created", () => {
       setTouchScrolling(false);
       syncSelectionLock(instance);
       reportSelection();
+      refreshPreview();
     });
     instance.on("selection:updated", () => {
       syncSelectionLock(instance);
       reportSelection();
+      refreshPreview();
     });
     instance.on("selection:cleared", () => {
       setTouchScrolling(true);
       editor.reportSelection(page.id, null);
+      refreshPreview();
+    });
+    instance.on("mouse:out", () => {
+      if (editor.tool === "edit") clearHover();
+    });
+    instance.on("before:render", ({ ctx }) => {
+      if (masks.length === 0) return;
+      const vpt = instance.viewportTransform;
+      ctx.save();
+      ctx.transform(vpt[0], vpt[1], vpt[2], vpt[3], vpt[4], vpt[5]);
+      for (const mask of masks) {
+        ctx.fillStyle = mask.color;
+        ctx.beginPath();
+        mask.points.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
     });
     // Fabric places the hidden textarea used for typing from a cached offset,
     // which goes stale as the workspace scrolls.
@@ -234,6 +617,10 @@
     loadAbort = null;
     loading = false;
     canvas = null;
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = null;
+    transforming.clear();
+    hovered = null;
     instance.dispose().catch(() => {});
   }
 
@@ -265,6 +652,7 @@
         instance.remove(...instance.getObjects());
       }
       instance.requestRenderAll();
+      refreshPreview(0);
     } catch (error) {
       if (!abort.signal.aborted) console.error("Error al cargar las anotaciones:", error);
     } finally {
@@ -323,6 +711,13 @@
     const tool = editor.tool;
     if (tool === "text" && !target) pendingTextAt = canvas.getScenePoint(e);
     else if (isDrawTool(tool)) drawStart = canvas.getScenePoint(e);
+    else if (tool === "edit" && !target) {
+      const scene = canvas.getScenePoint(e);
+      const point: Point = [scene.x, scene.y];
+      const lineOnly = (e as MouseEvent).altKey === true;
+      if (analysis) editTextAt(point, lineOnly, e);
+      else pendingEdit = { point, lineOnly };
+    }
   }
 
   /** With Shift, boxes become squares and lines snap to 45°. */
@@ -339,8 +734,13 @@
     return { x: start.x + Math.sign(dx || 1) * size, y: start.y + Math.sign(dy || 1) * size };
   }
 
-  function onPointerMove({ e }: TPointerEventInfo) {
+  function onPointerMove({ e, target }: TPointerEventInfo) {
     const tool = editor.tool;
+    if (tool === "edit" && canvas && analysis) {
+      const point = canvas.getScenePoint(e);
+      showHover(target ? null : unitAt([point.x, point.y], (e as MouseEvent).altKey === true));
+      return;
+    }
     if (!drawStart || !canvas || !isDrawTool(tool)) return;
     const end = constrain(tool, drawStart, canvas.getScenePoint(e), e.shiftKey);
     drawShapePreview(canvas, tool, drawStart, end, editor.shapeStyle, editor.highlightColor);
@@ -532,10 +932,22 @@
       const removable = editableSelection(canvas);
       if (removable.length > 0) {
         canvas.discardActiveObject();
-        canvas.remove(...removable);
-        canvas.requestRenderAll();
+        removeObjects(canvas, removable);
+        scheduleSave();
+        refreshPreview();
       }
       return { removed: removable.length, locked: objects.length - removable.length };
+    },
+
+    restoreOriginalText() {
+      if (!canvas) return;
+      const edits = selectedObjects(canvas).filter(isNative);
+      if (edits.length === 0) return;
+      canvas.discardActiveObject();
+      canvas.remove(...edits);
+      canvas.requestRenderAll();
+      scheduleSave();
+      refreshPreview(0);
     },
 
     async duplicateSelection() {
@@ -607,6 +1019,9 @@
       <span class="spinner"></span>
     </div>
   {/if}
+  {#if active && editor.tool === "edit" && analysisState === "loading"}
+    <div class="text-status" role="status">Leyendo el texto de la página…</div>
+  {/if}
 </div>
 
 <style>
@@ -629,6 +1044,18 @@
   }
   .annotation-layer :global(.canvas-container) {
     margin: 0 !important;
+  }
+  .text-status {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(16, 24, 40, 0.78);
+    color: white;
+    font-size: 12px;
+    pointer-events: none;
   }
   .placeholder {
     position: absolute;

@@ -6,7 +6,7 @@
 
 **Editor de PDF que funciona íntegramente en el navegador.**
 
-Une, organiza, firma, rellena y anota documentos con texto, imágenes y formas, y expórtalos conservando la posición exacta de cada elemento. Ningún archivo sale de tu equipo, y funciona incluso sin conexión.
+Une, organiza, firma, rellena y anota documentos con texto, imágenes y formas, **edita el texto que ya trae el PDF** con su propia fuente, y expórtalos conservando la posición exacta de cada elemento. Ningún archivo sale de tu equipo, y funciona incluso sin conexión.
 
 <br/>
 
@@ -64,6 +64,7 @@ La contrapartida de trabajar sin backend es que toda la manipulación del PDF �
 
 | | |
 |---|---|
+| **Texto del documento** | Edita el texto que ya trae el PDF: un clic sobre un párrafo lo vuelve editable y, al escribir, sus líneas se vuelven a repartir respetando la alineación original (izquierda, centrada, derecha o justificada). Se reutiliza la **fuente incrustada del propio documento** y, si le falta algún carácter, solo ese se dibuja con una fuente parecida. El texto original se elimina del archivo, no se tapa. |
 | **Texto** | Texto de varias líneas con fuente, tamaño, color, negrita, cursiva y subrayado. Además de Helvetica, Times y Courier, incluye **Noto Sans** y **Noto Serif**, que se incrustan en el PDF y admiten griego, cirílico y otros alfabetos latinos ampliados. |
 | **Imágenes** | PNG, JPG, WebP, GIF, SVG y cualquier formato que el navegador sepa leer. Las fotos de móvil respetan su orientación EXIF. Se pueden soltar sobre una página o pegar desde el portapapeles. |
 | **Firma manuscrita** | Se dibuja con ratón, dedo o lápiz y se inserta como trazo vectorial, nítido a cualquier zoom. Se puede guardar en el navegador para reutilizarla. |
@@ -101,14 +102,17 @@ La contrapartida de trabajar sin backend es que toda la manipulación del PDF �
 ## Uso
 
 1. **Abrir.** Pulsa *Cargar PDF* o arrastra uno o varios PDF a la ventana. Si un archivo está protegido, se pedirá su contraseña.
-2. **Anotar.** Elige *Texto* y haz clic donde quieras escribir, *Imagen* para insertar una, *Firma* para dibujar la tuya o *Formas* para rectángulos, elipses, líneas, flechas, el resaltador o la censura. La fila de propiedades cambia el estilo, el giro, la opacidad, el orden de capas y el bloqueo de lo seleccionado.
-3. **Rellenar.** Si el PDF tiene un formulario, sus campos se rellenan directamente sobre la página con la herramienta de selección.
-4. **Organizar.** Desde el panel de páginas abre *Organizar páginas* para reordenarlas, girarlas, eliminarlas, insertar páginas en blanco, añadir más PDF o exportar solo las seleccionadas. Doble clic en una página vuelve a ella en el editor.
-5. **Exportar.** *Exportar PDF* descarga el resultado como `<nombre>_ytaPDF.pdf`. Hasta entonces, cualquier cambio se puede deshacer.
+2. **Editar el texto del documento.** Elige *Editar texto* y haz clic sobre un párrafo: se vuelve editable en su sitio, con su fuente, tamaño y color. Con `Alt` + clic se edita solo esa línea. *Restaurar original* deshace los cambios de un texto y `Supr` lo elimina del documento.
+3. **Anotar.** Elige *Texto* y haz clic donde quieras escribir, *Imagen* para insertar una, *Firma* para dibujar la tuya o *Formas* para rectángulos, elipses, líneas, flechas, el resaltador o la censura. La fila de propiedades cambia el estilo, el giro, la opacidad, el orden de capas y el bloqueo de lo seleccionado.
+4. **Rellenar.** Si el PDF tiene un formulario, sus campos se rellenan directamente sobre la página con la herramienta de selección.
+5. **Organizar.** Desde el panel de páginas abre *Organizar páginas* para reordenarlas, girarlas, eliminarlas, insertar páginas en blanco, añadir más PDF o exportar solo las seleccionadas. Doble clic en una página vuelve a ella en el editor.
+6. **Exportar.** *Exportar PDF* descarga el resultado como `<nombre>_ytaPDF.pdf`. Hasta entonces, cualquier cambio se puede deshacer.
 
 | Atajo | Acción |
 |---|---|
 | `T` / `V` | Herramienta de texto / selección |
+| `E` | Editar el texto del documento |
+| `Alt` + clic | Editar solo una línea de un párrafo |
 | `Supr` o `Retroceso` | Eliminar lo seleccionado |
 | Flechas (`Mayús` + flechas) | Mover lo seleccionado 1 px (10 px) |
 | `Alt` al arrastrar | Mover sin guías de alineación |
@@ -162,6 +166,18 @@ Las formas siguen el mismo camino. Las firmas son trazados SVG en coordenadas de
 Las pruebas de `src/lib/export/export.test.ts` lo comprueban de punta a punta:
 - **Texto:** lo dibujan en páginas con rotación de 0°, 90°, 180° y 270°, con y sin `CropBox`, y verifican con PDF.js que aparece en la misma posición y dirección que en el editor.
 - **Formas:** reproducen los operadores generados y comprueban cada punto de líneas, firmas, rectángulos y elipses.
+
+### Editar el texto que ya trae el PDF
+
+Un PDF no guarda párrafos: guarda órdenes para dibujar glifos en posiciones fijas (`BT /F3 11 Tf … [(Hol) -20 (a)] TJ ET`). Editarlo de verdad, sin tapar con rectángulos blancos, exige leer esas órdenes, quitar las que dibujan el texto viejo y escribir el nuevo con la misma fuente. ytaPDF lo hace en cinco pasos (`src/lib/pdfText/`):
+
+1. **Leer.** Un lector propio del contenido de la página (`lexer.ts`) conserva la posición en bytes de cada operación, incluidas las imágenes en línea. Un intérprete (`interpreter.ts`) sigue la matriz de texto, la del objeto (`cm`), el espaciado (`Tc`, `Tw`, `Tz`, `TL`, `Ts`), el color y la opacidad, entra en los formularios XObject y calcula dónde cae cada glifo. Para eso hace falta entender la fuente (`fonts.ts`, `cmap.ts`, `encodings.ts`): cuántos bytes ocupa cada código (fuentes simples o compuestas con `Identity-H` y CMaps incrustadas), cuánto avanza (`Widths`, `W`, métricas AFM de las 14 estándar) y qué carácter representa (`ToUnicode`, codificaciones con `Differences` y nombres de glifo, o el propio programa de la fuente si falta el mapa).
+2. **Agrupar.** Los glifos se ordenan por geometría, no por el orden en que se dibujan (`layout.ts`): forman líneas, se deducen los espacios que el interletraje representa y se agrupan en párrafos cuando comparten tamaño, interlineado y alineación. El texto justificado se reconoce porque sus espacios están estirados; las líneas cortas, las sangrías y los guiones de final de línea marcan dónde terminan los párrafos.
+3. **Editar.** El párrafo se convierte en un texto de Fabric que mide cada carácter con los anchos de la fuente del PDF, de modo que las líneas se reparten y justifican igual que en el archivo final. Cada carácter recuerda de qué fuente vino, así que un párrafo con palabras en negrita conserva sus fuentes.
+4. **Borrar.** Cada glifo tiene una clave estable (operación y posición dentro de ella). Los glifos editados se eliminan de su `Tj`/`TJ` y se sustituyen por un desplazamiento del mismo ancho, así que el resto de la línea no se mueve. Si el texto está dentro de un formulario XObject compartido, se dibuja una copia modificada solo en esa página (`apply.ts`).
+5. **Escribir.** El texto nuevo se dibuja justo después del bloque de texto original, con lo que hereda su recorte y su orden de capas. Con la fuente original, cada carácter se escribe con el código que ya usaba el documento. Las fuentes incrustadas suelen ser subconjuntos que solo contienen los caracteres usados; la disponibilidad de cada glifo se comprueba en el propio programa de la fuente y los que faltan se dibujan con la fuente estándar más parecida, avisando al exportar.
+
+La vista previa del editor es el resultado real: un *web worker* (`textWorker.ts`) aplica los cambios a la página y los añade al documento como una **actualización incremental**, que PDF.js dibuja como cualquier otra página. Así lo que se ve al dejar de editar es exactamente lo que se exporta. Mientras se escribe, Fabric dibuja el texto en vivo y tapa transitoriamente el original con el color del papel hasta que llega la vista previa.
 
 ---
 
@@ -225,7 +241,17 @@ src/
     ├── fonts.ts                  # Familias, fuentes estándar y caracteres WinAnsi
     ├── embeddedFonts.ts          # Noto Sans y Noto Serif: carga e incrustación
     ├── geometry.ts               # Matrices de transformación y trazados
+    ├── nativeText.ts             # Texto del documento editable en Fabric y su descripción para el PDF
     ├── *.test.ts                 # Pruebas de fuentes, geometría, rotación, firmas y páginas en blanco
+    ├── pdfText/                  # Edición del texto original del PDF
+    │   ├── lexer.ts              # Lector del contenido con posiciones en bytes
+    │   ├── fonts.ts, cmap.ts, encodings.ts  # Códigos, anchos y Unicode de las fuentes del PDF
+    │   ├── interpreter.ts        # Estado gráfico y de texto: posición de cada glifo
+    │   ├── layout.ts, analyze.ts # Líneas, párrafos, alineación y glifos disponibles
+    │   ├── apply.ts              # Borrado de glifos y dibujo del texto nuevo
+    │   ├── incremental.ts        # Actualización incremental para las vistas previas
+    │   ├── textDocument.ts, textWorker.ts, service.ts  # Trabajador y su cliente
+    │   └── pdfText.test.ts       # Pruebas del lector, el análisis y la reescritura
     ├── export/
     │   ├── index.ts              # Orquestación de la exportación y páginas censuradas
     │   ├── assemble.ts           # Documento de salida, descifrado, rotación y formularios
@@ -299,6 +325,7 @@ Las pruebas corren en Node y no necesitan navegador. Cubren lo que más fácilme
 - **Exportación de punta a punta** (`src/lib/export/export.test.ts`): genera PDF con pdf-lib, dibuja anotaciones y comprueba con PDF.js la posición y dirección del texto en páginas rotadas y recortadas, objetos girados y volteados, la sustitución de caracteres y que cada fuente se incruste una sola vez.
 - **Formas y fuentes incrustadas:** posición exacta de líneas, firmas, rectángulos y elipses, y texto en cirílico y griego con Noto Sans.
 - **Ensamblado:** edición en sitio, reordenación, eliminación y unión de documentos, rotación de páginas, páginas censuradas sin restos del original, relleno de formularios (texto, casillas, opciones, listas y texto Unicode) y descifrado con y sin contraseña.
+- **Texto del documento** (`src/lib/pdfText/pdfText.test.ts`): lectura del contenido (cadenas, imágenes en línea, varios flujos), líneas y párrafos con su alineación, glifos disponibles en subconjuntos, borrado total y parcial sin mover lo demás, texto girado, superíndices, fuentes CID, formularios XObject compartidos, fuentes de sustitución, la actualización incremental y vistas previas consecutivas sobre el mismo documento.
 - **Funciones puras:** giro de anotaciones con su página, unión de trazos de firma, páginas en blanco, fuentes, juego WinAnsi y álgebra de matrices.
 - **Regresión de PDF.js:** con varios documentos abiertos, cada uno mantiene su número de páginas (en PDF.js 5.4 abrir un PDF corto dejaba inaccesibles las páginas de los anteriores).
 
@@ -341,7 +368,7 @@ Documentadas de forma explícita porque afectan al resultado exportado:
 - **Al unir o reordenar.** El documento nuevo conserva el contenido, las anotaciones propias del PDF y los campos de formulario, pero no los marcadores ni la estructura de etiquetas del original. Si solo se anota un documento sin cambiar sus páginas, se conserva todo.
 - **Formularios.** Se rellenan los campos de texto, casillas, botones de opción y listas. Los campos de firma digital, los botones con acciones y los formularios XFA no se pueden editar.
 - **Sin conexión.** Las fuentes Noto y los recursos de PDF.js para documentos poco comunes (por ejemplo, CJK o JPEG 2000) se guardan la primera vez que se usan; hasta entonces necesitan conexión.
-- **Edición del contenido original.** Las anotaciones se dibujan sobre el documento. El texto ya existente en el PDF no es editable ni se elimina, salvo con la censura.
+- **Edición del texto original.** Funciona con PDF digitales (Word, LibreOffice, navegadores, programas de maquetación). No se puede editar el texto de un documento escaneado (es una imagen), el texto convertido en trazados, el vertical, el de fuentes sin información de caracteres ni el de CMaps predefinidas que no sean `Identity` (habitual en documentos en chino, japonés o coreano). Las líneas solo se reacomodan dentro del párrafo que se edita: si el texto crece, no empuja al contenido que hay debajo. Los caracteres que no están en la fuente incrustada se dibujan con la fuente estándar más parecida, y un párrafo justificado por un programa de maquetación puede repartir sus líneas de forma algo distinta al editarlo. Cambiar el texto invalida las firmas digitales que tuviera el documento.
 
 ---
 
@@ -353,6 +380,7 @@ Documentadas de forma explícita porque afectan al resultado exportado:
 - [x] Extracción de páginas a un documento nuevo
 - [x] Metaetiquetas de descripción y previsualización social, e idioma del documento en español
 - [x] Apertura de documentos protegidos mediante contraseña provista por el usuario
+- [x] Edición del texto original del documento con su propia fuente y reacomodo de párrafos
 - [ ] Fuentes para alfabetos CJK y árabe, cargadas bajo demanda
 - [ ] Pruebas de interfaz automatizadas en el navegador e integración continua
 - [ ] Firma digital con certificado

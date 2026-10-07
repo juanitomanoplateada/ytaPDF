@@ -16,6 +16,7 @@ import {
   type SessionSummary,
 } from "./session";
 import { clearThumbnailCache } from "./thumbnails";
+import { textEditing } from "./pdfText/service";
 
 /** A PDF file the user opened. Its bytes stay untouched until export. */
 export interface SourceDocument {
@@ -55,7 +56,7 @@ export interface PageAnnotations {
 }
 
 export type DrawTool = "rect" | "ellipse" | "line" | "arrow" | "highlight" | "redact";
-export type Tool = "select" | "text" | DrawTool;
+export type Tool = "select" | "text" | "edit" | DrawTool;
 export type ObjectKind = "text" | "image" | "signature" | DrawTool;
 export type ArrangeAction = "front" | "forward" | "backward" | "back";
 
@@ -93,6 +94,12 @@ export interface SelectionInfo {
   opacity: number;
   /** Style of the selected text, or of the first text in a multiple selection. */
   text: TextStyle | null;
+  /** The selection includes text of the document itself. */
+  native: boolean;
+  /** Fonts of the document that selected document text can go back to. */
+  originalFonts: { label: string; css: string }[];
+  /** Characters of selected document text that its original font lacks. */
+  substituted: string[];
   /** Style of the first shape, line or signature in the selection. */
   shape: ShapeStyle | null;
   /** Colour of the first highlight in the selection. */
@@ -126,6 +133,8 @@ export interface PageController {
   nudgeSelection(dx: number, dy: number): void;
   clearSelection(): void;
   isEditingText(): boolean;
+  /** Removes the selected edits of document text, bringing the original back. */
+  restoreOriginalText(): void;
 }
 
 export interface PasswordRequest {
@@ -352,6 +361,7 @@ class Editor {
     this.sources.clear();
     releaseImageAssets();
     clearThumbnailCache();
+    textEditing.reset();
     this.#clipboard = null;
     this.hasClipboard = false;
     if (this.#autosaveTimer) clearTimeout(this.#autosaveTimer);
@@ -712,6 +722,10 @@ class Editor {
 
   isEditingText(): boolean {
     return this.#owner()?.isEditingText() ?? false;
+  }
+
+  restoreOriginalText(): void {
+    this.#owner()?.restoreOriginalText();
   }
 
   // ── History ──────────────────────────────────────────────────────────────

@@ -11,12 +11,14 @@ import {
   InteractiveFabricObject,
   Path,
   Rect,
+  Textbox,
   util,
   type Canvas,
   type TPointerEvent,
   type Transform,
 } from "fabric";
 import { isBoldWeight, isItalicStyle } from "./fonts";
+import { bakeNativeScale, isNative, markDeleted, originalFontLabel, substitutedChars, toPlainTextData } from "./nativeText";
 import type {
   ArrangeAction,
   DrawTool,
@@ -33,7 +35,7 @@ const DANGER = "#e5484d";
 // ── Global look & controls (applied once, before any object is created) ────
 
 // Extra properties every object carries through serialisation, undo and copy.
-BaseFabricObject.customProperties.push("ytaKind", "locked");
+BaseFabricObject.customProperties.push("ytaKind", "locked", "ytaNative");
 
 Object.assign(InteractiveFabricObject.ownDefaults, {
   borderColor: ACCENT,
@@ -53,7 +55,7 @@ function removeTarget(_event: TPointerEvent, transform: Transform): boolean {
   if (!canvas) return false;
   const objects = (target instanceof ActiveSelection ? target.getObjects() : [target]).filter((o) => !isLocked(o));
   canvas.discardActiveObject();
-  canvas.remove(...objects);
+  removeObjects(canvas, objects);
   canvas.requestRenderAll();
   return true;
 }
@@ -116,6 +118,30 @@ IText.createControls = () => {
   const { ml: _ml, mr: _mr, mt: _mt, mb: _mb, ...corners } = controlsUtils.createObjectDefaultControls();
   return { controls: { ...corners, deleteControl } };
 };
+
+// Paragraphs also get side handles, which change the width they wrap to.
+Textbox.createControls = () => {
+  const { mt: _mt, mb: _mb, ...controls } = controlsUtils.createTextboxDefaultControls();
+  return { controls: { ...controls, deleteControl } };
+};
+
+/**
+ * Removes objects from the canvas. Text of the document itself is not
+ * removed but marked as deleted, so the original stays erased.
+ */
+export function removeObjects(canvas: Canvas, objects: FabricObject[]): void {
+  const removable: FabricObject[] = [];
+  for (const object of objects) {
+    if (isNative(object)) {
+      markDeleted(object);
+      canvas.fire("object:modified", { target: object } as never);
+    } else {
+      removable.push(object);
+    }
+  }
+  if (removable.length > 0) canvas.remove(...removable);
+  canvas.requestRenderAll();
+}
 
 // ── Object kinds and locking ───────────────────────────────────────────────
 
@@ -310,6 +336,7 @@ export function createShape(
  */
 export function bakeScale(object: FabricObject | undefined): boolean {
   if (!object) return false;
+  if (isNative(object)) return bakeNativeScale(object);
   const sx = object.scaleX || 1;
   const sy = object.scaleY || 1;
   if (Math.abs(sx - 1) < 1e-3 && Math.abs(sy - 1) < 1e-3) return false;
@@ -369,6 +396,12 @@ function stackRange(canvas: Canvas, objects: FabricObject[]): { canRaise: boolea
   return { canRaise: !atTop, canLower: !atBottom };
 }
 
+function originalFonts(objects: FabricObject[]): SelectionInfo["originalFonts"] {
+  const native = objects.find(isNative);
+  if (!native) return [];
+  return native.ytaNative.fonts.map((font) => ({ label: originalFontLabel(font.css) ?? font.name, css: font.css }));
+}
+
 export function describeSelection(canvas: Canvas): SelectionInfo | null {
   const active = canvas.getActiveObject();
   if (!active) return null;
@@ -384,6 +417,9 @@ export function describeSelection(canvas: Canvas): SelectionInfo | null {
     flipY: !!active.flipY,
     opacity: active instanceof ActiveSelection ? (objects[0]?.opacity ?? 1) : (active.opacity ?? 1),
     text: firstText ? readTextStyle(firstText) : null,
+    native: objects.some(isNative),
+    originalFonts: originalFonts(objects),
+    substituted: [...new Set(objects.filter(isNative).flatMap(substitutedChars))],
     shape: firstShape ? readShapeStyle(firstShape) : null,
     highlight: firstHighlight && typeof firstHighlight.fill === "string" ? normalizeHex(firstHighlight.fill) : null,
     locked: objects.every(isLocked),
@@ -403,8 +439,16 @@ export function applyTextStyle(canvas: Canvas, style: Partial<TextStyle>): boole
     const { fontSize, ...rest } = style;
     text.set(rest);
     if (fontSize !== undefined) text.set("fontSize", fontSize / (text.scaleY || 1));
-    // Per-character styles from typing would override object-level styles.
-    if (text.styles && Object.keys(text.styles).length > 0) text.set("styles", {});
+    if (isNative(text)) {
+      // Document text keeps a style per character (its original fonts):
+      // the change applies to every character instead of clearing them.
+      const change: Record<string, unknown> = { ...rest };
+      if (fontSize !== undefined) change.fontSize = fontSize / (text.scaleY || 1);
+      text.setSelectionStyles(change, 0, text.text.length);
+    } else if (text.styles && Object.keys(text.styles).length > 0) {
+      // Per-character styles from typing would override object-level styles.
+      text.set("styles", {});
+    }
     text.initDimensions();
     text.setCoords();
   }
@@ -472,7 +516,7 @@ export function serializeSelection(canvas: Canvas): Record<string, unknown>[] {
   const all = canvas.getObjects();
   return selectedObjects(canvas)
     .sort((a, b) => all.indexOf(a) - all.indexOf(b))
-    .map((object) => internals._toObject(object, "toObject", []));
+    .map((object) => toPlainTextData(internals._toObject(object, "toObject", [])));
 }
 
 export function selectionText(canvas: Canvas): string {

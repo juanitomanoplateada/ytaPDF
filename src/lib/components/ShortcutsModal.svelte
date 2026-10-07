@@ -11,6 +11,8 @@
       items: [
         ["V", "Seleccionar"],
         ["T", "Texto"],
+        ["E", "Editar el texto del documento"],
+        ["Alt + clic", "Editar solo una línea de un párrafo"],
         ["Esc", "Terminar la edición y deseleccionar"],
       ],
     },

@@ -31,6 +31,8 @@
     Shapes,
     Signature,
     Square,
+    TextCursorInput,
+    UndoDot,
     Trash2,
     Type,
     Underline,
@@ -42,6 +44,7 @@
   import { editor, type DrawTool, type ShapeStyle, type TextStyle } from "../editor.svelte";
   import { ensureFamilyLoaded } from "../embeddedFonts";
   import { FONT_FAMILIES, familyFromCss, type EmbeddedFamilyId } from "../fonts";
+  import { originalFontIndex } from "../nativeText";
   import { notifications } from "../notifications.svelte";
   import { pwa } from "../pwa.svelte";
   import ConfirmModal from "./ConfirmModal.svelte";
@@ -90,6 +93,11 @@
   /** Text controls edit the selected text, or the style of the next text. */
   const showTextControls = $derived(selection ? selection.text !== null && !locked : editor.tool === "text");
   const textStyle = $derived<TextStyle>(selection?.text ?? editor.textStyle);
+  /** Document text can go back to the fonts it had in the document. */
+  const originalFonts = $derived(selection?.originalFonts ?? []);
+  const fontValue = $derived(
+    originalFontIndex(textStyle.fontFamily) !== undefined ? textStyle.fontFamily : familyFromCss(textStyle.fontFamily).css,
+  );
 
   const showShapeControls = $derived(
     selection ? selection.shape !== null && !locked : ["rect", "ellipse", "line", "arrow"].includes(editor.tool),
@@ -143,7 +151,9 @@
     activeShape?.hint ??
       (editor.tool === "text"
         ? "Haz clic en la página donde quieras escribir."
-        : "Selecciona un elemento para editarlo, o añade texto, imágenes, firmas y formas."),
+        : editor.tool === "edit"
+          ? "Haz clic en un texto del documento para editarlo. Se edita el párrafo entero; con Alt, solo esa línea."
+          : "Selecciona un elemento para editarlo, o añade texto, imágenes, firmas y formas."),
   );
 </script>
 
@@ -242,6 +252,17 @@
         >
           <Type size={18} />
           <span class="hide-mobile">Texto</span>
+        </button>
+        <button
+          class="icon labeled"
+          class:active={editor.tool === "edit"}
+          aria-pressed={editor.tool === "edit"}
+          title="Editar el texto del documento: haz clic en una línea o un párrafo (E)"
+          aria-label="Editar el texto del documento"
+          onclick={() => (editor.tool = editor.tool === "edit" ? "select" : "edit")}
+        >
+          <TextCursorInput size={18} />
+          <span class="hide-mobile">Editar texto</span>
         </button>
         <button class="icon labeled" title="Añadir imagen" aria-label="Añadir imagen" onclick={() => imageInput?.click()}>
           <ImageIcon size={18} />
@@ -390,12 +411,25 @@
           <select
             class="font"
             aria-label="Fuente"
-            value={familyFromCss(textStyle.fontFamily).css}
+            value={fontValue}
             onchange={(event) => void setFont(event.currentTarget.value)}
           >
-            {#each FONT_FAMILIES as family (family.id)}
-              <option value={family.css}>{family.label}</option>
-            {/each}
+            {#if originalFonts.length > 0}
+              <optgroup label="Del documento">
+                {#each originalFonts as font (font.css)}
+                  <option value={font.css}>{font.label}</option>
+                {/each}
+              </optgroup>
+              <optgroup label="Otras fuentes">
+                {#each FONT_FAMILIES as family (family.id)}
+                  <option value={family.css}>{family.label}</option>
+                {/each}
+              </optgroup>
+            {:else}
+              {#each FONT_FAMILIES as family (family.id)}
+                <option value={family.css}>{family.label}</option>
+              {/each}
+            {/if}
           </select>
           <input
             class="size"
@@ -590,6 +624,20 @@
           </label>
         {/if}
 
+        {#if selection.native}
+          <div class="group">
+            <button
+              class="icon labeled"
+              title="Quitar los cambios y volver al texto original del documento"
+              aria-label="Restaurar el texto original"
+              onclick={() => editor.restoreOriginalText()}
+            >
+              <UndoDot size={16} />
+              <span class="hide-mobile">Restaurar original</span>
+            </button>
+          </div>
+        {/if}
+
         <div class="group">
           <button class="icon" title="Duplicar (Ctrl D)" aria-label="Duplicar" onclick={() => void editor.duplicateSelection()}>
             <CopyPlus size={16} />
@@ -616,6 +664,10 @@
         </div>
         {#if locked}
           <span class="hint">Bloqueado: no se puede mover ni editar hasta desbloquearlo.</span>
+        {:else if selection.substituted.length > 0}
+          <span class="hint">
+            La fuente original no tiene {selection.substituted.slice(0, 8).join(" ")}: se dibujarán con una fuente parecida.
+          </span>
         {/if}
       {:else}
         <span class="hint">{hint}</span>

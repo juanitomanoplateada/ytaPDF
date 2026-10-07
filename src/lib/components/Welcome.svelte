@@ -7,6 +7,7 @@
     ShieldCheck,
     Signature,
     SquareCheck,
+    TextCursorInput,
     Type,
     Upload,
   } from "lucide-svelte";
@@ -48,6 +49,7 @@
     <ul class="features">
       <li><Plus size={20} /> Unir varios PDF</li>
       <li><LayoutGrid size={20} /> Reorganizar y girar páginas</li>
+      <li><TextCursorInput size={20} /> Editar el texto del PDF</li>
       <li><Type size={20} /> Texto, imágenes y formas</li>
       <li><Signature size={20} /> Firmar documentos</li>
       <li><SquareCheck size={20} /> Rellenar formularios</li>

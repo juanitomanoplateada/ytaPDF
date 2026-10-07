@@ -178,6 +178,7 @@
       return;
     }
     if (key === "t") editor.tool = "text";
+    if (key === "e") editor.tool = "edit";
     if (key === "v") editor.tool = "select";
     if (!editor.selection) return;
 
