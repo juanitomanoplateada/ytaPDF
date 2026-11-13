@@ -65,12 +65,39 @@ export function isRenderCancelled(error: unknown): boolean {
   return error instanceof pdfjsLib.RenderingCancelledException;
 }
 
+/** A visible area of a page in PDF user space: [x0, y0, x1, y1], like a CropBox. */
+export type Box = [number, number, number, number];
+
+/** How the editor shows a page: the user's rotation and crop on top of the page's own. */
+export interface PageGeometry {
+  /** Clockwise degrees added to the page's own `/Rotate`. */
+  rotation?: number;
+  /** Area kept by the user's crop, in PDF user space. */
+  crop?: Box;
+}
+
 /**
- * Viewport of a page with an extra rotation on top of its own `/Rotate`, as
- * the editor shows it. At scale 1 its units are PDF points.
+ * Viewport of a page as the editor shows it: with an extra rotation on top of
+ * its own `/Rotate` and, when cropped, limited to the crop box. At scale 1 its
+ * units are PDF points. A number is taken as the extra rotation.
  */
-export function viewportOf(page: PDFPageProxy, scale: number, extraRotation = 0): PageViewport {
-  return page.getViewport({ scale, rotation: (page.rotate + extraRotation) % 360 });
+export function viewportOf(page: PDFPageProxy, scale: number, geometry: PageGeometry | number = 0): PageViewport {
+  const { rotation = 0, crop } = typeof geometry === "number" ? { rotation: geometry } : geometry;
+  const viewport = page.getViewport({ scale, rotation: (page.rotate + rotation) % 360 });
+  if (!crop) return viewport;
+  // PDF.js does not export PageViewport, but every viewport is one.
+  const PageViewportClass = viewport.constructor as new (options: {
+    viewBox: number[];
+    userUnit: number;
+    scale: number;
+    rotation: number;
+  }) => PageViewport;
+  return new PageViewportClass({
+    viewBox: crop,
+    userUnit: (page as unknown as { userUnit?: number }).userUnit ?? 1,
+    scale,
+    rotation: viewport.rotation,
+  });
 }
 
 /**
@@ -83,11 +110,11 @@ export function renderPage(
   canvas: HTMLCanvasElement,
   scale: number,
   pixelRatio = window.devicePixelRatio || 1,
-  extraRotation = 0,
+  geometry: PageGeometry | number = 0,
 ): RenderTask {
-  const cssViewport = viewportOf(page, scale, extraRotation);
+  const cssViewport = viewportOf(page, scale, geometry);
   const outputScale = clampOutputScale(cssViewport.width, cssViewport.height, pixelRatio);
-  const viewport = viewportOf(page, scale * outputScale, extraRotation);
+  const viewport = viewportOf(page, scale * outputScale, geometry);
 
   canvas.width = Math.max(1, Math.floor(viewport.width));
   canvas.height = Math.max(1, Math.floor(viewport.height));
@@ -99,6 +126,24 @@ export function renderPage(
     viewport,
     annotationMode: pdfjsLib.AnnotationMode.ENABLE_STORAGE,
   });
+}
+
+export type PageTextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
+
+const textCache = new WeakMap<PDFPageProxy, Promise<PageTextContent>>();
+
+/**
+ * The text of a page as PDF.js extracts it. The text layer and the search
+ * share it, so the n-th text item is the n-th span of the text layer.
+ */
+export function pageTextContent(page: PDFPageProxy): Promise<PageTextContent> {
+  let content = textCache.get(page);
+  if (!content) {
+    content = page.getTextContent();
+    content.catch(() => textCache.delete(page));
+    textCache.set(page, content);
+  }
+  return content;
 }
 
 /** Browsers refuse canvases above ~16.7M pixels (less on iOS). */

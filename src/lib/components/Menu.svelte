@@ -99,7 +99,7 @@
     display: flex;
     flex-direction: column;
     min-width: 220px;
-    max-width: calc(100vw - 16px);
+    max-width: min(360px, calc(100vw - 16px));
     padding: 6px;
     border: 1px solid var(--color-border);
     border-radius: var(--radius-md);
@@ -149,7 +149,7 @@
     height: 18px;
     margin-left: auto;
     border-radius: 999px;
-    background: #c9ced6;
+    background: var(--color-border-strong);
     transition: background 0.15s;
   }
   .menu :global(.switch)::after {

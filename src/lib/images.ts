@@ -40,18 +40,16 @@ const MIN_VECTOR_SIDE = 2048;
  * screen but that a raw JPEG stream would lose inside the PDF.
  */
 export async function importImage(file: Blob): Promise<string> {
+  return registerImage(await readImageAsset(file));
+}
+
+/** The PNG or JPEG bytes of any image, without registering it for the canvas. */
+export async function readImageAsset(file: Blob): Promise<ImageAsset> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const kind = sniffImageType(bytes);
-
-  let asset: ImageAsset;
-  if (kind === "png") {
-    asset = { bytes, mime: "image/png" };
-  } else if (kind === "jpeg" && readJpegOrientation(bytes) <= 1) {
-    asset = { bytes, mime: "image/jpeg" };
-  } else {
-    asset = await reencode(file, kind);
-  }
-  return registerImage(asset);
+  if (kind === "png") return { bytes, mime: "image/png" };
+  if (kind === "jpeg" && readJpegOrientation(bytes) <= 1) return { bytes, mime: "image/jpeg" };
+  return reencode(file, kind);
 }
 
 type ImageKind = "png" | "jpeg" | "svg" | "other";

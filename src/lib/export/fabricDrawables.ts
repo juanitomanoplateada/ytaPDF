@@ -1,7 +1,8 @@
-import { Color, Ellipse, FabricImage, FabricText, Path, Rect, util, type FabricObject } from "fabric";
+import { Color, Ellipse, FabricImage, FabricText, Group, Path, Rect, util, type FabricObject } from "fabric";
 import { applyToPoint, IDENTITY, multiply, pathToSvg, type Matrix, type PathCommand } from "../geometry";
-import type { PageAnnotations } from "../editor.svelte";
+import type { LinkTarget, PageAnnotations } from "../editor.svelte";
 import { isNative } from "../nativeText";
+import { overlapArea, type Point } from "../polygon";
 import type { Drawable, PathDrawable, Rgb, TextLine } from "./drawing";
 
 /**
@@ -45,27 +46,34 @@ function withoutScale(matrix: Matrix, scaleX: number, scaleY: number): Matrix {
 /**
  * Rebuilds the Fabric objects of a page and describes each one as a drawing
  * instruction, using Fabric's own transforms and line metrics so the PDF
- * matches the canvas. Redaction boxes are left out: pages with them are
- * exported as an image instead.
+ * matches the canvas. Redaction boxes are drawn as the opaque boxes they
+ * are: what was under them has already been removed from the page.
  */
 export async function fabricToDrawables(data: PageAnnotations): Promise<Drawable[]> {
   const objects = await util.enlivenObjects<FabricObject>(data.objects);
   const drawables: Drawable[] = [];
 
-  for (const object of objects) {
-    if (!object.visible) continue;
+  const visit = (object: FabricObject, opacity: number) => {
+    if (!object.visible) return;
     const kind = (object as unknown as { ytaKind?: string }).ytaKind;
-    if (kind === "redact" || isNative(object)) continue;
-    const drawable = toDrawable(object);
+    // Document text is rewritten in the content; notes and links become annotations.
+    if (isNative(object) || kind === "note" || kind === "link") return;
+    if (object instanceof Group) {
+      // Children's transforms already include the group's (they know their group).
+      for (const child of object.getObjects()) visit(child, opacity * (object.opacity ?? 1));
+      return;
+    }
+    const drawable = toDrawable(object, opacity);
     if (drawable) drawables.push(drawable);
-  }
+  };
+  for (const object of objects) visit(object, 1);
   return drawables;
 }
 
-function toDrawable(object: FabricObject): Drawable | null {
+function toDrawable(object: FabricObject, parentOpacity = 1): Drawable | null {
   const paint: Paint = {
     matrix: object.calcTransformMatrix() as Matrix,
-    opacity: object.opacity ?? 1,
+    opacity: (object.opacity ?? 1) * parentOpacity,
     fill: parseColor(object.fill),
     stroke: object.strokeWidth > 0 ? parseColor(object.stroke) : null,
   };
@@ -102,6 +110,7 @@ function textDrawable(object: FabricText, { matrix, opacity, fill }: Paint): Dra
     color: fill?.color ?? { r: 0, g: 0, b: 0 },
     opacity: opacity * (fill?.alpha ?? 1),
     underline: !!object.underline,
+    linethrough: !!object.linethrough,
   };
 }
 
@@ -151,7 +160,100 @@ function shapeDrawable(object: Ellipse | Rect, { matrix, opacity, fill, stroke }
   return { kind: "rect", ...shape, width: object.width * kx, height: object.height * ky };
 }
 
-/** Whether a page has redaction boxes, which force it to be rasterised. */
+/** Objects that show nothing of their own: covering them with a redaction box hides nothing. */
+const PLAIN_SHAPES = new Set(["rect", "ellipse", "line", "arrow", "highlight", "redact", "decoration", "note", "link"]);
+
+/** Corners of an object in scene space, its stroke included. */
+function cornersOf(object: FabricObject): Point[] {
+  const matrix = object.calcTransformMatrix() as Matrix;
+  const stroke = object.stroke && object.strokeWidth > 0 ? object.strokeWidth : 0;
+  const w = (object.width + stroke) / 2;
+  const h = (object.height + stroke) / 2;
+  return [
+    applyToPoint(matrix, -w, -h),
+    applyToPoint(matrix, w, -h),
+    applyToPoint(matrix, w, h),
+    applyToPoint(matrix, -w, h),
+  ];
+}
+
+/**
+ * Redaction boxes of a page (scene space), and whether one covers an object
+ * of the page's own annotations that shows something (text, an image, a
+ * drawing): those are only hidden, not removed, so the page has to be
+ * exported as an image.
+ */
+export async function redactionAreas(data: PageAnnotations): Promise<{ areas: Point[][]; coversContent: boolean }> {
+  const objects = await util.enlivenObjects<FabricObject>(data.objects);
+  const areas: Point[][] = [];
+  const below: Point[][] = [];
+  let coversContent = false;
+  const visit = (object: FabricObject) => {
+    if (!object.visible) return;
+    const kind = (object as unknown as { ytaKind?: string }).ytaKind;
+    if (object instanceof Group) {
+      for (const child of object.getObjects()) visit(child);
+      return;
+    }
+    if (kind === "redact") {
+      const area = cornersOf(object);
+      if (below.some((shape) => overlapArea(shape, area) > 0.5)) coversContent = true;
+      areas.push(area);
+    } else if (!PLAIN_SHAPES.has(kind ?? "") && !isNative(object)) {
+      below.push(cornersOf(object));
+    }
+  };
+  for (const object of objects) visit(object);
+  return { areas, coversContent };
+}
+
+/** A note or a link of a page, in scene space, before it becomes a PDF annotation. */
+export interface SceneAnnotation {
+  kind: "note" | "link";
+  corners: Point[];
+  text: string;
+  color: Rgb;
+  link: LinkTarget | null;
+}
+
+/** The notes and links of a page, which are exported as PDF annotations. */
+export async function sceneAnnotations(data: PageAnnotations): Promise<SceneAnnotation[]> {
+  if (!data.objects.some(mayHoldAnnotations)) return [];
+  const objects = await util.enlivenObjects<FabricObject>(data.objects);
+  const found: SceneAnnotation[] = [];
+  const visit = (object: FabricObject) => {
+    if (!object.visible) return;
+    if (object instanceof Group) {
+      for (const child of object.getObjects()) visit(child);
+      return;
+    }
+    const kind = (object as unknown as { ytaKind?: string }).ytaKind;
+    if (kind !== "note" && kind !== "link") return;
+    const background = parseColor((object as FabricObject & { backgroundColor?: string }).backgroundColor);
+    found.push({
+      kind,
+      corners: cornersOf(object),
+      text: object instanceof FabricText ? object.text : "",
+      color: background?.color ?? { r: 1, g: 0.95, b: 0.63 },
+      link: (object as unknown as { ytaLink?: LinkTarget }).ytaLink ?? null,
+    });
+  };
+  for (const object of objects) visit(object);
+  return found;
+}
+
+function mayHoldAnnotations(object: Record<string, unknown>): boolean {
+  return (
+    object.ytaKind === "note" ||
+    object.ytaKind === "link" ||
+    (Array.isArray(object.objects) && (object.objects as Record<string, unknown>[]).some(mayHoldAnnotations))
+  );
+}
+
+/** Whether a page has redaction boxes. */
 export function hasRedactions(data: PageAnnotations | undefined): boolean {
-  return !!data?.objects.some((object) => object.ytaKind === "redact");
+  const redacts = (object: Record<string, unknown>): boolean =>
+    object.ytaKind === "redact" ||
+    (Array.isArray(object.objects) && (object.objects as Record<string, unknown>[]).some(redacts));
+  return !!data?.objects.some(redacts);
 }

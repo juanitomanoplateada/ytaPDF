@@ -1,58 +1,67 @@
 <script lang="ts">
   import { editor } from "../editor.svelte";
+  import { t } from "../i18n.svelte";
   import Modal from "./Modal.svelte";
 
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
   const mod = isMac ? "⌘" : "Ctrl";
 
-  const sections: { title: string; items: [string, string][] }[] = [
+  const sections = $derived<{ title: string; items: [string, string][] }[]>([
     {
-      title: "Herramientas",
+      title: t("Herramientas"),
       items: [
-        ["V", "Seleccionar"],
-        ["T", "Texto"],
-        ["E", "Editar el texto del documento"],
-        ["Alt + clic", "Editar solo una línea de un párrafo"],
-        ["Esc", "Terminar la edición y deseleccionar"],
+        ["V", t("Seleccionar")],
+        ["T", t("Texto")],
+        ["E", t("Editar el texto del documento")],
+        ["S", t("Seleccionar texto del documento")],
+        ["P", t("Lápiz a mano alzada")],
+        ["C", t("Recortar la página")],
+        [t("Alt + clic"), t("Editar solo una línea de un párrafo")],
+        ["Esc", t("Terminar la edición y deseleccionar")],
       ],
     },
     {
-      title: "Edición",
+      title: t("Edición"),
       items: [
-        [`${mod} Z`, "Deshacer"],
-        [`${mod} Y`, "Rehacer"],
-        [`${mod} C / ${mod} X / ${mod} V`, "Copiar, cortar y pegar (también imágenes y texto de otras aplicaciones)"],
-        [`${mod} D`, "Duplicar"],
-        [`${mod} L`, "Bloquear o desbloquear"],
-        ["Supr", "Eliminar"],
-        ["Flechas", "Mover 1 px (con Mayús, 10 px)"],
-        ["Alt al arrastrar", "Mover sin guías de alineación"],
+        [`${mod} Z`, t("Deshacer")],
+        [`${mod} Y`, t("Rehacer")],
+        [`${mod} C / ${mod} X / ${mod} V`, t("Copiar, cortar y pegar (también imágenes y texto de otras aplicaciones)")],
+        [`${mod} D`, t("Duplicar")],
+        [`${mod} L`, t("Bloquear o desbloquear")],
+        [`${mod} ${t("Mayús")} G`, t("Agrupar o desagrupar")],
+        [t("Supr"), t("Eliminar")],
+        [t("Flechas"), t("Mover 1 px (con Mayús, 10 px)")],
+        [t("Alt al arrastrar"), t("Mover sin guías de alineación")],
       ],
     },
     {
-      title: "Capas",
+      title: t("Capas"),
       items: [
-        [`${mod} ] o ${mod} ↑`, "Traer adelante"],
-        [`${mod} [ o ${mod} ↓`, "Enviar atrás"],
-        [`${mod} Mayús ] o ↑`, "Traer al frente"],
-        [`${mod} Mayús [ o ↓`, "Enviar al fondo"],
+        [`${mod} ] / ${mod} ↑`, t("Traer adelante")],
+        [`${mod} [ / ${mod} ↓`, t("Enviar atrás")],
+        [`${mod} ${t("Mayús")} ]`, t("Traer al frente")],
+        [`${mod} ${t("Mayús")} [`, t("Enviar al fondo")],
       ],
     },
     {
-      title: "Documento",
+      title: t("Documento"),
       items: [
-        [`${mod} O`, "Abrir o añadir PDF"],
-        [`${mod} S`, "Exportar PDF"],
-        [`${mod} + / ${mod} -`, "Acercar / alejar"],
-        [`${mod} 0`, "Zoom al 100 %"],
-        [`${mod} + rueda`, "Zoom continuo"],
-        ["?", "Mostrar esta ayuda"],
+        [`${mod} O`, t("Abrir o añadir PDF")],
+        [`${mod} S`, t("Exportar PDF (o guardar en el archivo abierto)")],
+        [`${mod} ${t("Mayús")} S`, t("Guardar como: nombre, contraseña, imagen…")],
+        [`${mod} P`, t("Imprimir")],
+        [`${mod} F`, t("Buscar en el documento")],
+        [`${mod} G`, t("Ir a una página")],
+        [`${mod} + / ${mod} -`, t("Acercar / alejar")],
+        [`${mod} 0`, t("Zoom al 100 %")],
+        [`${mod} + ${t("rueda")}`, t("Zoom continuo (en el móvil, pellizca)")],
+        ["?", t("Mostrar esta ayuda")],
       ],
     },
-  ];
+  ]);
 </script>
 
-<Modal title="Atajos de teclado" onclose={() => (editor.shortcutsOpen = false)} wide>
+<Modal title={t("Atajos de teclado")} onclose={() => (editor.shortcutsOpen = false)} wide>
   <div class="sections">
     {#each sections as section (section.title)}
       <section>

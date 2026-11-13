@@ -1,14 +1,28 @@
 <script lang="ts">
-  import { untrack } from "svelte";
-  import { ActiveSelection, Canvas, IText, type FabricObject, type TPointerEventInfo } from "fabric";
-  import type { PDFPageProxy, RenderTask } from "pdfjs-dist";
+  import { tick, untrack } from "svelte";
+  import { ActiveSelection, Canvas, IText, PencilBrush, type FabricObject, type TPointerEventInfo } from "fabric";
+  import { TextLayer, type PDFPageProxy, type RenderTask } from "pdfjs-dist";
+  import { t } from "../i18n.svelte";
+  import { search } from "../search.svelte";
+  import { ocrKey, withOcrText } from "../ocrText";
+  import { markLine, mergeLines } from "../textMarks";
+  import { paintAnnotations } from "../thumbnails";
+  import {
+    alignObjects,
+    distributeObjects,
+    groupSelected,
+    setObjectBounds,
+    ungroupSelected,
+  } from "../fabricSetup";
   import {
     applyShapeStyle,
+    setLinkTarget,
     applyTextStyle,
     arrange,
     bakeScale,
     clearTopLayer,
     createImage,
+    createMark,
     createShape,
     createSignature,
     createText,
@@ -19,6 +33,7 @@
     installAlignmentGuides,
     isLocked,
     isText,
+    markInk,
     pasteObjects,
     prepareObject,
     removeObjects,
@@ -30,12 +45,14 @@
   } from "../fabricSetup";
   import {
     editor,
+    signatureWidth,
     type DrawTool,
     type PageAnnotations,
     type PageController,
     type PageRef,
+    type Rect,
   } from "../editor.svelte";
-  import { ensureFontsFor } from "../embeddedFonts";
+  import { ensureFontsFor, ensureScriptFontsFor } from "../embeddedFonts";
   import { applyToPoint, type Matrix } from "../geometry";
   import { importImage } from "../images";
   import {
@@ -48,7 +65,7 @@
     type NativeText,
   } from "../nativeText";
   import { notifications } from "../notifications.svelte";
-  import { isRenderCancelled, renderPage, viewportOf } from "../pdfjs";
+  import { isRenderCancelled, pageTextContent, renderPage, viewportOf } from "../pdfjs";
   import { parseEraseRanges } from "../pdfText/ranges";
   import { specKey, textEditing, type PreviewHandle } from "../pdfText/service";
   import type { NativeSpec, PageTextAnalysis, Point, TextUnit } from "../pdfText/types";
@@ -63,7 +80,7 @@
 
   let { page, index, active }: Props = $props();
 
-  const DRAW_TOOLS: DrawTool[] = ["rect", "ellipse", "line", "arrow", "highlight", "redact"];
+  const DRAW_TOOLS: DrawTool[] = ["rect", "ellipse", "line", "arrow", "highlight", "redact", "note", "link"];
   const isDrawTool = (tool: string): tool is DrawTool => DRAW_TOOLS.includes(tool as DrawTool);
 
   let container: HTMLDivElement;
@@ -83,10 +100,164 @@
   let saveKey: string | undefined;
   let pendingTextAt: { x: number; y: number } | null = null;
   let drawStart: { x: number; y: number } | null = null;
+  let cropStart: { x: number; y: number } | null = null;
+  /** Area being drawn with the crop tool. */
+  let cropDraft = $state<Rect | null>(null);
   let cleanups: Array<() => void> = [];
 
   const width = $derived(page.width * editor.zoom);
   const height = $derived(page.height * editor.zoom);
+  /** The crop area shown over this page: the one being drawn, or the one waiting to be applied. */
+  const cropArea = $derived(
+    cropDraft ?? (editor.pendingCrop?.pageId === page.id && editor.tool === "crop" ? editor.pendingCrop.rect : null),
+  );
+
+  // ── Text layer, search and decorations ────────────────────────────────────
+
+  let textLayerElement = $state<HTMLDivElement>();
+  /** Spans of the text layer, one per text item of the page. */
+  let textDivs = $state.raw<HTMLElement[]>([]);
+  let decorationCanvas = $state<HTMLCanvasElement>();
+  let highlights = $state.raw<{ left: number; top: number; width: number; height: number; active: boolean }[]>([]);
+
+  // PDF.js lays out the transparent text over the page; the zoom only changes a CSS variable.
+  $effect(() => {
+    const proxy = pdfPage;
+    const element = textLayerElement;
+    const geometry = { rotation: page.rotation, crop: page.crop };
+    // Text recognised on a scanned page is selectable and searchable like the rest.
+    const recognised = editor.ocr[ocrKey(page.sourceId, page.sourceIndex)];
+    if (!proxy || !element) return;
+    let cancelled = false;
+    let layer: TextLayer | null = null;
+    element.replaceChildren();
+    textDivs = [];
+    void pageTextContent(proxy)
+      .then((content) => {
+        if (cancelled) return;
+        layer = new TextLayer({
+          textContentSource: withOcrText(content, recognised),
+          container: element,
+          viewport: viewportOf(proxy, 1, geometry),
+        });
+        return layer.render().then(() => {
+          if (!cancelled && layer) textDivs = layer.textDivs;
+        });
+      })
+      .catch((error) => {
+        if (!cancelled) console.error("No se pudo preparar el texto de la página:", error);
+      });
+    return () => {
+      cancelled = true;
+      layer?.cancel();
+    };
+  });
+
+  /** Boxes of a text range on this page, in scene units, from the text layer's spans. */
+  function rangeBoxes(range: { start: { item: number; offset: number }; end: { item: number; offset: number } }) {
+    const boxes: { x: number; y: number; width: number; height: number }[] = [];
+    const origin = container.getBoundingClientRect();
+    for (let item = range.start.item; item <= range.end.item; item++) {
+      const node = textDivs[item]?.firstChild;
+      if (!node || node.nodeType !== Node.TEXT_NODE) continue;
+      const length = node.textContent?.length ?? 0;
+      const sub = document.createRange();
+      sub.setStart(node, item === range.start.item ? Math.min(range.start.offset, length) : 0);
+      sub.setEnd(node, item === range.end.item ? Math.min(range.end.offset + 1, length) : length);
+      for (const r of sub.getClientRects()) {
+        boxes.push({
+          x: (r.left - origin.left) / editor.zoom,
+          y: (r.top - origin.top) / editor.zoom,
+          width: r.width / editor.zoom,
+          height: r.height / editor.zoom,
+        });
+      }
+    }
+    return boxes;
+  }
+
+  // Search matches on this page, highlighted over the text.
+  $effect(() => {
+    const matches = search.matchesOn(page.id);
+    void textDivs;
+    void editor.zoom;
+    void search.reveal;
+    if (matches.length === 0 || textDivs.length === 0) {
+      highlights = [];
+      return;
+    }
+    // Measured after layout, when the spans have their final size.
+    const frame = requestAnimationFrame(() => {
+      highlights = matches.flatMap((match) =>
+        mergeLines(rangeBoxes(match), spanRotation(textDivs[match.start.item]) % 180 !== 0).map((box) => ({
+          left: box.x,
+          top: box.y,
+          width: box.width,
+          height: box.height,
+          active: match.active,
+        })),
+      );
+      // The new highlights reach the DOM after this update.
+      void tick().then(() => {
+        container.querySelector(".search-hit.active")?.scrollIntoView({ block: "center", inline: "nearest" });
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  });
+
+  // Page numbers, header, footer and watermark, painted over the page.
+  $effect(() => {
+    const target = decorationCanvas;
+    const objects = editor.decorationObjects[page.id] ?? [];
+    const zoom = editor.zoom;
+    const w = width;
+    const h = height;
+    if (!target || !active) return;
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    target.width = Math.max(1, Math.round(w * ratio));
+    target.height = Math.max(1, Math.round(h * ratio));
+    const ctx = target.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, target.width, target.height);
+    if (objects.length === 0) return;
+    const abort = new AbortController();
+    void paintAnnotations(ctx, { objects }, zoom * ratio, abort.signal).catch(() => {});
+    return () => abort.abort();
+  });
+
+  /** How a span's letters are turned on screen (page rotation plus the text's own), in quarter turns. */
+  function spanRotation(span: HTMLElement | undefined): number {
+    const main = Number(textLayerElement?.dataset.mainRotation ?? 0);
+    const own = span ? Number.parseFloat(span.style.getPropertyValue("--rotate")) || 0 : 0;
+    return ((Math.round((main + own) / 90) * 90) % 360 + 360) % 360;
+  }
+
+  /** Lines of text selected on this page (scene units), and how their letters are turned. */
+  function selectedLines(range: Range): { lines: { x: number; y: number; width: number; height: number }[]; rotation: number } {
+    const boxes: { x: number; y: number; width: number; height: number }[] = [];
+    const origin = container.getBoundingClientRect();
+    let first: HTMLElement | undefined;
+    for (const span of textDivs) {
+      const node = span.firstChild;
+      if (!node || !range.intersectsNode(span)) continue;
+      first ??= span;
+      const length = node.textContent?.length ?? 0;
+      const sub = document.createRange();
+      sub.setStart(node, span.contains(range.startContainer) && range.startContainer === node ? range.startOffset : 0);
+      sub.setEnd(node, span.contains(range.endContainer) && range.endContainer === node ? range.endOffset : length);
+      if (sub.collapsed) continue;
+      for (const r of sub.getClientRects()) {
+        boxes.push({
+          x: (r.left - origin.left) / editor.zoom,
+          y: (r.top - origin.top) / editor.zoom,
+          width: r.width / editor.zoom,
+          height: r.height / editor.zoom,
+        });
+      }
+    }
+    const rotation = spanRotation(first);
+    return { lines: mergeLines(boxes, rotation % 180 !== 0), rotation };
+  }
 
   // ── PDF layer ─────────────────────────────────────────────────────────────
 
@@ -111,6 +282,7 @@
     const proxy = pdfPage;
     const zoom = editor.zoom;
     const rotation = page.rotation;
+    const crop = page.crop;
     const specs = previewSpecs;
     const drawn = previewDrawn;
     const source = editor.sources.get(page.sourceId);
@@ -135,7 +307,7 @@
         renderProxy = await pdf.getPage(page.sourceIndex + 1);
         if (cancelled) return;
       }
-      task = renderPage(renderProxy, buffer, zoom, undefined, rotation);
+      task = renderPage(renderProxy, buffer, zoom, undefined, { rotation, crop });
       await task.promise;
       if (cancelled) return;
       target.width = buffer.width;
@@ -152,7 +324,7 @@
     })().catch((error) => {
       if (cancelled || isRenderCancelled(error)) return;
       console.error("Error al dibujar la página:", error);
-      if (specs.length > 0) notifications.error("No se pudo mostrar el texto editado en la página.");
+      if (specs.length > 0) notifications.error(t("No se pudo mostrar el texto editado en la página."));
     });
 
     return () => {
@@ -196,7 +368,7 @@
   let pendingEdit: { point: Point; lineOnly: boolean } | null = null;
 
   function viewportTransform(): Matrix | null {
-    return pdfPage ? (viewportOf(pdfPage, 1, page.rotation).transform as Matrix) : null;
+    return pdfPage ? (viewportOf(pdfPage, 1, page).transform as Matrix) : null;
   }
 
   function natives(): NativeText[] {
@@ -338,7 +510,7 @@
       .catch((error) => {
         console.error("No se pudo analizar el texto de la página:", error);
         analysisState = "error";
-        notifications.error("No se pudo leer el texto de esta página para editarlo.");
+        notifications.error(t("No se pudo leer el texto de esta página para editarlo."));
       });
   });
 
@@ -427,14 +599,15 @@
     if (!canvas || !viewport || !analysis) return false;
     if (analysis.lines.length === 0) {
       notifications.info(
-        "Esta página no tiene texto que se pueda editar. Si es un documento escaneado, el texto forma parte de una imagen.",
+        t("Esta página no tiene texto que se pueda editar. Si es un documento escaneado, el texto forma parte de una imagen."),
+        { label: t("Reconocer texto (OCR)"), run: () => (editor.ocrDialog = true) },
       );
       return false;
     }
     const unit = unitAt(point, lineOnly);
     if (!unit) return false;
     if (!unit.editable) {
-      notifications.info(unit.reason ?? "Este texto no se puede editar.");
+      notifications.info(t(unit.reason ?? "Este texto no se puede editar."));
       return true;
     }
     clearHover();
@@ -478,13 +651,34 @@
     void canvasGeneration;
     const tool = editor.tool;
     if (!canvas) return;
-    const drawing = isDrawTool(tool);
+    const drawing = isDrawTool(tool) || tool === "crop";
+    const pen = tool === "pen";
     canvas.selection = tool === "select";
-    // While drawing, clicks over existing objects start a new shape.
+    // While drawing or cropping, clicks over existing objects start a new shape.
     canvas.skipTargetFind = drawing;
+    canvas.isDrawingMode = pen;
+    // With the pen, a finger draws instead of scrolling the document.
+    canvas.allowTouchScrolling = !pen;
+    setTouchScrolling(!pen);
     canvas.defaultCursor = tool === "text" || tool === "edit" ? "text" : drawing ? "crosshair" : "default";
     if (tool !== "select") canvas.discardActiveObject();
     canvas.requestRenderAll();
+  });
+
+  // The pen draws with the current stroke colour and width.
+  $effect(() => {
+    void canvasGeneration;
+    const pen = editor.tool === "pen";
+    const { stroke, strokeWidth } = editor.shapeStyle;
+    if (!canvas || !pen) return;
+    const brush = canvas.freeDrawingBrush instanceof PencilBrush ? canvas.freeDrawingBrush : new PencilBrush(canvas);
+    brush.color = stroke;
+    brush.width = strokeWidth;
+    brush.strokeLineCap = "round";
+    brush.strokeLineJoin = "round";
+    // Points closer than this (in screen pixels) are dropped: smoother, lighter strokes.
+    brush.decimate = 1;
+    canvas.freeDrawingBrush = brush;
   });
 
   // Undo, redo and other external changes flow from the editor state into Fabric.
@@ -535,7 +729,24 @@
     instance.on("object:scaling", startTransform);
     instance.on("object:rotating", startTransform);
     instance.on("object:resizing", startTransform);
-    instance.on("text:changed", () => scheduleSave(500, `typing:${page.id}`));
+    instance.on("path:created", ({ path }) => {
+      // A freehand stroke from the pen: kept as a vector path, like signatures.
+      markInk(path);
+      scheduleSave();
+    });
+    instance.on("text:changed", ({ target }) => {
+      scheduleSave(500, `typing:${page.id}`);
+      // Arabic, Chinese, Japanese or Korean typed for the first time: measure
+      // again once their font has arrived.
+      if (target instanceof IText) {
+        void ensureScriptFontsFor(target.text).then((loaded) => {
+          if (!loaded) return;
+          target.initDimensions();
+          target.setCoords();
+          instance.requestRenderAll();
+        });
+      }
+    });
     instance.on("text:editing:entered", ({ target }) => {
       if (isNative(target) && target.ytaGhost) {
         target.ytaGhost = false;
@@ -626,7 +837,7 @@
 
   function setTouchScrolling(enabled: boolean) {
     // While something is selected, touch gestures move it instead of scrolling.
-    if (canvas) canvas.upperCanvasEl.style.touchAction = enabled ? "pan-x pan-y pinch-zoom" : "none";
+    if (canvas) canvas.upperCanvasEl.style.touchAction = enabled ? "pan-x pan-y" : "none";
   }
 
   async function loadAnnotations(data: PageAnnotations | undefined) {
@@ -709,7 +920,12 @@
     drawStart = null;
     if (!canvas) return;
     const tool = editor.tool;
-    if (tool === "text" && !target) pendingTextAt = canvas.getScenePoint(e);
+    if (tool === "crop") {
+      const point = clampToPage(canvas.getScenePoint(e));
+      cropStart = point;
+      cropDraft = { x: point.x, y: point.y, width: 0, height: 0 };
+      if (editor.pendingCrop?.pageId !== page.id) editor.pendingCrop = null;
+    } else if (tool === "text" && !target) pendingTextAt = canvas.getScenePoint(e);
     else if (isDrawTool(tool)) drawStart = canvas.getScenePoint(e);
     else if (tool === "edit" && !target) {
       const scene = canvas.getScenePoint(e);
@@ -734,8 +950,20 @@
     return { x: start.x + Math.sign(dx || 1) * size, y: start.y + Math.sign(dy || 1) * size };
   }
 
+  function clampToPage(point: { x: number; y: number }) {
+    return { x: Math.max(0, Math.min(page.width, point.x)), y: Math.max(0, Math.min(page.height, point.y)) };
+  }
+
+  function rectBetween(a: { x: number; y: number }, b: { x: number; y: number }): Rect {
+    return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+  }
+
   function onPointerMove({ e, target }: TPointerEventInfo) {
     const tool = editor.tool;
+    if (tool === "crop" && cropStart && canvas) {
+      cropDraft = rectBetween(cropStart, clampToPage(canvas.getScenePoint(e)));
+      return;
+    }
     if (tool === "edit" && canvas && analysis) {
       const point = canvas.getScenePoint(e);
       showHover(target ? null : unitAt([point.x, point.y], (e as MouseEvent).altKey === true));
@@ -749,6 +977,15 @@
   function onPointerUp({ e }: TPointerEventInfo) {
     if (!canvas) return;
     const tool = editor.tool;
+
+    if (tool === "crop" && cropStart) {
+      const rect = rectBetween(cropStart, clampToPage(canvas.getScenePoint(e)));
+      cropStart = null;
+      cropDraft = null;
+      // A click instead of a drag keeps the previous area.
+      if (rect.width > 8 / editor.zoom && rect.height > 8 / editor.zoom) editor.pendingCrop = { pageId: page.id, rect };
+      return;
+    }
 
     if (drawStart && isDrawTool(tool)) {
       const start = drawStart;
@@ -770,6 +1007,10 @@
       canvas.add(shape);
       canvas.setActiveObject(shape);
       editor.tool = "select";
+      if (tool === "note" && shape instanceof IText) {
+        shape.enterEditing();
+        shape.selectAll();
+      }
       canvas.requestRenderAll();
       scheduleSave();
       reportSelection();
@@ -810,10 +1051,11 @@
     };
   }
 
-  async function placeImage(url: string, at?: { x: number; y: number }) {
+  async function placeImage(url: string, at?: { x: number; y: number }, width?: number) {
     if (!canvas) return;
-    const image = await createImage(url, page.width * 0.6, page.height * 0.6);
+    const image = await createImage(url, width ?? page.width * 0.6, width ? Infinity : page.height * 0.6);
     if (!canvas) return;
+    if (width) image.scaleToWidth(width);
     place(image, at ?? visibleCenter());
   }
 
@@ -842,7 +1084,7 @@
         await placeImage(url, { x: point.x + offset * 16, y: point.y + offset * 16 });
       } catch (error) {
         console.error("Error al importar la imagen:", error);
-        notifications.error(`No se pudo usar «${file.name}» como imagen.`);
+        notifications.error(t("No se pudo usar «{name}» como imagen.", { name: file.name }));
       }
     }
   }
@@ -852,7 +1094,7 @@
     const active = canvas?.getActiveObject();
     if (!canvas || !active) return;
     if (selectedObjects(canvas).some(isLocked)) {
-      notifications.info("La selección incluye objetos bloqueados. Desbloquéalos para modificarlos.");
+      notifications.info(t("La selección incluye objetos bloqueados. Desbloquéalos para modificarlos."));
       return;
     }
     edit(canvas, active);
@@ -862,21 +1104,33 @@
   }
 
   const controller: PageController = {
-    addImage: (url) => placeImage(url),
+    addImage: (url, options) => placeImage(url, undefined, options?.width),
 
     addSignature(signature) {
       if (!canvas) return;
-      place(createSignature(signature, Math.min(220, page.width * 0.4)), visibleCenter());
+      place(createSignature(signature, signatureWidth(page.width, signature.initials)), visibleCenter());
     },
 
-    addText(content) {
+    addMark(kind) {
       if (!canvas) return;
-      place(createText(content, editor.textStyle), visibleCenter());
+      place(createMark(kind, 20, "#111111"), visibleCenter());
+    },
+
+    addText(content, style) {
+      if (!canvas) return;
+      place(createText(content, { ...editor.textStyle, ...style }), visibleCenter());
     },
 
     applyTextStyle(style) {
       if (canvas && applyTextStyle(canvas, style)) {
         scheduleSave(150, `style:${page.id}`);
+        reportSelection();
+      }
+    },
+
+    setLinkTarget(target) {
+      if (canvas && setLinkTarget(canvas, target)) {
+        scheduleSave(0);
         reportSelection();
       }
     },
@@ -912,6 +1166,64 @@
       if (!canvas || selectedObjects(canvas).length === 0) return;
       if (arrange(canvas, action)) scheduleSave();
       reportSelection();
+    },
+
+    alignSelection(mode) {
+      editSelection((instance) => alignObjects(instance, mode, page));
+    },
+
+    distributeSelection(axis) {
+      editSelection((instance) => distributeObjects(instance, axis));
+    },
+
+    groupSelection() {
+      if (canvas && groupSelected(canvas)) {
+        scheduleSave();
+        reportSelection();
+      }
+    },
+
+    ungroupSelection() {
+      if (canvas && ungroupSelected(canvas).length > 0) {
+        scheduleSave();
+        reportSelection();
+      }
+    },
+
+    setSelectionBounds(change, keepRatio) {
+      editSelection((instance) => setObjectBounds(instance, change, keepRatio), 250, `bounds:${page.id}`);
+    },
+
+    markText(range, kind) {
+      if (!canvas || textDivs.length === 0 || !range.intersectsNode(textLayerElement as Node)) return 0;
+      const { lines, rotation } = selectedLines(range);
+      if (lines.length === 0) return 0;
+      const created = lines.map((line) => {
+        if (kind === "highlight") {
+          const pad = Math.min(line.width, line.height) * 0.06;
+          return prepareObject(
+            createShape(
+              "highlight",
+              { x: line.x - pad, y: line.y - pad },
+              { x: line.x + line.width + pad, y: line.y + line.height + pad },
+              editor.shapeStyle,
+              editor.highlightColor,
+            ),
+          );
+        }
+        const { from, to, width: strokeWidth } = markLine(kind, line, rotation);
+        return prepareObject(
+          createShape("line", { x: from[0], y: from[1] }, { x: to[0], y: to[1] }, { ...editor.shapeStyle, strokeWidth }, editor.highlightColor),
+        );
+      });
+      editor.tool = "select";
+      for (const object of created) canvas.add(object);
+      canvas.discardActiveObject();
+      canvas.setActiveObject(created.length === 1 ? created[0] : new ActiveSelection(created, { canvas }));
+      canvas.requestRenderAll();
+      scheduleSave();
+      reportSelection();
+      return created.length;
     },
 
     toggleLockSelection() {
@@ -996,22 +1308,58 @@
 </script>
 
 <div
-  class="page"
+  class="page text-scale"
+  class:selecting-text={editor.tool === "textselect"}
   bind:this={container}
   style:width="{width}px"
   style:height="{height}px"
+  style:--scale-factor={editor.zoom}
+  style:--user-unit={pdfPage?.userUnit ?? 1}
   role="group"
-  aria-label="Página {index + 1}"
+  aria-label={t("Página {n}", { n: index + 1 })}
   {ondragover}
   {ondrop}
 >
   {#if active}
     <canvas class="pdf-layer" bind:this={pdfCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+    <canvas class="decoration-layer" bind:this={decorationCanvas} style:width="{width}px" style:height="{height}px"></canvas>
+    {#if highlights.length > 0}
+      <div class="search-layer" aria-hidden="true">
+        {#each highlights as box, i (i)}
+          <span
+            class="search-hit"
+            class:active={box.active}
+            style:left="{box.left * editor.zoom}px"
+            style:top="{box.top * editor.zoom}px"
+            style:width="{box.width * editor.zoom}px"
+            style:height="{box.height * editor.zoom}px"
+          ></span>
+        {/each}
+      </div>
+    {/if}
+    <div class="textLayer" bind:this={textLayerElement}></div>
     <div class="annotation-layer">
       <canvas bind:this={fabricElement}></canvas>
     </div>
     {#if pdfPage && editor.tool === "select"}
       <FormLayer {page} {pdfPage} zoom={editor.zoom} />
+    {/if}
+    {#if cropArea}
+      <svg class="crop-layer" viewBox="0 0 {page.width} {page.height}" preserveAspectRatio="none" aria-hidden="true">
+        <path
+          class="crop-shade"
+          fill-rule="evenodd"
+          d="M0 0H{page.width}V{page.height}H0Z M{cropArea.x} {cropArea.y}h{cropArea.width}v{cropArea.height}h{-cropArea.width}Z"
+        />
+        <rect
+          class="crop-frame"
+          x={cropArea.x}
+          y={cropArea.y}
+          width={cropArea.width}
+          height={cropArea.height}
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
     {/if}
   {/if}
   {#if !rendered}
@@ -1020,27 +1368,74 @@
     </div>
   {/if}
   {#if active && editor.tool === "edit" && analysisState === "loading"}
-    <div class="text-status" role="status">Leyendo el texto de la página…</div>
+    <div class="text-status" role="status">{t("Leyendo el texto de la página…")}</div>
   {/if}
 </div>
 
 <style>
   .page {
     position: relative;
-    background: white;
+    background: var(--color-paper);
     box-shadow:
       0 1px 3px rgba(16, 24, 40, 0.12),
       0 8px 28px rgba(16, 24, 40, 0.08);
   }
-  .pdf-layer {
+  .pdf-layer,
+  .decoration-layer {
     position: absolute;
     inset: 0;
     display: block;
     pointer-events: none;
   }
+  /* The document's text is transparent and only takes the pointer with the text tool. */
+  .textLayer {
+    z-index: 1;
+    pointer-events: none;
+  }
+  .selecting-text .textLayer {
+    z-index: 3;
+    pointer-events: auto;
+  }
   .annotation-layer {
     position: absolute;
     inset: 0;
+    z-index: 2;
+  }
+  .selecting-text .annotation-layer {
+    pointer-events: none;
+  }
+  .search-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+  }
+  .search-hit {
+    position: absolute;
+    border-radius: 2px;
+    background: rgba(255, 196, 0, 0.4);
+    mix-blend-mode: multiply;
+  }
+  .search-hit.active {
+    background: rgba(255, 120, 0, 0.55);
+    outline: 2px solid rgba(230, 100, 0, 0.9);
+  }
+  .crop-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .crop-shade {
+    fill: rgba(15, 23, 42, 0.45);
+  }
+  .crop-frame {
+    fill: none;
+    stroke: #ffffff;
+    stroke-width: 1.5;
+    stroke-dasharray: 6 4;
   }
   .annotation-layer :global(.canvas-container) {
     margin: 0 !important;
@@ -1063,7 +1458,7 @@
     display: grid;
     place-items: center;
     color: #b5bcc7;
-    background: white;
+    background: var(--color-paper);
     pointer-events: none;
   }
 </style>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fly } from "svelte/transition";
   import { CircleAlert, CircleCheck, Info, TriangleAlert, X } from "lucide-svelte";
+  import { t } from "../i18n.svelte";
   import { notifications, type NoticeKind } from "../notifications.svelte";
 
   const ICONS = {
@@ -32,7 +33,7 @@
           {notice.action.label}
         </button>
       {/if}
-      <button class="close" aria-label="Cerrar aviso" onclick={() => notifications.dismiss(notice.id)}>
+      <button class="close" aria-label={t("Cerrar aviso")} onclick={() => notifications.dismiss(notice.id)}>
         <X size={16} />
       </button>
     </div>

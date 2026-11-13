@@ -34,7 +34,7 @@ function remember(key: string, bitmap: ImageBitmap): void {
 export async function pageSpecs(source: SourceDocument, page: PageRef, data: PageAnnotations | undefined): Promise<NativeSpec[]> {
   if (!data?.objects.some(isNativeData)) return [];
   const original = await source.pdf.getPage(page.sourceIndex + 1);
-  return nativeSpecsFromData(data.objects, viewportOf(original, 1, page.rotation).transform as Matrix);
+  return nativeSpecsFromData(data.objects, viewportOf(original, 1, page).transform as Matrix);
 }
 
 /**
@@ -75,7 +75,7 @@ async function pageBitmap(
   signal: AbortSignal,
 ): Promise<ImageBitmap | null> {
   const edits = specs.length > 0 ? specKey(specs) : "";
-  const key = `${source.id}:${page.sourceIndex}:${page.rotation}:${formRevision}:${edits}:${Math.round(cssWidth * pixelRatio)}`;
+  const key = `${source.id}:${page.sourceIndex}:${page.rotation}:${page.crop?.join(",") ?? ""}:${formRevision}:${edits}:${Math.round(cssWidth * pixelRatio)}`;
   const cached = pageBitmaps.get(key);
   if (cached) return cached;
 
@@ -83,7 +83,7 @@ async function pageBitmap(
   try {
     if (signal.aborted) return null;
     const scratch = document.createElement("canvas");
-    const task = renderPage(proxy, scratch, cssWidth / page.width, pixelRatio, page.rotation);
+    const task = renderPage(proxy, scratch, cssWidth / page.width, pixelRatio, page);
     const cancel = () => task.cancel();
     signal.addEventListener("abort", cancel, { once: true });
     try {

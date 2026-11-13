@@ -42,6 +42,9 @@ export interface AnalyzedChar {
   color: FillColor;
   /** Text rise (superscript/subscript), in user space units. */
   rise: number;
+  /** Extent along the baseline, from the start of its line's quad (user space units). */
+  x0?: number;
+  x1?: number;
 }
 
 /** A line or a paragraph that can be turned into editable text. */

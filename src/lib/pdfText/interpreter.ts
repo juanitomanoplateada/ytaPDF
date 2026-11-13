@@ -45,6 +45,19 @@ export interface Glyph {
   vertical: boolean;
 }
 
+/** Something painted that is not text: a filled or stroked path, an image or a shading. */
+export interface PaintedArea {
+  /** `<form path><operation>` of the painting operation. */
+  key: string;
+  kind: "path" | "image" | "shading";
+  /** Corners of what is painted, in page user space: the path's points or the image's square. */
+  points: [number, number][];
+  /** Name of the image XObject drawn by `Do` (undefined for inline images and paths). */
+  name?: string;
+  /** The image XObject itself, when it is an indirect object. */
+  ref?: PDFRef;
+}
+
 /** A form XObject drawn by the page, as read for one invocation. */
 export interface FormInvocation {
   path: string;
@@ -60,6 +73,8 @@ export interface PageContent {
   glyphs: Glyph[];
   /** CTM after each top-level operation, when requested. */
   ctmAfter: Matrix[];
+  /** Paths, images and shadings, when requested. */
+  paints: PaintedArea[];
   forms: Map<string, FormInvocation>;
   resources: PDFDict | undefined;
   /** False if part of the content could not be decoded (unsupported filter). */
@@ -127,18 +142,23 @@ export function concat(parts: Uint8Array[]): Uint8Array {
  * Reads a page's content, following text state, colour and transforms, and
  * returns every glyph it draws, including those inside form XObjects.
  */
-export function interpretPage(page: PDFPage, fonts: FontCache, options: { trackCtm?: boolean } = {}): PageContent {
+export function interpretPage(
+  page: PDFPage,
+  fonts: FontCache,
+  options: { trackCtm?: boolean; trackPaints?: boolean } = {},
+): PageContent {
   const { context } = page.doc;
   const { bytes, complete } = pageContentBytes(page);
   const resources = page.node.Resources();
   const operations = parseContent(bytes);
-  const interpreter = new Interpreter(context, fonts, options.trackCtm ?? false);
+  const interpreter = new Interpreter(context, fonts, options.trackCtm ?? false, options.trackPaints ?? false);
   interpreter.run(operations, resources, "", newState(IDENTITY), 0, new Set());
   return {
     bytes,
     operations,
     glyphs: interpreter.glyphs,
     ctmAfter: interpreter.ctmAfter,
+    paints: interpreter.paints,
     forms: interpreter.forms,
     resources,
     complete: complete && interpreter.complete,
@@ -174,6 +194,7 @@ const num = (value: Operand | undefined) => (typeof value === "number" ? value :
 class Interpreter {
   readonly glyphs: Glyph[] = [];
   readonly ctmAfter: Matrix[] = [];
+  readonly paints: PaintedArea[] = [];
   readonly forms = new Map<string, FormInvocation>();
   complete = true;
   #textObjects = 0;
@@ -182,6 +203,7 @@ class Interpreter {
     private readonly context: PDFContext,
     private readonly fonts: FontCache,
     private readonly trackCtm: boolean,
+    private readonly trackPaints: boolean,
   ) {}
 
   run(
@@ -199,6 +221,18 @@ class Interpreter {
     let tlm: Matrix = [...IDENTITY];
     let pending: Glyph[] = [];
     let textObject = -1;
+    // Points of the path being built, already in page user space.
+    let pathPoints: [number, number][] = [];
+    const addPoints = (values: number[]) => {
+      if (!this.trackPaints) return;
+      for (let k = 0; k + 1 < values.length; k += 2) pathPoints.push(applyToPoint(state.ctm, values[k], values[k + 1]));
+    };
+    const unitSquare = (): [number, number][] => [
+      applyToPoint(state.ctm, 0, 0),
+      applyToPoint(state.ctm, 1, 0),
+      applyToPoint(state.ctm, 1, 1),
+      applyToPoint(state.ctm, 0, 1),
+    ];
 
     const fontResource = (name: string): PDFObject | undefined => {
       const fontDict = dictOf(this.context, resources?.get(PDFName.of("Font")));
@@ -373,9 +407,54 @@ class Interpreter {
         }
         case "Do": {
           const name = operands[0];
-          if (isName(name)) this.#drawForm(name.value, resources, `${path}${i}/`, state, depth, visiting);
+          if (!isName(name)) break;
+          const image = this.trackPaints ? this.#image(name.value, resources) : null;
+          if (image) {
+            this.paints.push({ key: `${path}${i}`, kind: "image", points: unitSquare(), name: name.value, ref: image.ref });
+          } else {
+            this.#drawForm(name.value, resources, `${path}${i}/`, state, depth, visiting);
+          }
           break;
         }
+        case "BI":
+          if (this.trackPaints) this.paints.push({ key: `${path}${i}`, kind: "image", points: unitSquare() });
+          break;
+        case "m":
+        case "l":
+          addPoints(operands.slice(0, 2).map(num));
+          break;
+        case "c":
+          addPoints(operands.slice(0, 6).map(num));
+          break;
+        case "v":
+        case "y":
+          addPoints(operands.slice(0, 4).map(num));
+          break;
+        case "re": {
+          const [x, y, w, h] = operands.slice(0, 4).map(num);
+          addPoints([x, y, x + w, y, x + w, y + h, x, y + h]);
+          break;
+        }
+        case "S":
+        case "s":
+        case "f":
+        case "F":
+        case "f*":
+        case "B":
+        case "B*":
+        case "b":
+        case "b*":
+          if (this.trackPaints && pathPoints.length > 0) {
+            this.paints.push({ key: `${path}${i}`, kind: "path", points: pathPoints });
+          }
+          pathPoints = [];
+          break;
+        case "n":
+          pathPoints = [];
+          break;
+        case "sh":
+          if (this.trackPaints) this.paints.push({ key: `${path}${i}`, kind: "shading", points: [] });
+          break;
       }
       if (top && this.trackCtm) this.ctmAfter.push(state.ctm);
     }
@@ -404,6 +483,15 @@ class Interpreter {
     if (family === "CalGray") return "gray";
     if (family === "CalRGB" || family === "Lab") return "rgb";
     return "other";
+  }
+
+  /** The image XObject called `name`, or null when it is not an image. */
+  #image(name: string, resources: PDFDict | undefined): { ref: PDFRef | undefined } | null {
+    const xobjects = dictOf(this.context, resources?.get(PDFName.of("XObject")));
+    const raw = xobjects?.get(PDFName.of(name));
+    const stream = resolve(this.context, raw);
+    if (!(stream instanceof PDFStream) || nameOf(this.context, stream.dict.get(PDFName.of("Subtype"))) !== "Image") return null;
+    return { ref: raw instanceof PDFRef ? raw : undefined };
   }
 
   #applyExtGState(name: string, resources: PDFDict | undefined, state: GraphicsState): void {

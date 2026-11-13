@@ -6,7 +6,16 @@ import { degrees, PDFDict, PDFDocument, PDFName, StandardFonts, type PDFPage } f
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PDFPageProxy } from "pdfjs-dist";
 import { applyToPoint, IDENTITY, multiply, type Matrix } from "../geometry";
-import { assembleDocument, type ExportSource } from "./assemble";
+import {
+  applyMetadata,
+  assembleDocument,
+  flattenForm,
+  protectDocument,
+  stripMetadata,
+  type ExportSource,
+} from "./assemble";
+import { imagePageSize, imagesToPdf } from "../imagePdf";
+import { writeOutline } from "./outline";
 import {
   DrawContext,
   drawOnPage,
@@ -450,5 +459,162 @@ describe("assembleDocument", () => {
     expect(value("acepto")).not.toBe("Off");
     expect(value("plan")).toBe("completo");
     expect(value("pais")).toBe("México");
+  });
+});
+
+describe("export options", () => {
+  async function single(label = "A", pages = 1, options: { field?: boolean } = {}) {
+    const source = await makeSource("a", label, pages, options);
+    return assembleDocument(
+      Array.from({ length: pages }, (_, i) => ({ sourceId: "a", sourceIndex: i })),
+      new Map([["a", source]]),
+    );
+  }
+
+  it("protects the file with a password (AES-256)", async () => {
+    const { doc } = await single("A", 2);
+    protectDocument(doc, "clave segura");
+    const bytes = await doc.save({ useObjectStreams: true });
+    await expect(openWithPdfjs(bytes)).rejects.toMatchObject({ name: "PasswordException" });
+    await expect(openWithPdfjs(bytes, "otra")).rejects.toMatchObject({ name: "PasswordException" });
+    const opened = await openWithPdfjs(bytes, "clave segura");
+    expect(opened.numPages).toBe(2);
+    const { items } = await (await opened.getPage(2)).getTextContent();
+    expect(items.map((item) => ("str" in item ? item.str : "")).join("")).toBe("A1");
+  });
+
+  it("writes the properties the user set and drops the empty ones", async () => {
+    const { doc } = await single();
+    doc.setAuthor("Autor original");
+    doc.setSubject("Asunto original");
+    applyMetadata(doc, { title: "Contrato firmado", author: "", subject: "Alquiler", keywords: "contrato 2026" });
+    const info = (await (await openWithPdfjs(await doc.save())).getMetadata()).info as unknown as Record<string, unknown>;
+    expect(info.Title).toBe("Contrato firmado");
+    expect(info.Author).toBeUndefined();
+    expect(info.Subject).toBe("Alquiler");
+    expect(info.Keywords).toBe("contrato 2026");
+  });
+
+  it("removes every property when asked to strip them", async () => {
+    const { doc } = await single();
+    doc.setTitle("Secreto");
+    doc.setAuthor("Alguien");
+    doc.setProducer("Programa");
+    stripMetadata(doc);
+    const bytes = await doc.save();
+    const info = (await (await openWithPdfjs(bytes)).getMetadata()).info as unknown as Record<string, unknown>;
+    for (const key of ["Title", "Author", "Producer", "Creator", "CreationDate", "ModDate"]) {
+      expect(info[key]).toBeUndefined();
+    }
+    expect(new TextDecoder("latin1").decode(bytes)).not.toContain("Alguien");
+  });
+
+  it("flattens form fields into the page content", async () => {
+    const source = await makeSource("a", "A", 1, { field: true });
+    const { doc } = await assembleDocument([{ sourceId: "a", sourceIndex: 0 }], new Map([["a", source]]), {
+      formValues: { a: { campoA: "Firmado" } },
+    });
+    flattenForm(doc);
+    const bytes = await doc.save();
+    const fields = await (await openWithPdfjs(bytes)).getFieldObjects();
+    expect(fields === null || (fields as Map<string, unknown>).size === 0).toBe(true);
+    // The value is now ordinary text of the page.
+    expect((await pageTexts(bytes))[0]).toContain("Firmado");
+  });
+
+  it("leaves documents without a form untouched when flattening", async () => {
+    const { doc } = await single();
+    flattenForm(doc);
+    expect(doc.catalog.get(PDFName.of("AcroForm"))).toBeUndefined();
+  });
+
+  it("gives each duplicated page content of its own", async () => {
+    const source = await makeSource("a", "A", 2);
+    const { doc, pages } = await assembleDocument(
+      [
+        { sourceId: "a", sourceIndex: 0 },
+        { sourceId: "a", sourceIndex: 0 },
+        { sourceId: "a", sourceIndex: 1 },
+      ],
+      new Map([["a", source]]),
+    );
+    expect(pages[0].node.Contents()).not.toBe(pages[1].node.Contents());
+    const vt = (await firstPage(await doc.save())).getViewport({ scale: 1 }).transform;
+    await drawOnPage(pages[1], [textAt([1, 0, 0, 1, 40, 40], "Copia")], vt, new DrawContext(doc, noImages));
+    expect(await pageTexts(await doc.save())).toEqual(["A0", "A0Copia", "A1"]);
+  });
+
+  it("draws strikethrough like the canvas: across the middle of the letters", async () => {
+    const doc = await PDFDocument.create();
+    doc.addPage([300, 200]);
+    const vt = (await firstPage(await doc.save())).getViewport({ scale: 1 }).transform;
+    const page = doc.getPage(0);
+    await drawOnPage(page, [{ ...textAt([1, 0, 0, 1, 50, 100], "Tachado"), linethrough: true }], vt, new DrawContext(doc, noImages));
+    const ys = tracePoints(page).map(([, y]) => applyToPoint(vt as Matrix, 0, y)[1]);
+    // Fabric centres the line 0.28 font sizes above the baseline (at y = 100 on the canvas).
+    const middle = (Math.min(...ys) + Math.max(...ys)) / 2;
+    expect(middle).toBeCloseTo(100 - 20 * 0.28167, 1);
+  });
+});
+
+describe("imagesToPdf", () => {
+  it("makes one page per image, with the image's proportions", async () => {
+    const png = new Uint8Array(readFileSync(new URL("../../../public/paty.png", import.meta.url)));
+    const bytes = await imagesToPdf(
+      [
+        { bytes: png, mime: "image/png" },
+        { bytes: png, mime: "image/png" },
+      ],
+      "Fotos",
+    );
+    const doc = await openWithPdfjs(bytes);
+    expect(doc.numPages).toBe(2);
+    const { width, height } = (await doc.getPage(1)).getViewport({ scale: 1 });
+    expect(width).toBeCloseTo(841.89, 1);
+    expect(height).toBeCloseTo(841.89, 1);
+    const { operators } = { operators: (await (await doc.getPage(1)).getOperatorList()).fnArray };
+    expect(operators.length).toBeGreaterThan(0);
+  });
+
+  it("fits the long side of the page to an A4", () => {
+    expect(imagePageSize(4000, 3000)).toEqual({ width: 841.89, height: 631.42 });
+    expect(imagePageSize(1000, 2000)).toEqual({ width: 420.95, height: 841.89 });
+  });
+});
+
+describe("outline and crop", () => {
+  it("writes bookmarks that open their pages", async () => {
+    const source = await makeSource("a", "A", 3);
+    const { doc, pages } = await assembleDocument(
+      [2, 0, 1].map((i) => ({ sourceId: "a", sourceIndex: i })),
+      new Map([["a", source]]),
+    );
+    writeOutline(doc, pages, [
+      { title: "Capítulo único", pageIndex: 1, top: 150, children: [{ title: "Sección «β»", pageIndex: 2, top: null, children: [] }] },
+      { title: "Anexo", pageIndex: 0, top: null, children: [] },
+    ]);
+    const pdf = await openWithPdfjs(await doc.save());
+    const outline = (await pdf.getOutline()) as { title: string; dest: unknown[]; items: { title: string; dest: unknown[] }[] }[];
+    expect(outline.map((item) => item.title)).toEqual(["Capítulo único", "Anexo"]);
+    expect(outline[0].items.map((item) => item.title)).toEqual(["Sección «β»"]);
+    const pageOf = async (dest: unknown[]) => pdf.getPageIndex(dest[0] as never);
+    expect(await pageOf(outline[0].dest)).toBe(1);
+    expect(outline[0].dest[3]).toBe(150);
+    expect(await pageOf(outline[0].items[0].dest)).toBe(2);
+    expect(await pageOf(outline[1].dest)).toBe(0);
+  });
+
+  it("crops pages to the box the editor shows", async () => {
+    const source = await makeSource("a", "A", 2);
+    const { doc } = await assembleDocument(
+      [
+        { sourceId: "a", sourceIndex: 0, crop: [10, 20, 210, 170] },
+        { sourceId: "a", sourceIndex: 1 },
+      ],
+      new Map([["a", source]]),
+    );
+    const pdf = await openWithPdfjs(await doc.save());
+    expect((await pdf.getPage(1)).view).toEqual([10, 20, 210, 170]);
+    expect((await pdf.getPage(2)).view).toEqual([0, 0, 300, 200]);
   });
 });

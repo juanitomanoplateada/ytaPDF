@@ -3,8 +3,8 @@ import { IDENTITY, invert, multiply, type Matrix } from "../geometry";
 import { parseEraseRanges } from "./ranges";
 import type { FontCache } from "./fonts";
 import type { FillColor } from "./color";
-import { interpretPage, type FormInvocation, type Glyph } from "./interpreter";
-import { formatNumber, formatOperand, hexString, isString, type Operand, type Operation } from "./lexer";
+import { interpretPage, type FormInvocation, type Glyph, type PageContent } from "./interpreter";
+import { formatNumber, formatOperand, hexString, isName, isString, type Operand, type Operation } from "./lexer";
 import { dictOf } from "./pdfObjects";
 import type { NativeRun, NativeSpec, RunFont } from "./types";
 
@@ -17,6 +17,16 @@ export interface FallbackFont {
 
 export interface ApplyResources {
   fallbackFont(font: Extract<RunFont, { kind: "fallback" }>): Promise<FallbackFont>;
+}
+
+export interface ApplyOptions {
+  /**
+   * Painting operations to remove (`<form path><operation>` keys of
+   * `PaintedArea`): paths are ended without painting, images are not drawn.
+   */
+  drop?: Set<string>;
+  /** The page as already read (with `trackCtm`), to avoid reading it twice. */
+  content?: PageContent;
 }
 
 export interface ApplyReport {
@@ -55,11 +65,13 @@ export async function applyNativeSpecs(
   specs: NativeSpec[],
   fonts: FontCache,
   resources: ApplyResources,
+  options: ApplyOptions = {},
 ): Promise<ApplyReport> {
   const report: ApplyReport = { failed: [] };
-  if (specs.length === 0) return report;
+  const drop = options.drop ?? new Set<string>();
+  if (specs.length === 0 && drop.size === 0) return report;
   const { context } = page.doc;
-  const content = interpretPage(page, fonts, { trackCtm: true });
+  const content = options.content ?? interpretPage(page, fonts, { trackCtm: true });
   if (!content.complete) {
     report.failed.push(...specs.map((spec) => spec.id));
     return report;
@@ -99,7 +111,7 @@ export async function applyNativeSpecs(
     }
   }
 
-  const rewriter = new StreamRewriter(context, content.forms, erase, glyphsByOp);
+  const rewriter = new StreamRewriter(context, content.forms, erase, glyphsByOp, drop);
   const parts = rewriter.rewrite(content.bytes, content.operations, "", names, insertions);
   const ends = insertions.get("end");
   if (ends) parts.push(...ends);
@@ -107,6 +119,11 @@ export async function applyNativeSpecs(
   const stream = context.flateStream(joinParts(parts));
   page.node.set(PDFName.of("Contents"), context.obj([context.register(stream)]));
   page.node.set(PDFName.of("Resources"), pageResources);
+  // pdf-lib keeps the stream it last drew into (form flattening, for one);
+  // its operators are now part of the new stream, so drawing starts afresh.
+  const drawing = page as unknown as { contentStream?: unknown; contentStreamRef?: unknown };
+  drawing.contentStream = undefined;
+  drawing.contentStreamRef = undefined;
   return report;
 }
 
@@ -155,11 +172,20 @@ class ResourceNames {
     if (id !== undefined) this.#assigned.set(`${category}:${id}`, name);
     return name;
   }
+
+  /** Removes a name from the (local) resources: what it pointed to is no longer drawn here. */
+  remove(category: "XObject", name: string): void {
+    const dict = this.resources.get(PDFName.of(category));
+    if (dict instanceof PDFDict) dict.delete(PDFName.of(name));
+  }
 }
 
 // ── Erasing ────────────────────────────────────────────────────────────────
 
 const SHOW_TEXT = new Set(["Tj", "TJ", "'", '"']);
+const PAINT_PATH = new Set(["S", "s", "f", "F", "f*", "B", "B*", "b", "b*"]);
+/** Marked-content properties that repeat the text or describe what is drawn. */
+const DESCRIPTIVE_PROPERTIES = ["ActualText", "Alt", "E"];
 
 class StreamRewriter {
   #cloneCount = 0;
@@ -168,12 +194,35 @@ class StreamRewriter {
     private readonly forms: Map<string, FormInvocation>,
     private readonly erase: Map<string, Set<number>>,
     private readonly glyphsByOp: Map<string, Glyph[]>,
+    private readonly drop: Set<string>,
   ) {}
 
   /** Whether anything inside the form drawn at `path` must be erased. */
   #touches(path: string): boolean {
     for (const key of this.erase.keys()) if (key.startsWith(path)) return true;
+    for (const key of this.drop) if (key.startsWith(path)) return true;
     return false;
+  }
+
+  /**
+   * Marked-content sequences (BDC … EMC) that contain something erased: their
+   * replacement text and descriptions would otherwise keep what was removed.
+   */
+  #touchedSequences(operations: Operation[], path: string): Set<number> {
+    const touched = new Set<number>();
+    const open: number[] = [];
+    for (let i = 0; i < operations.length; i++) {
+      const { op } = operations[i];
+      if (op === "BDC" || op === "BMC") open.push(i);
+      else if (op === "EMC") open.pop();
+      else {
+        const key = `${path}${i}`;
+        if (this.erase.has(key) || this.drop.has(key) || (op === "Do" && this.#touches(`${key}/`))) {
+          for (const index of open) touched.add(index);
+        }
+      }
+    }
+    return touched;
   }
 
   rewrite(
@@ -184,20 +233,36 @@ class StreamRewriter {
     insertions: Map<string, string[]> | null,
   ): Part[] {
     const parts: Part[] = [];
+    const touched = this.#touchedSequences(operations, path);
+    // XObjects this content no longer draws (dropped images, forms drawn as a copy).
+    const replaced = new Set<string>();
+    const drawn = new Set<string>();
     for (let i = 0; i < operations.length; i++) {
       const operation = operations[i];
       const key = `${path}${i}`;
       const erased = this.erase.get(key);
-      if (erased && SHOW_TEXT.has(operation.op)) {
+      const xobject = operation.op === "Do" && isName(operation.operands[0]) ? operation.operands[0].value : undefined;
+      if (this.drop.has(key) && PAINT_PATH.has(operation.op)) {
+        parts.push("n");
+      } else if (this.drop.has(key) && (operation.op === "Do" || operation.op === "BI" || operation.op === "sh")) {
+        if (xobject) replaced.add(xobject);
+      } else if (erased && SHOW_TEXT.has(operation.op)) {
         parts.push(this.#rewriteShow(operation, this.glyphsByOp.get(key) ?? [], erased));
       } else if (operation.op === "Do" && this.#touches(`${key}/`)) {
-        parts.push(this.#rewriteForm(`${key}/`, names) ?? bytes.subarray(operation.start, operation.end));
+        const clone = this.#rewriteForm(`${key}/`, names);
+        if (clone && xobject) replaced.add(xobject);
+        else if (xobject) drawn.add(xobject);
+        parts.push(clone ?? bytes.subarray(operation.start, operation.end));
+      } else if (touched.has(i) && operation.op === "BDC") {
+        parts.push(withoutDescriptions(operation) ?? bytes.subarray(operation.start, operation.end));
       } else {
+        if (xobject) drawn.add(xobject);
         parts.push(bytes.subarray(operation.start, operation.end));
       }
       const after = insertions?.get(String(i));
       if (after) parts.push(...after);
     }
+    for (const name of replaced) if (!drawn.has(name)) names.remove("XObject", name);
     return parts;
   }
 
@@ -270,6 +335,17 @@ class StreamRewriter {
     const name = names.add("XObject", "YtaX", ref, `clone-${path}-${this.#cloneCount++}`);
     return `/${name} Do`;
   }
+}
+
+/** A BDC operation without the properties that describe its content, or null if it has none. */
+function withoutDescriptions(operation: Operation): string | null {
+  const [tag, properties] = operation.operands;
+  if (!isName(tag) || typeof properties !== "object" || properties === null || Array.isArray(properties)) return null;
+  if (properties.kind !== "dict") return null;
+  if (!DESCRIPTIVE_PROPERTIES.some((key) => properties.entries.has(key))) return null;
+  const entries = new Map(properties.entries);
+  for (const key of DESCRIPTIVE_PROPERTIES) entries.delete(key);
+  return `${formatOperand(tag)} ${formatOperand({ kind: "dict", entries })} BDC`;
 }
 
 // ── Drawing ────────────────────────────────────────────────────────────────

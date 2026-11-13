@@ -9,6 +9,17 @@
       content="Une, organiza, firma, rellena y anota PDF sin subirlos a ningún servidor. Todo se procesa en tu navegador, incluso sin conexión."
     />
     <meta name="theme-color" content="#1976d2" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      // Theme and language before the first paint, so nothing flashes.
+      try {
+        var theme = localStorage.getItem("ytapdf.theme");
+        if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+        var locale = localStorage.getItem("ytapdf.locale");
+        if (!locale) locale = (navigator.languages || [navigator.language]).some(function (l) { return /^es/i.test(l || ""); }) ? "es" : "en";
+        document.documentElement.lang = locale;
+      } catch (e) {}
+    </script>
     <link rel="icon" type="image/png" href="/paty.png" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />

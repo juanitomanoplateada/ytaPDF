@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Lock } from "lucide-svelte";
   import type { PasswordRequest } from "../editor.svelte";
+  import { t } from "../i18n.svelte";
   import Modal from "./Modal.svelte";
 
   let { request }: { request: PasswordRequest } = $props();
@@ -13,13 +14,13 @@
   }
 </script>
 
-<Modal title="Documento protegido" onclose={() => request.resolve(null)}>
+<Modal title={t("Documento protegido")} onclose={() => request.resolve(null)}>
   <form onsubmit={submit}>
     <p class="intro">
       <Lock size={16} />
-      <span>«{request.fileName}» necesita una contraseña para abrirse.</span>
+      <span>{t("«{name}» necesita una contraseña para abrirse.", { name: request.fileName })}</span>
     </p>
-    <label for="pdf-password">Contraseña</label>
+    <label for="pdf-password">{t("Contraseña")}</label>
     <input
       id="pdf-password"
       type="password"
@@ -30,12 +31,16 @@
       data-autofocus
     />
     {#if request.incorrect}
-      <p id="pdf-password-error" class="error" role="alert">Contraseña incorrecta. Inténtalo de nuevo.</p>
+      <p id="pdf-password-error" class="error" role="alert">{t("Contraseña incorrecta. Inténtalo de nuevo.")}</p>
     {/if}
-    <p class="hint">La contraseña solo se usa en este navegador para descifrar el archivo. El PDF exportado no tendrá contraseña.</p>
+    <p class="hint">
+      {t(
+        "La contraseña solo se usa en este navegador para descifrar el archivo. El PDF exportado no tendrá contraseña, salvo que le pongas una en «Guardar como».",
+      )}
+    </p>
     <div class="actions">
-      <button type="button" class="secondary" onclick={() => request.resolve(null)}>Cancelar</button>
-      <button type="submit" class="primary" disabled={password.length === 0}>Abrir</button>
+      <button type="button" class="secondary" onclick={() => request.resolve(null)}>{t("Cancelar")}</button>
+      <button type="submit" class="primary" disabled={password.length === 0}>{t("Abrir")}</button>
     </div>
   </form>
 </Modal>

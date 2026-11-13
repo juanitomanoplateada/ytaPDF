@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { t } from "../i18n.svelte";
   import Modal from "./Modal.svelte";
 
   interface Props {
@@ -14,8 +15,8 @@
   let {
     title,
     message,
-    confirmText = "Confirmar",
-    cancelText = "Cancelar",
+    confirmText = t("Confirmar"),
+    cancelText = t("Cancelar"),
     danger = false,
     onconfirm,
     oncancel,
@@ -52,7 +53,7 @@
     border: 1px solid var(--color-border);
   }
   .secondary:hover {
-    background: #eceef1;
+    background: var(--color-border);
   }
   .primary {
     background: var(--color-primary);

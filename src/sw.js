@@ -29,10 +29,41 @@ globalThis.addEventListener("message", (event) => {
   if (event.data?.type === "SKIP_WAITING") globalThis.skipWaiting();
 });
 
+const SHARED = "ytapdf-compartidos";
+
+/**
+ * Files shared with the installed app from another app (Web Share Target):
+ * they are kept in a cache the page reads and empties, and the app opens.
+ */
+async function receiveShare(request) {
+  try {
+    const data = await request.formData();
+    const cache = await caches.open(SHARED);
+    let index = 0;
+    for (const file of data.getAll("archivos")) {
+      if (!(file instanceof File)) continue;
+      index += 1;
+      await cache.put(
+        new Request(`/compartido/${Date.now()}-${index}`),
+        new Response(file, {
+          headers: { "Content-Type": file.type || "application/octet-stream", "X-Nombre": encodeURIComponent(file.name) },
+        }),
+      );
+    }
+  } catch {
+    // Nothing usable was shared: the app simply opens.
+  }
+  return Response.redirect("/?compartido=1", 303);
+}
+
 globalThis.addEventListener("fetch", (event) => {
   const { request } = event;
-  if (request.method !== "GET") return;
   const url = new URL(request.url);
+  if (request.method === "POST" && url.origin === globalThis.location.origin && url.pathname === "/compartir") {
+    event.respondWith(receiveShare(request));
+    return;
+  }
+  if (request.method !== "GET") return;
   if (url.origin !== globalThis.location.origin) return;
 
   // Pages: network first so updates arrive, cached shell when offline.
@@ -43,13 +74,16 @@ globalThis.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Code, fonts and PDF.js assets: cache first, keeping what gets downloaded.
+  // Code, fonts, PDF.js and OCR assets: cache first, keeping what gets downloaded.
   event.respondWith(
     (async () => {
       const cached = await caches.match(request);
       if (cached) return cached;
       const response = await fetch(request);
-      if (response.ok && (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/pdfjs/"))) {
+      if (
+        response.ok &&
+        (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/pdfjs/") || url.pathname.startsWith("/tesseract/"))
+      ) {
         const cache = await caches.open(RUNTIME);
         await cache.put(request, response.clone());
       }

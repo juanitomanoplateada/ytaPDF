@@ -14,9 +14,12 @@ import {
 } from "@cantoo/pdf-lib";
 import { objectToPdf, sceneToPdf, type Matrix } from "../geometry";
 import {
+  isBoldWeight,
   isWinAnsiChar,
   resolveFont,
   sanitizeForStandardFont,
+  scriptFontFor,
+  type ScriptFontId,
   type EmbeddedFamilyId,
   type FontVariant,
   type FontWeight,
@@ -53,6 +56,7 @@ export interface TextDrawable extends Placed {
   fontStyle?: string;
   color: Rgb;
   underline: boolean;
+  linethrough?: boolean;
 }
 
 export interface ImageDrawable extends Placed {
@@ -109,6 +113,8 @@ export interface DrawResources {
   loadImage: (src: string) => Promise<ImageData>;
   /** Font file bytes for embedded families; required only if they are used. */
   loadFont?: (family: EmbeddedFamilyId, variant: FontVariant) => Promise<Uint8Array>;
+  /** Font file bytes for scripts the families lack (Arabic, Chinese, Japanese, Korean). */
+  loadScriptFont?: (id: ScriptFontId, bold: boolean) => Promise<Uint8Array>;
   fontkit?: FontkitLike;
 }
 
@@ -118,9 +124,12 @@ interface UsableFont {
   embedded: boolean;
 }
 
-// Fabric's underline geometry, as fractions of the font size.
+// Fabric's text decoration geometry, as fractions of the font size: offsets
+// from the baseline (y down) and the line thickness. A strikethrough is
+// centred on its offset; an underline hangs from it.
 const UNDERLINE_OFFSET = 0.1;
-const UNDERLINE_THICKNESS = 66.667 / 1000;
+const LINETHROUGH_OFFSET = -0.28167;
+const DECORATION_THICKNESS = 66.667 / 1000;
 
 /**
  * Shared state for drawing onto one output document: each font and image is
@@ -156,10 +165,31 @@ export class DrawContext {
     return { font: await this.doc.embedFont(name), canEncode: isWinAnsiChar, embedded: false };
   }
 
+  /** The font for characters of a script the text's own font lacks, or null if none can be had. */
+  scriptFont(id: ScriptFontId, bold: boolean): Promise<UsableFont | null> {
+    const { loadScriptFont, fontkit } = this.#resources;
+    if (!loadScriptFont || !fontkit) return Promise.resolve(null);
+    const key = `script:${id}:${bold}`;
+    let font = this.#fonts.get(key);
+    if (!font) {
+      font = loadScriptFont(id, bold).then((bytes) => this.#fromBytes(bytes));
+      this.#fonts.set(key, font);
+    }
+    return font.catch((error) => {
+      console.error("No se pudo cargar la fuente para otros alfabetos:", error);
+      return null;
+    });
+  }
+
   async #embeddedFont(family: EmbeddedFamilyId, variant: FontVariant): Promise<UsableFont> {
     const { loadFont, fontkit } = this.#resources;
     if (!loadFont || !fontkit) throw new Error("Faltan los recursos para incrustar fuentes.");
-    const bytes = await loadFont(family, variant);
+    return this.#fromBytes(await loadFont(family, variant));
+  }
+
+  async #fromBytes(bytes: Uint8Array): Promise<UsableFont> {
+    const { fontkit } = this.#resources;
+    if (!fontkit) throw new Error("Faltan los recursos para incrustar fuentes.");
     this.doc.registerFontkit(fontkit as never);
     const font = await this.doc.embedFont(bytes, { subset: true });
     const glyphs = fontkit.create(bytes);
@@ -229,28 +259,75 @@ async function drawText(page: PDFPage, text: TextDrawable, context: DrawContext)
   const color = toColor(text.color);
   const opacity = clamp01(text.opacity);
 
+  const primary = { font, canEncode, embedded };
+  const bold = isBoldWeight(text.fontWeight);
+
   for (const line of text.lines) {
+    const runs = await textRuns(line.text, primary, bold, context);
+    let x = line.x;
+    let width = 0;
+    let visible = false;
+    for (const run of runs) {
+      page.drawText(run.text, { x, y: -line.baseline, size: text.fontSize, font: run.font, color, opacity });
+      const advance = run.font.widthOfTextAtSize(run.text, text.fontSize);
+      x += advance;
+      width += advance;
+      if (run.text.trim()) visible = true;
+    }
+
+    if (!visible) continue;
+    const thickness = text.fontSize * DECORATION_THICKNESS;
+    // drawRectangle takes the bottom edge, which in y-down terms is the larger y.
+    const decorate = (bottom: number) =>
+      page.drawRectangle({ x: line.x, y: -bottom, width, height: thickness, color, opacity, borderWidth: 0 });
+    if (text.underline) decorate(line.baseline + text.fontSize * UNDERLINE_OFFSET + thickness);
+    if (text.linethrough) decorate(line.baseline + text.fontSize * LINETHROUGH_OFFSET + thickness / 2);
+  }
+}
+
+interface TextRun {
+  text: string;
+  font: PDFFont;
+}
+
+/**
+ * Splits a line into runs that one font can draw: the text's own font, or a
+ * script font for Arabic, Chinese, Japanese and Korean characters it lacks.
+ * Spaces and punctuation stay with the run they are in. Runs keep the line's
+ * order (the canvas lays lines out left to right too); fontkit shapes Arabic
+ * and gives its glyphs right to left within each run.
+ */
+async function textRuns(text: string, primary: UsableFont, bold: boolean, context: DrawContext): Promise<TextRun[]> {
+  const runs: { text: string; font: UsableFont }[] = [];
+  const push = (char: string, font: UsableFont) => {
+    const last = runs.at(-1);
+    if (last && last.font === font) last.text += char;
+    else runs.push({ text: char, font });
+  };
+  for (const char of text) {
+    const current = runs.at(-1)?.font;
+    // Neutral characters continue the current run when its font has them.
+    if (current && current !== primary && /[\s\p{P}\p{N}]/u.test(char) && current.canEncode(char)) {
+      push(char, current);
+      continue;
+    }
+    if (primary.canEncode(char)) {
+      push(char, primary);
+      continue;
+    }
+    const scriptId = scriptFontFor(char);
+    const script = scriptId ? await context.scriptFont(scriptId, bold) : null;
+    if (script?.canEncode(char)) {
+      push(char, script);
+      continue;
+    }
     // pdf-lib silently turns unencodable characters into "?", so they are
     // substituted (and reported) here, where better equivalents exist.
-    const { text: content, unsupported } = sanitizeForStandardFont(line.text, canEncode);
-    for (const char of unsupported) (embedded ? context.missingGlyphs : context.unsupportedChars).add(char);
-    if (content.length === 0) continue;
-
-    page.drawText(content, { x: line.x, y: -line.baseline, size: text.fontSize, font, color, opacity });
-
-    if (text.underline && content.trim().length > 0) {
-      const thickness = text.fontSize * UNDERLINE_THICKNESS;
-      page.drawRectangle({
-        x: line.x,
-        y: -(line.baseline + text.fontSize * UNDERLINE_OFFSET + thickness),
-        width: font.widthOfTextAtSize(content, text.fontSize),
-        height: thickness,
-        color,
-        opacity,
-        borderWidth: 0,
-      });
-    }
+    const { text: substitute, unsupported } = sanitizeForStandardFont(char, primary.canEncode);
+    for (const missing of unsupported) (primary.embedded ? context.missingGlyphs : context.unsupportedChars).add(missing);
+    push(substitute, primary);
   }
+  return runs.filter((run) => run.text.length > 0).map((run) => ({ text: run.text, font: run.font.font }));
 }
 
 async function drawImage(page: PDFPage, image: ImageDrawable, context: DrawContext): Promise<void> {

@@ -54,6 +54,51 @@ function pdfjsAssets(): Plugin {
 }
 
 /**
+ * Serves the OCR engine from this origin: Tesseract's worker, its
+ * WebAssembly core (only the LSTM builds, one per CPU feature level) and the
+ * Spanish and English language data. Nothing is fetched from a CDN, so
+ * recognising a scanned page keeps the document on the device. They are
+ * emitted to `dist/tesseract/` and cached by the service worker on first use.
+ */
+function tesseractAssets(): Plugin {
+  const require = createRequire(import.meta.url);
+  const packageDir = (name: string) => dirname(require.resolve(`${name}/package.json`));
+  const coreDir = packageDir("tesseract.js-core");
+  const files = new Map<string, string>([
+    ["worker.min.js", join(dirname(require.resolve("tesseract.js")), "..", "dist", "worker.min.js")],
+    ...["lstm", "simd-lstm", "relaxedsimd-lstm"].map(
+      (variant): [string, string] => [`core/tesseract-core-${variant}.wasm.js`, join(coreDir, `tesseract-core-${variant}.wasm.js`)],
+    ),
+    ...["spa", "eng"].map(
+      (lang): [string, string] => [
+        `lang/${lang}.traineddata.gz`,
+        join(packageDir(`@tesseract.js-data/${lang}`), "4.0.0_best_int", `${lang}.traineddata.gz`),
+      ],
+    ),
+  ]);
+
+  return {
+    name: "tesseract-assets",
+    configureServer(server) {
+      server.middlewares.use("/tesseract/", (req, res, next) => {
+        const path = decodeURIComponent((req.url ?? "").split("?")[0]).replace(/^\/+/, "");
+        const file = files.get(path);
+        // Only the listed files are served, which also rules out path traversal.
+        if (!file) return next();
+        // The language data stays gzipped: Tesseract unpacks it itself.
+        res.setHeader("Content-Type", path.endsWith(".js") ? "text/javascript" : "application/octet-stream");
+        createReadStream(file).pipe(res);
+      });
+    },
+    generateBundle() {
+      for (const [path, file] of files) {
+        this.emitFile({ type: "asset", fileName: `tesseract/${path}`, source: readFileSync(file) });
+      }
+    },
+  };
+}
+
+/**
  * Emits `sw.js`, a service worker that precaches this build's app shell and
  * code (so the app opens and exports offline) and caches PDF.js assets and
  * fonts the first time they are used.
@@ -67,7 +112,14 @@ function serviceWorker(): Plugin {
       const precache = [
         ...publicFiles,
         ...Object.keys(bundle)
-          .filter((file) => !file.startsWith("pdfjs/") && !file.endsWith(".map") && !file.endsWith(".ttf") && file !== "index.html")
+          .filter(
+            (file) =>
+              !file.startsWith("pdfjs/") &&
+              !file.startsWith("tesseract/") &&
+              !file.endsWith(".map") &&
+              !file.endsWith(".ttf") &&
+              file !== "index.html",
+          )
           .map((file) => `/${file}`),
       ];
       const version = createHash("sha256").update(precache.join("\n")).digest("hex").slice(0, 12);
@@ -81,7 +133,7 @@ function serviceWorker(): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [svelte(), pdfjsAssets(), serviceWorker()],
+  plugins: [svelte(), pdfjsAssets(), tesseractAssets(), serviceWorker()],
   build: {
     // PDF.js, pdf-lib and Fabric are large by nature; split them so the app
     // shell stays small and vendors are cached independently.

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { PDFPageProxy } from "pdfjs-dist";
   import { editor, type PageRef } from "../editor.svelte";
+  import { t } from "../i18n.svelte";
   import { pageWidgets, viewportOf, type FormValue, type FormWidget } from "../pdfjs";
 
   interface Props {
@@ -25,7 +26,7 @@
     };
   });
 
-  const viewport = $derived(viewportOf(pdfPage, zoom, page.rotation));
+  const viewport = $derived(viewportOf(pdfPage, zoom, page));
   const values = $derived(editor.formValues[page.sourceId] ?? {});
 
   function box(widget: FormWidget) {
@@ -60,7 +61,7 @@
 </script>
 
 {#if widgets.length > 0}
-  <div class="form-layer" aria-label="Campos del formulario">
+  <div class="form-layer" aria-label={t("Campos del formulario")}>
     {#each widgets as widget (widget.id)}
       {@const rect = box(widget)}
       {@const value = valueOf(widget)}

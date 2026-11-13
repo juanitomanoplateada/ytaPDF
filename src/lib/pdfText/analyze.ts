@@ -120,12 +120,17 @@ function toUnit(
     line.chars.map((c): AnalyzedChar => {
       const g = c.glyph;
       const scale = g.glyph.size !== 0 ? g.size / g.glyph.size : 1;
+      // Inferred spaces sit in the gap after their glyph: they take no width here.
+      const x0 = (c.inferred ? g.x1 : g.x0) - line.start;
+      const x1 = g.x1 - line.start;
       return {
         text: c.text,
         font: fontIndex(g.glyph),
         size: g.size,
         color: g.glyph.color,
         rise: c.inferred ? 0 : g.glyph.rise * scale,
+        x0: Math.min(x0, x1),
+        x1: Math.max(x0, x1),
       };
     }),
   );

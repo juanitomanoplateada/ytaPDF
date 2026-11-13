@@ -18,35 +18,102 @@ export interface FontFamilyOption {
   embedded: boolean;
 }
 
+/**
+ * Fonts for scripts the families lack (Arabic, Chinese, Japanese, Korean).
+ * They come after each family in its CSS stack, and the export uses the same
+ * files for those characters, so the canvas and the PDF match.
+ */
+export type ScriptFontId = "noto-sans-arabic" | "noto-sans-sc" | "noto-sans-kr";
+
+export const SCRIPT_FONT_NAMES: Record<ScriptFontId, string> = {
+  "noto-sans-arabic": "Noto Sans Arabic",
+  "noto-sans-sc": "Noto Sans SC",
+  "noto-sans-kr": "Noto Sans KR",
+};
+
+const SCRIPT_STACK = '"Noto Sans Arabic", "Noto Sans SC", "Noto Sans KR"';
+
+const inRanges = (cp: number, ranges: [number, number][]) => ranges.some(([from, to]) => cp >= from && cp <= to);
+const ARABIC: [number, number][] = [
+  [0x0600, 0x06ff],
+  [0x0750, 0x077f],
+  [0x0870, 0x08ff],
+  [0xfb50, 0xfdff],
+  [0xfe70, 0xfeff],
+];
+const HANGUL: [number, number][] = [
+  [0x1100, 0x11ff],
+  [0x3130, 0x318f],
+  [0xa960, 0xa97f],
+  [0xac00, 0xd7ff],
+];
+const CJK: [number, number][] = [
+  [0x2e80, 0x2fdf],
+  [0x3000, 0x30ff],
+  [0x3100, 0x312f],
+  [0x31a0, 0x31ff],
+  [0x3200, 0x9fff],
+  [0xf900, 0xfaff],
+  [0xfe30, 0xfe4f],
+  [0xff00, 0xffef],
+  [0x20000, 0x3134f],
+];
+
+/** The script font that draws a character, or null for scripts the families cover. */
+export function scriptFontFor(char: string): ScriptFontId | null {
+  const cp = char.codePointAt(0) ?? 0;
+  if (cp < 0x0600) return null;
+  if (inRanges(cp, ARABIC)) return "noto-sans-arabic";
+  if (inRanges(cp, HANGUL)) return "noto-sans-kr";
+  if (inRanges(cp, CJK)) return "noto-sans-sc";
+  return null;
+}
+
+/** Script fonts a text needs. */
+export function scriptFontsIn(text: string): Set<ScriptFontId> {
+  const ids = new Set<ScriptFontId>();
+  for (const char of text) {
+    const id = scriptFontFor(char);
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
+/** Whether a character is written right to left (Arabic, Hebrew). */
+export function isRtlChar(char: string): boolean {
+  const cp = char.codePointAt(0) ?? 0;
+  return (cp >= 0x0590 && cp <= 0x08ff) || (cp >= 0xfb1d && cp <= 0xfdff) || (cp >= 0xfe70 && cp <= 0xfeff);
+}
+
 export const FONT_FAMILIES: FontFamilyOption[] = [
   {
     id: "helvetica",
     label: "Helvetica",
-    css: 'Helvetica, Arial, "Liberation Sans", sans-serif',
+    css: `Helvetica, Arial, "Liberation Sans", ${SCRIPT_STACK}, sans-serif`,
     embedded: false,
   },
   {
     id: "times",
     label: "Times New Roman",
-    css: '"Times New Roman", Times, "Liberation Serif", serif',
+    css: `"Times New Roman", Times, "Liberation Serif", ${SCRIPT_STACK}, serif`,
     embedded: false,
   },
   {
     id: "courier",
     label: "Courier",
-    css: '"Courier New", Courier, "Liberation Mono", monospace',
+    css: `"Courier New", Courier, "Liberation Mono", ${SCRIPT_STACK}, monospace`,
     embedded: false,
   },
   {
     id: "noto-sans",
     label: "Noto Sans",
-    css: '"Noto Sans", sans-serif',
+    css: `"Noto Sans", ${SCRIPT_STACK}, sans-serif`,
     embedded: true,
   },
   {
     id: "noto-serif",
     label: "Noto Serif",
-    css: '"Noto Serif", serif',
+    css: `"Noto Serif", ${SCRIPT_STACK}, serif`,
     embedded: true,
   },
 ];
@@ -61,7 +128,8 @@ export function familyFromCss(fontFamily: string | undefined): FontFamilyOption 
   if (!fontFamily) return DEFAULT_FONT_FAMILY;
   const exact = FONT_FAMILIES.find((f) => f.css === fontFamily);
   if (exact) return exact;
-  const lower = fontFamily.toLowerCase();
+  // The script fonts at the end of every stack say nothing about the family.
+  const lower = fontFamily.replace(SCRIPT_STACK, "").toLowerCase();
   if (lower.includes("noto serif")) return family("noto-serif");
   if (lower.includes("noto")) return family("noto-sans");
   if (lower.includes("times") || (lower.includes("serif") && !lower.includes("sans"))) {

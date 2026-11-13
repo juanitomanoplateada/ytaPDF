@@ -1,9 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import "./lib/fabricSetup";
-  import { editor, type ArrangeAction } from "./lib/editor.svelte";
+  import { editor, type ArrangeAction, type Tool } from "./lib/editor.svelte";
+  import { i18n, t } from "./lib/i18n.svelte";
   import { notifications } from "./lib/notifications.svelte";
-  import { pwa } from "./lib/pwa.svelte";
+  import { isProjectFile, PROJECT_EXTENSION } from "./lib/project";
+  import { pwa, takeSharedFiles } from "./lib/pwa.svelte";
+  import { search } from "./lib/search.svelte";
+  import ConfirmModal from "./lib/components/ConfirmModal.svelte";
+  import DecorationsModal from "./lib/components/DecorationsModal.svelte";
+  import OcrModal from "./lib/components/OcrModal.svelte";
+  import AiModal from "./lib/components/AiModal.svelte";
+  import ExportModal from "./lib/components/ExportModal.svelte";
   import GridOrganizer from "./lib/components/GridOrganizer.svelte";
   import PasswordModal from "./lib/components/PasswordModal.svelte";
   import ShortcutsModal from "./lib/components/ShortcutsModal.svelte";
@@ -16,13 +24,26 @@
 
   /** Marks clipboard content copied from this app, to paste it back as objects. */
   const CLIPBOARD_TYPE = "application/x-ytapdf-objects";
+  /** Single-key tools; pressing the key again goes back to selecting. */
+  const TOOL_KEYS: Record<string, Tool> = { t: "text", e: "edit", s: "textselect", c: "crop", p: "pen" };
 
   let fileInput: HTMLInputElement;
   let dragDepth = $state(0);
 
   onMount(() => {
-    pwa.init((files) => void editor.openFiles(files));
-    void editor.checkRecovery();
+    document.documentElement.lang = i18n.locale;
+    pwa.init((files, handles) => void editor.openFiles(files, { handles }));
+    void editor.refreshWorks();
+    // Files sent to the installed app from another app's "Share" menu.
+    if (new URL(location.href).searchParams.has("compartido")) {
+      history.replaceState(null, "", "/");
+      void takeSharedFiles().then((files) => openAny(files));
+    }
+  });
+
+  // The search reads the text of the open document's sources.
+  $effect(() => {
+    if (!editor.hasDocument) search.reset();
   });
 
   function openFilePicker() {
@@ -33,17 +54,42 @@
     const input = event.currentTarget as HTMLInputElement;
     const files = [...(input.files ?? [])];
     input.value = "";
-    void editor.openFiles(files);
+    void openAny(files);
+  }
+
+  function isPdf(file: File) {
+    return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  }
+
+  /** PDFs open or join the document, images become pages or go onto the page, projects open. */
+  async function openAny(files: File[]) {
+    const project = files.find(isProjectFile);
+    if (project) {
+      await editor.openProject(project);
+      return;
+    }
+    const pdfs = files.filter(isPdf);
+    const images = files.filter((file) => file.type.startsWith("image/"));
+    if (pdfs.length === 0 && images.length === 0) {
+      if (files.length > 0) notifications.info(t("Solo se pueden abrir archivos PDF, imágenes o proyectos de ytaPDF."));
+      return;
+    }
+    const hadDocument = editor.hasDocument;
+    if (pdfs.length > 0) await editor.openFiles(pdfs);
+    if (images.length === 0) return;
+    if (hadDocument && editor.view === "editor") {
+      // On the editor, images go onto the current page.
+      for (const image of images) await editor.addImage(image);
+    } else {
+      // Without a document they become one; in the organizer, new pages.
+      await editor.addImagePages(images);
+    }
   }
 
   // ── Drag & drop from the operating system ────────────────────────────────
 
   function carriesFiles(event: DragEvent) {
     return event.dataTransfer?.types.includes("Files") ?? false;
-  }
-
-  function isPdf(file: File) {
-    return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
   }
 
   function ondragenter(event: DragEvent) {
@@ -63,20 +109,7 @@
   async function ondrop(event: DragEvent) {
     if (!carriesFiles(event)) return;
     event.preventDefault();
-    const files = [...(event.dataTransfer?.files ?? [])];
-    const pdfs = files.filter(isPdf);
-    const images = files.filter((file) => file.type.startsWith("image/"));
-    if (pdfs.length === 0 && images.length === 0) {
-      notifications.info("Solo se pueden abrir archivos PDF o añadir imágenes.");
-      return;
-    }
-    if (pdfs.length > 0) await editor.openFiles(pdfs);
-    if (images.length === 0) return;
-    if (editor.hasDocument && editor.view === "editor") {
-      for (const image of images) await editor.addImage(image);
-    } else if (!editor.hasDocument) {
-      notifications.info("Abre primero un PDF para poder añadir imágenes.");
-    }
+    await openAny([...(event.dataTransfer?.files ?? [])]);
   }
 
   // ── Keyboard shortcuts ───────────────────────────────────────────────────
@@ -122,7 +155,25 @@
 
     if (mod && key === "s") {
       event.preventDefault();
-      void editor.exportPdf();
+      if (event.shiftKey) editor.exportDialog = "pdf";
+      else void editor.exportPdf();
+      return;
+    }
+    if (mod && key === "p") {
+      event.preventDefault();
+      void editor.printDocument();
+      return;
+    }
+    if (mod && key === "f" && editor.view === "editor") {
+      event.preventDefault();
+      search.show();
+      return;
+    }
+    if (mod && key === "g" && !event.shiftKey && editor.view === "editor") {
+      event.preventDefault();
+      // The page box of whichever toolbar layout is visible.
+      const input = [...document.querySelectorAll<HTMLInputElement>(".page-input")].find((el) => el.offsetParent !== null);
+      input?.focus();
       return;
     }
     // While typing, undo/redo belong to the text field.
@@ -168,18 +219,30 @@
         editor.toggleLockSelection();
         return;
       }
+      if (key === "g" && event.shiftKey) {
+        event.preventDefault();
+        if (editor.selection.kind === "group") editor.ungroupSelection();
+        else editor.groupSelection();
+        return;
+      }
     }
     if (mod || event.altKey || editor.view !== "editor") return;
 
     if (event.key === "Escape") {
       editor.clearSelection();
       editor.tool = "select";
+      editor.pendingCrop = null;
       editor.sidebarOpen = false;
       return;
     }
-    if (key === "t") editor.tool = "text";
-    if (key === "e") editor.tool = "edit";
+    if (event.key === "Enter" && editor.pendingCrop) {
+      event.preventDefault();
+      void editor.applyCrop("page");
+      return;
+    }
     if (key === "v") editor.tool = "select";
+    const tool = TOOL_KEYS[key];
+    if (tool) editor.tool = editor.tool === tool ? "select" : tool;
     if (!editor.selection) return;
 
     if (event.key === "Delete" || event.key === "Backspace") {
@@ -215,6 +278,7 @@
   }
 
   function oncopy(event: ClipboardEvent) {
+    // Text selected in the document itself is copied by the browser.
     if (canUseClipboard(event) && editor.selection) copyTo(event, editor.copySelection());
   }
 
@@ -279,10 +343,13 @@
     {#if !editor.hasDocument}
       <Welcome onopenfiles={openFilePicker} />
     {:else if editor.view === "organizer"}
-      <GridOrganizer onaddfiles={openFilePicker} />
+      <GridOrganizer />
     {:else}
       {#if editor.sidebarOpen}
-        <button class="sidebar-backdrop" aria-label="Cerrar panel de páginas" onclick={() => (editor.sidebarOpen = false)}
+        <button
+          class="sidebar-backdrop"
+          aria-label={t("Cerrar panel de páginas")}
+          onclick={() => (editor.sidebarOpen = false)}
         ></button>
       {/if}
       <Sidebar onaddfiles={openFilePicker} />
@@ -293,7 +360,7 @@
   <input
     bind:this={fileInput}
     type="file"
-    accept="application/pdf,.pdf"
+    accept="application/pdf,.pdf,{PROJECT_EXTENSION}"
     multiple
     hidden
     onchange={onFilesChosen}
@@ -302,11 +369,13 @@
   {#if dragDepth > 0}
     <div class="drop-overlay" aria-hidden="true">
       <div>
-        <strong>Suelta los archivos aquí</strong>
+        <strong>{t("Suelta los archivos aquí")}</strong>
         <span>
-          {editor.hasDocument
-            ? "Los PDF se añaden al final del documento y las imágenes a la página actual."
-            : "Se abrirán los archivos PDF."}
+          {!editor.hasDocument
+            ? t("Se abrirán los PDF; las imágenes se convertirán en un PDF.")
+            : editor.view === "organizer"
+              ? t("Suéltalos en el hueco entre dos páginas para insertarlos ahí.")
+              : t("Los PDF se añaden al final del documento y las imágenes a la página actual.")}
         </span>
       </div>
     </div>
@@ -327,6 +396,34 @@
 
   {#if editor.shortcutsOpen}
     <ShortcutsModal />
+  {/if}
+
+  {#if editor.exportDialog && editor.hasDocument}
+    <ExportModal />
+  {/if}
+
+  {#if editor.ocrDialog && editor.hasDocument}
+    <OcrModal />
+  {/if}
+  {#if editor.aiDialog && editor.hasDocument}
+    <AiModal />
+  {/if}
+  {#if editor.decorationsOpen && editor.hasDocument}
+    <DecorationsModal />
+  {/if}
+
+  {#if editor.overwriteRequest}
+    {@const request = editor.overwriteRequest}
+    <ConfirmModal
+      title={t("¿Guardar sobre el archivo original?")}
+      message={t(
+        "Se reemplazará «{name}» con el documento editado. Si prefieres conservar el original, usa «Guardar como».",
+        { name: request.fileName },
+      )}
+      confirmText={t("Reemplazar")}
+      onconfirm={() => request.resolve(true)}
+      oncancel={() => request.resolve(false)}
+    />
   {/if}
 
   {#if editor.passwordRequest}
@@ -388,7 +485,7 @@
     z-index: 1800;
     display: grid;
     place-items: center;
-    background: rgba(255, 255, 255, 0.55);
+    background: var(--color-busy);
     cursor: progress;
   }
   .busy-card {
@@ -410,7 +507,7 @@
       inset: 0;
       z-index: 150;
       border: none;
-      background: rgba(15, 23, 42, 0.4);
+      background: var(--color-backdrop);
     }
   }
 </style>

@@ -77,11 +77,13 @@
     display: grid;
     place-items: center;
     padding: 16px;
-    background: rgba(15, 23, 42, 0.45);
+    background: var(--color-backdrop);
     animation: fade-in 0.15s ease-out;
   }
   .dialog {
     width: min(420px, 100%);
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
     padding: 24px;
     border-radius: var(--radius-lg);
     background: var(--color-surface);

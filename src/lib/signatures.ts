@@ -1,8 +1,6 @@
-import type { SignatureData } from "./editor.svelte";
+import type { SignatureContent } from "./editor.svelte";
 
-export interface SavedSignature extends SignatureData {
-  id: string;
-}
+export type SavedSignature = SignatureContent & { id: string };
 
 const STORAGE_KEY = "ytapdf.signatures";
 const LIMIT = 5;
@@ -33,7 +31,9 @@ export function loadSavedSignatures(): SavedSignature[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     const list = raw ? (JSON.parse(raw) as SavedSignature[]) : [];
-    return Array.isArray(list) ? list.filter((s) => typeof s.path === "string") : [];
+    return Array.isArray(list)
+      ? list.filter((s) => typeof (s as { path?: unknown }).path === "string" || typeof (s as { image?: unknown }).image === "string")
+      : [];
   } catch {
     return [];
   }
@@ -48,8 +48,12 @@ function store(list: SavedSignature[]): void {
   }
 }
 
-export function saveSignature(signature: SignatureData): SavedSignature[] {
-  const list = [{ ...signature, id: `firma-${Date.now().toString(36)}` }, ...loadSavedSignatures()].slice(0, LIMIT);
+/** Keeps up to five signatures and five sets of initials, newest first. */
+export function saveSignature(signature: SignatureContent): SavedSignature[] {
+  const saved: SavedSignature = { ...signature, id: `firma-${Date.now().toString(36)}` };
+  const same = (s: SavedSignature) => !!s.initials === !!signature.initials;
+  const previous = loadSavedSignatures();
+  const list = [saved, ...previous.filter(same).slice(0, LIMIT - 1), ...previous.filter((s) => !same(s))];
   store(list);
   return list;
 }

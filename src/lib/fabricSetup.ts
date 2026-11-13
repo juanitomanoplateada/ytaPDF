@@ -7,6 +7,7 @@ import {
   FabricImage,
   FabricObject,
   FabricText,
+  Group,
   IText,
   InteractiveFabricObject,
   Path,
@@ -17,15 +18,21 @@ import {
   type TPointerEvent,
   type Transform,
 } from "fabric";
+import { alignShifts, distributeShifts, type AlignMode, type Bounds } from "./arrange";
 import { isBoldWeight, isItalicStyle } from "./fonts";
+import { t } from "./i18n.svelte";
 import { bakeNativeScale, isNative, markDeleted, originalFontLabel, substitutedChars, toPlainTextData } from "./nativeText";
 import type {
   ArrangeAction,
+  BoundsChange,
   DrawTool,
+  LinkTarget,
+  MarkKind,
   ObjectKind,
   SelectionInfo,
   ShapeStyle,
   SignatureData,
+  TextAlign,
   TextStyle,
 } from "./editor.svelte";
 
@@ -35,7 +42,7 @@ const DANGER = "#e5484d";
 // ── Global look & controls (applied once, before any object is created) ────
 
 // Extra properties every object carries through serialisation, undo and copy.
-BaseFabricObject.customProperties.push("ytaKind", "locked", "ytaNative");
+BaseFabricObject.customProperties.push("ytaKind", "locked", "ytaNative", "ytaLink");
 
 Object.assign(InteractiveFabricObject.ownDefaults, {
   borderColor: ACCENT,
@@ -158,6 +165,7 @@ function setExtra(object: FabricObject, props: Extra & Record<string, unknown>):
 export function kindOf(object: FabricObject): ObjectKind {
   const kind = extra(object).ytaKind;
   if (kind) return kind;
+  if (object instanceof Group) return "group";
   if (object instanceof FabricText) return "text";
   if (object instanceof FabricImage) return "image";
   if (object instanceof Ellipse) return "ellipse";
@@ -215,7 +223,7 @@ export function syncSelectionLock(canvas: Canvas): void {
 export function createText(content: string, style: TextStyle): IText {
   return new IText(content, {
     ...style,
-    lineHeight: 1.16,
+    lineHeight: style.lineHeight || 1.16,
     editingBorderColor: ACCENT,
     cursorColor: ACCENT,
     selectionColor: "rgba(25, 118, 210, 0.25)",
@@ -229,18 +237,48 @@ export async function createImage(url: string, maxWidth: number, maxHeight: numb
   return image;
 }
 
-/** A handwritten signature as a single vector path, `width` scene units wide. */
+/**
+ * A signature as a single vector path, `width` scene units wide: the strokes
+ * of a drawn one, or the filled glyph outlines of a typed one.
+ */
 export function createSignature(signature: SignatureData, width: number): Path {
-  const path = new Path(signature.path, {
-    fill: null,
-    stroke: signature.color,
-    strokeWidth: signature.strokeWidth,
-    strokeLineCap: "round",
-    strokeLineJoin: "round",
-  });
+  const style: Partial<Path> = signature.filled
+    ? { fill: signature.color, stroke: null, strokeWidth: 0 }
+    : { fill: null, stroke: signature.color, strokeWidth: signature.strokeWidth, strokeLineCap: "round", strokeLineJoin: "round" };
+  const path = new Path(signature.path, style);
   setExtra(path, { ytaKind: "signature" });
   path.scale(width / Math.max(1, path.width));
   return path;
+}
+
+/** Check mark and cross, drawn in a 24 × 24 box. */
+const MARK_PATHS: Record<MarkKind, string> = {
+  check: "M 4 12.5 L 9.5 18 L 20 6",
+  cross: "M 6 6 L 18 18 M 18 6 L 6 18",
+};
+
+/** A check mark or a cross `size` scene units wide, for ticking boxes on forms. */
+export function createMark(kind: MarkKind, size: number, color: string): Path {
+  const path = new Path(MARK_PATHS[kind], {
+    fill: null,
+    stroke: color,
+    strokeWidth: 3,
+    strokeLineCap: "round",
+    strokeLineJoin: "round",
+  });
+  setExtra(path, { ytaKind: "mark" });
+  path.scale(size / 24);
+  return path;
+}
+
+/** Freehand strokes from the pen tool. */
+export function markInk(path: FabricObject): void {
+  setExtra(path, { ytaKind: "ink", strokeLineCap: "round", strokeLineJoin: "round", fill: null });
+}
+
+/** Paths painted by their fill (typed signatures): their colour is the fill. */
+function isFilledPath(object: FabricObject): boolean {
+  return object instanceof Path && typeof object.fill === "string" && object.fill !== "" && !(object.strokeWidth > 0 && object.stroke);
 }
 
 /** Highlights are translucent so the text underneath stays readable. */
@@ -253,7 +291,13 @@ export const DEFAULT_SIZES: Record<DrawTool, { width: number; height: number }> 
   arrow: { width: 140, height: 0 },
   highlight: { width: 160, height: 20 },
   redact: { width: 160, height: 24 },
+  note: { width: 180, height: 60 },
+  link: { width: 140, height: 24 },
 };
+
+/** Sticky notes look like one in the editor; in the file they are PDF note annotations. */
+export const NOTE_COLOR = "#fff3a0";
+const LINK_FILL = "rgba(25, 118, 210, 0.12)";
 
 export function linePath(x1: number, y1: number, x2: number, y2: number): string {
   return `M ${x1} ${y1} L ${x2} ${y2}`;
@@ -315,6 +359,33 @@ export function createShape(
     object = new Rect({ ...center, width, height, fill: highlightColor, strokeWidth: 0, opacity: HIGHLIGHT_OPACITY });
   } else if (tool === "redact") {
     object = new Rect({ ...center, width, height, fill: "#000000", strokeWidth: 0 });
+  } else if (tool === "note") {
+    object = new Textbox(t("Nota"), {
+      left: center.left,
+      width: Math.max(80, width),
+      fontSize: 13,
+      fontFamily: "Helvetica, Arial, sans-serif",
+      fill: "#333333",
+      backgroundColor: NOTE_COLOR,
+      lineHeight: 1.2,
+      editingBorderColor: ACCENT,
+      cursorColor: ACCENT,
+      selectionColor: "rgba(25, 118, 210, 0.25)",
+    });
+    // The note starts where the gesture started; its height follows its text.
+    object.set({ top: top + object.height / 2 });
+  } else if (tool === "link") {
+    object = new Rect({
+      ...center,
+      width,
+      height,
+      fill: LINK_FILL,
+      stroke: ACCENT,
+      strokeWidth: 1,
+      strokeDashArray: [5, 3],
+      strokeUniform: true,
+    });
+    setExtra(object, { ytaLink: { url: "" } });
   } else {
     object = new Rect({
       ...center,
@@ -337,6 +408,8 @@ export function createShape(
 export function bakeScale(object: FabricObject | undefined): boolean {
   if (!object) return false;
   if (isNative(object)) return bakeNativeScale(object);
+  // A group keeps its scale: its children are drawn through it.
+  if (object instanceof Group) return false;
   const sx = object.scaleX || 1;
   const sy = object.scaleY || 1;
   if (Math.abs(sx - 1) < 1e-3 && Math.abs(sy - 1) < 1e-3) return false;
@@ -374,12 +447,23 @@ function readTextStyle(text: FabricText): TextStyle {
     fontWeight: isBoldWeight(text.fontWeight) ? "bold" : "normal",
     fontStyle: isItalicStyle(text.fontStyle) ? "italic" : "normal",
     underline: !!text.underline,
+    linethrough: !!text.linethrough,
+    textAlign: (ALIGNMENTS as string[]).includes(text.textAlign) ? (text.textAlign as TextAlign) : "left",
+    lineHeight: Math.round((text.lineHeight || 1.16) * 100) / 100,
   };
 }
 
-const STROKED = new Set<ObjectKind>(["rect", "ellipse", "line", "arrow", "signature"]);
+const ALIGNMENTS: TextAlign[] = ["left", "center", "right"];
+
+/** Paragraph settings that only plain text takes: document text keeps its own layout. */
+const PLAIN_TEXT_ONLY: (keyof TextStyle)[] = ["textAlign", "lineHeight", "linethrough"];
+
+const STROKED = new Set<ObjectKind>(["rect", "ellipse", "line", "arrow", "signature", "ink", "mark"]);
 
 function readShapeStyle(object: FabricObject): ShapeStyle {
+  if (isFilledPath(object)) {
+    return { stroke: normalizeHex(object.fill as string), fill: null, strokeWidth: 0 };
+  }
   return {
     stroke: typeof object.stroke === "string" ? normalizeHex(object.stroke) : "#000000",
     fill: typeof object.fill === "string" && object.fill !== "" ? normalizeHex(object.fill) : null,
@@ -424,7 +508,146 @@ export function describeSelection(canvas: Canvas): SelectionInfo | null {
     highlight: firstHighlight && typeof firstHighlight.fill === "string" ? normalizeHex(firstHighlight.fill) : null,
     locked: objects.every(isLocked),
     ...stackRange(canvas, objects),
+    bounds: roundBounds(active.getBoundingRect()),
+    size:
+      objects.length === 1
+        ? { width: round2(active.getScaledWidth()), height: round2(active.getScaledHeight()) }
+        : null,
+    canGroup: objects.length > 1 && !objects.some(isNative) && !objects.some(isLocked),
+    link: objects.length === 1 && kindOf(active) === "link" ? linkOf(active) : null,
   };
+}
+
+/** Where a link object points (an empty URL until the user gives one). */
+export function linkOf(object: FabricObject): LinkTarget {
+  const target = (object as unknown as { ytaLink?: LinkTarget }).ytaLink;
+  return target && (target.url !== undefined || target.pageId !== undefined) ? { ...target } : { url: "" };
+}
+
+/** Points the selected links somewhere else. Returns whether any changed. */
+export function setLinkTarget(canvas: Canvas, target: LinkTarget): boolean {
+  const links = selectedObjects(canvas).filter((object) => kindOf(object) === "link" && !isLocked(object));
+  for (const link of links) setExtra(link, { ytaLink: { ...target } });
+  return links.length > 0;
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+function roundBounds(box: { left: number; top: number; width: number; height: number }): Bounds {
+  return { left: round2(box.left), top: round2(box.top), width: round2(box.width), height: round2(box.height) };
+}
+
+// ── Alignment, grouping and exact size ─────────────────────────────────────
+
+/**
+ * Takes the selection apart so each object has its own position on the page
+ * (inside a multiple selection they are relative to it), runs `change`, and
+ * selects the same objects again.
+ */
+function withLooseSelection(canvas: Canvas, change: (objects: FabricObject[]) => FabricObject[] | void): FabricObject[] {
+  const objects = editableSelection(canvas);
+  canvas.discardActiveObject();
+  const result = change(objects) ?? objects;
+  for (const object of result) object.setCoords();
+  if (result.length === 1) canvas.setActiveObject(result[0]);
+  else if (result.length > 1) canvas.setActiveObject(new ActiveSelection(result, { canvas }));
+  canvas.requestRenderAll();
+  return result;
+}
+
+function moveBy(object: FabricObject, dx: number, dy: number): void {
+  object.set({ left: object.left + dx, top: object.top + dy });
+  object.setCoords();
+}
+
+/** Aligns several objects to each other, or a single one to the page. */
+export function alignObjects(canvas: Canvas, mode: AlignMode, page: { width: number; height: number }): boolean {
+  if (editableSelection(canvas).length === 0) return false;
+  withLooseSelection(canvas, (objects) => {
+    const boxes = objects.map((object) => object.getBoundingRect());
+    const reference = objects.length === 1 ? { left: 0, top: 0, width: page.width, height: page.height } : undefined;
+    alignShifts(boxes, mode, reference).forEach(({ dx, dy }, i) => moveBy(objects[i], dx, dy));
+  });
+  return true;
+}
+
+/** Spreads three or more objects with equal gaps between them. */
+export function distributeObjects(canvas: Canvas, axis: "horizontal" | "vertical"): boolean {
+  if (editableSelection(canvas).length < 3) return false;
+  withLooseSelection(canvas, (objects) => {
+    const boxes = objects.map((object) => object.getBoundingRect());
+    distributeShifts(boxes, axis).forEach(({ dx, dy }, i) => moveBy(objects[i], dx, dy));
+  });
+  return true;
+}
+
+/** Joins the selected objects into one group, keeping their stacking order. */
+export function groupSelected(canvas: Canvas): Group | null {
+  const all = canvas.getObjects();
+  const objects = selectedObjects(canvas).sort((a, b) => all.indexOf(a) - all.indexOf(b));
+  if (objects.length < 2 || objects.some((object) => isNative(object) || isLocked(object))) return null;
+  const index = all.indexOf(objects[0]);
+  canvas.discardActiveObject();
+  canvas.remove(...objects);
+  const group = new Group(objects);
+  canvas.insertAt(index, group);
+  canvas.setActiveObject(group);
+  canvas.requestRenderAll();
+  return group;
+}
+
+/** Takes a group apart; its objects keep where and how they were drawn. */
+export function ungroupSelected(canvas: Canvas): FabricObject[] {
+  const group = canvas.getActiveObject();
+  if (!(group instanceof Group) || group instanceof ActiveSelection || isLocked(group)) return [];
+  const index = canvas.getObjects().indexOf(group);
+  canvas.discardActiveObject();
+  const objects = group.removeAll();
+  canvas.remove(group);
+  objects.forEach((object, i) => {
+    prepareObject(object);
+    object.setCoords();
+    canvas.insertAt(index + i, object);
+  });
+  canvas.setActiveObject(objects.length === 1 ? objects[0] : new ActiveSelection(objects, { canvas }));
+  canvas.requestRenderAll();
+  return objects;
+}
+
+/**
+ * Moves the selection so its box starts at `left`/`top`, and resizes a single
+ * object to `width`/`height` (its own size, before rotation).
+ */
+export function setObjectBounds(canvas: Canvas, change: BoundsChange, keepRatio: boolean): boolean {
+  const active = canvas.getActiveObject();
+  if (!active || selectedObjects(canvas).some(isLocked)) return false;
+  if (change.width !== undefined || change.height !== undefined) {
+    // Resizing keeps the top left corner of the box where it is.
+    const before = active.getBoundingRect();
+    const width = active.getScaledWidth();
+    const height = active.getScaledHeight();
+    let sx = change.width !== undefined && width > 0 ? change.width / width : 1;
+    let sy = change.height !== undefined && height > 0 ? change.height / height : 1;
+    // Text and proportional resizing scale both sides alike.
+    if (keepRatio || isText(active)) {
+      const factor = change.width !== undefined ? sx : sy;
+      sx = factor;
+      sy = factor;
+    }
+    if (Math.abs(sx) > 1e-3 && Math.abs(sy) > 1e-3) {
+      active.set({ scaleX: (active.scaleX || 1) * sx, scaleY: (active.scaleY || 1) * sy });
+      active.setCoords();
+      if (!(active instanceof ActiveSelection)) bakeScale(active);
+      const after = active.getBoundingRect();
+      moveBy(active, before.left - after.left, before.top - after.top);
+    }
+  }
+  if (change.left !== undefined || change.top !== undefined) {
+    const box = active.getBoundingRect();
+    moveBy(active, change.left !== undefined ? change.left - box.left : 0, change.top !== undefined ? change.top - box.top : 0);
+  }
+  canvas.requestRenderAll();
+  return true;
 }
 
 /** Objects of the selection that may be edited (locked ones are skipped). */
@@ -436,7 +659,11 @@ export function applyTextStyle(canvas: Canvas, style: Partial<TextStyle>): boole
   const texts = editableSelection(canvas).filter(isText);
   if (texts.length === 0) return false;
   for (const text of texts) {
-    const { fontSize, ...rest } = style;
+    const { fontSize, ...all } = style;
+    const rest = isNative(text)
+      ? Object.fromEntries(Object.entries(all).filter(([key]) => !PLAIN_TEXT_ONLY.includes(key as keyof TextStyle)))
+      : all;
+    if (isNative(text) && Object.keys(rest).length === 0 && fontSize === undefined) continue;
     text.set(rest);
     if (fontSize !== undefined) text.set("fontSize", fontSize / (text.scaleY || 1));
     if (isNative(text)) {
@@ -474,6 +701,11 @@ export function applyShapeStyle(canvas: Canvas, style: Partial<ShapeStyle>, high
 }
 
 function setShapeStyle(object: FabricObject, kind: ObjectKind, style: Partial<ShapeStyle>): void {
+  if (isFilledPath(object)) {
+    // A typed signature has no stroke: its colour is the fill, and its weight is the font's.
+    if (style.stroke !== undefined) object.set("fill", style.stroke);
+    return;
+  }
   if (style.stroke !== undefined) object.set("stroke", style.stroke);
   if (style.strokeWidth !== undefined) object.set("strokeWidth", style.strokeWidth);
   // Only closed shapes take a fill.
@@ -675,6 +907,16 @@ export function drawShapePreview(
   } else if (tool === "redact") {
     ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
     ctx.fillRect(x, y, w, h);
+  } else if (tool === "note") {
+    ctx.fillStyle = NOTE_COLOR;
+    ctx.fillRect(x, y, w, h);
+  } else if (tool === "link") {
+    ctx.fillStyle = LINK_FILL;
+    ctx.fillRect(x, y, w, h);
+    ctx.lineWidth = 1 / vpt[0];
+    ctx.strokeStyle = ACCENT;
+    ctx.setLineDash([5 / vpt[0], 3 / vpt[0]]);
+    ctx.strokeRect(x, y, w, h);
   } else if (tool === "rect" || tool === "ellipse") {
     ctx.beginPath();
     if (tool === "rect") ctx.rect(x, y, w, h);
