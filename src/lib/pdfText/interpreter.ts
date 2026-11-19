@@ -1,12 +1,22 @@
-import { PDFArray, PDFDict, PDFName, PDFRef, PDFStream, type PDFContext, type PDFObject, type PDFPage } from "@cantoo/pdf-lib";
+import {
+  PDFArray,
+  PDFDict,
+  PDFName,
+  PDFRef,
+  PDFStream,
+  type PDFContext,
+  type PDFObject,
+  type PDFPage,
+} from "@cantoo/pdf-lib";
 import { applyToPoint, IDENTITY, multiply, type Matrix } from "../geometry";
+import type { CodeRead } from "./cmap";
 import type { PdfFont, FontCache } from "./fonts";
 import { isName, isString, parseContent, type Operand, type Operation } from "./lexer";
 import { arrayOf, dictOf, nameOf, numberOf, numbersOf, resolve, streamBytes } from "./pdfObjects";
 
 import type { FillColor } from "./color";
 
-export type { FillColor };
+export type { FillColor } from "./color";
 
 /** One drawn character code, with everything needed to find, erase or imitate it. */
 export interface Glyph {
@@ -197,13 +207,17 @@ class Interpreter {
   readonly paints: PaintedArea[] = [];
   readonly forms = new Map<string, FormInvocation>();
   complete = true;
-  #textObjects = 0;
+  /** Text objects (BT … ET, and forms drawn by the page) numbered across the page. */
+  textObjects = 0;
+  /** Top-level operation and text object currently being executed (for forms). */
+  topOp: string | undefined;
+  topTextObject: number | undefined;
 
   constructor(
-    private readonly context: PDFContext,
-    private readonly fonts: FontCache,
+    readonly context: PDFContext,
+    readonly fonts: FontCache,
     private readonly trackCtm: boolean,
-    private readonly trackPaints: boolean,
+    readonly trackPaints: boolean,
   ) {}
 
   run(
@@ -214,271 +228,30 @@ class Interpreter {
     depth: number,
     visiting: Set<string>,
   ): void {
-    const top = path === "";
-    const stack: GraphicsState[] = [];
-    let state = initial;
-    let tm: Matrix = [...IDENTITY];
-    let tlm: Matrix = [...IDENTITY];
-    let pending: Glyph[] = [];
-    let textObject = -1;
-    // Points of the path being built, already in page user space.
-    let pathPoints: [number, number][] = [];
-    const addPoints = (values: number[]) => {
-      if (!this.trackPaints) return;
-      for (let k = 0; k + 1 < values.length; k += 2) pathPoints.push(applyToPoint(state.ctm, values[k], values[k + 1]));
-    };
-    const unitSquare = (): [number, number][] => [
-      applyToPoint(state.ctm, 0, 0),
-      applyToPoint(state.ctm, 1, 0),
-      applyToPoint(state.ctm, 1, 1),
-      applyToPoint(state.ctm, 0, 1),
-    ];
-
-    const fontResource = (name: string): PDFObject | undefined => {
-      const fontDict = dictOf(this.context, resources?.get(PDFName.of("Font")));
-      return fontDict?.get(PDFName.of(name));
-    };
-
-    const show = (opIndex: number, items: Operand[], firstIndex: number): number => {
-      let index = firstIndex;
-      const { text } = state;
-      const font = text.font;
-      for (const item of items) {
-        if (typeof item === "number") {
-          const tx = (-item / 1000) * text.size * text.hScale;
-          if (font?.vertical) tm = multiply(tm, [1, 0, 0, 1, 0, (-item / 1000) * text.size]);
-          else tm = multiply(tm, [1, 0, 0, 1, tx, 0]);
-          continue;
-        }
-        if (!isString(item) || !font || !text.fontObject) continue;
-        for (const read of font.readCodes(item.bytes)) {
-          const w0 = font.width(read.code) * font.scale;
-          const spacing = text.charSpacing + (read.length === 1 && read.code === 32 ? text.wordSpacing : 0);
-          const glyph: Glyph = {
-            key: `${path}${opIndex}:${index}`,
-            path,
-            op: opIndex,
-            index,
-            code: read.code,
-            length: read.length,
-            unicode: font.unicode(read.code),
-            font,
-            fontObject: text.fontObject,
-            size: text.size,
-            hScale: text.hScale,
-            charSpacing: text.charSpacing,
-            wordSpacing: text.wordSpacing,
-            rise: text.rise,
-            renderMode: text.renderMode,
-            textMatrix: tm,
-            ctm: state.ctm,
-            advance: font.vertical ? 0 : (w0 * text.size + spacing) * text.hScale,
-            width: w0 * text.size * text.hScale,
-            color: state.color,
-            alpha: state.alpha,
-            insertAfter: top ? "end" : (this.#topOp ?? "end"),
-            textObject: this.#topTextObject ?? textObject,
-            vertical: font.vertical,
-          };
-          this.glyphs.push(glyph);
-          if (top) pending.push(glyph);
-          if (font.vertical) {
-            tm = multiply(tm, [1, 0, 0, 1, 0, -(text.size + spacing)]);
-          } else {
-            tm = multiply(tm, [1, 0, 0, 1, glyph.advance, 0]);
-          }
-          index++;
-        }
-      }
-      return index;
-    };
-
-    const nextLine = (tx: number, ty: number) => {
-      tlm = multiply(tlm, [1, 0, 0, 1, tx, ty]);
-      tm = [...tlm];
-    };
-
+    const run = new ContentRun(this, { resources, path, depth, visiting }, initial);
     for (let i = 0; i < operations.length; i++) {
       const { op, operands } = operations[i];
-      if (top) this.#topOp = String(i);
-      switch (op) {
-        case "q":
-          stack.push(cloneState(state));
-          break;
-        case "Q":
-          if (stack.length > 0) state = stack.pop()!;
-          break;
-        case "cm":
-          if (operands.length >= 6) {
-            state = { ...state, ctm: multiply(state.ctm, operands.slice(0, 6).map(num) as Matrix) };
-          }
-          break;
-        case "BT":
-          tm = [...IDENTITY];
-          tlm = [...IDENTITY];
-          textObject = this.#textObjects++;
-          break;
-        case "ET":
-          if (top) for (const glyph of pending) glyph.insertAfter = String(i);
-          pending = [];
-          break;
-        case "Tf": {
-          const name = operands[0];
-          const object = isName(name) ? fontResource(name.value) : undefined;
-          state.text.font = object ? this.fonts.get(object) : undefined;
-          state.text.fontObject = object;
-          state.text.size = num(operands[1]);
-          break;
-        }
-        case "Tc":
-          state.text.charSpacing = num(operands[0]);
-          break;
-        case "Tw":
-          state.text.wordSpacing = num(operands[0]);
-          break;
-        case "Tz":
-          state.text.hScale = num(operands[0]) / 100;
-          break;
-        case "TL":
-          state.text.leading = num(operands[0]);
-          break;
-        case "Ts":
-          state.text.rise = num(operands[0]);
-          break;
-        case "Tr":
-          state.text.renderMode = num(operands[0]);
-          break;
-        case "Td":
-          nextLine(num(operands[0]), num(operands[1]));
-          break;
-        case "TD":
-          state.text.leading = -num(operands[1]);
-          nextLine(num(operands[0]), num(operands[1]));
-          break;
-        case "Tm":
-          tlm = operands.slice(0, 6).map(num) as Matrix;
-          tm = [...tlm];
-          break;
-        case "T*":
-          nextLine(0, -state.text.leading);
-          break;
-        case "Tj":
-          show(i, [operands[0] ?? []], 0);
-          break;
-        case "TJ":
-          show(i, Array.isArray(operands[0]) ? operands[0] : [], 0);
-          break;
-        case "'":
-          nextLine(0, -state.text.leading);
-          show(i, [operands[0] ?? []], 0);
-          break;
-        case '"':
-          state.text.wordSpacing = num(operands[0]);
-          state.text.charSpacing = num(operands[1]);
-          nextLine(0, -state.text.leading);
-          show(i, [operands[2] ?? []], 0);
-          break;
-        case "g":
-          state.colorSpace = "gray";
-          state.color = { space: "gray", components: [num(operands[0])] };
-          break;
-        case "rg":
-          state.colorSpace = "rgb";
-          state.color = { space: "rgb", components: operands.slice(0, 3).map(num) };
-          break;
-        case "k":
-          state.colorSpace = "cmyk";
-          state.color = { space: "cmyk", components: operands.slice(0, 4).map(num) };
-          break;
-        case "cs": {
-          const name = operands[0];
-          state.colorSpace = isName(name) ? this.#colorSpace(name.value, resources) : "other";
-          state.color = initialColor(state.colorSpace);
-          break;
-        }
-        case "sc":
-        case "scn":
-          state.color = colorFrom(state.colorSpace, operands.filter((o): o is number => typeof o === "number"));
-          break;
-        case "gs": {
-          const name = operands[0];
-          if (isName(name)) this.#applyExtGState(name.value, resources, state);
-          break;
-        }
-        case "Do": {
-          const name = operands[0];
-          if (!isName(name)) break;
-          const image = this.trackPaints ? this.#image(name.value, resources) : null;
-          if (image) {
-            this.paints.push({ key: `${path}${i}`, kind: "image", points: unitSquare(), name: name.value, ref: image.ref });
-          } else {
-            this.#drawForm(name.value, resources, `${path}${i}/`, state, depth, visiting);
-          }
-          break;
-        }
-        case "BI":
-          if (this.trackPaints) this.paints.push({ key: `${path}${i}`, kind: "image", points: unitSquare() });
-          break;
-        case "m":
-        case "l":
-          addPoints(operands.slice(0, 2).map(num));
-          break;
-        case "c":
-          addPoints(operands.slice(0, 6).map(num));
-          break;
-        case "v":
-        case "y":
-          addPoints(operands.slice(0, 4).map(num));
-          break;
-        case "re": {
-          const [x, y, w, h] = operands.slice(0, 4).map(num);
-          addPoints([x, y, x + w, y, x + w, y + h, x, y + h]);
-          break;
-        }
-        case "S":
-        case "s":
-        case "f":
-        case "F":
-        case "f*":
-        case "B":
-        case "B*":
-        case "b":
-        case "b*":
-          if (this.trackPaints && pathPoints.length > 0) {
-            this.paints.push({ key: `${path}${i}`, kind: "path", points: pathPoints });
-          }
-          pathPoints = [];
-          break;
-        case "n":
-          pathPoints = [];
-          break;
-        case "sh":
-          if (this.trackPaints) this.paints.push({ key: `${path}${i}`, kind: "shading", points: [] });
-          break;
-      }
-      if (top && this.trackCtm) this.ctmAfter.push(state.ctm);
+      if (run.top) this.topOp = String(i);
+      OPERATORS.get(op)?.(run, operands, i);
+      if (run.top && this.trackCtm) this.ctmAfter.push(run.state.ctm);
     }
-    if (top) this.#topOp = undefined;
+    if (run.top) this.topOp = undefined;
   }
 
-  /** Top-level operation and text object currently being executed (for forms). */
-  #topOp: string | undefined;
-  #topTextObject: number | undefined;
-
-  #colorSpace(name: string, resources: PDFDict | undefined): FillColor["space"] | "other" {
+  colorSpace(name: string, resources: PDFDict | undefined): FillColor["space"] | "other" {
     if (name === "DeviceGray" || name === "G" || name === "CalGray") return "gray";
     if (name === "DeviceRGB" || name === "RGB" || name === "CalRGB") return "rgb";
     if (name === "DeviceCMYK" || name === "CMYK") return "cmyk";
     const spaces = dictOf(this.context, resources?.get(PDFName.of("ColorSpace")));
     const value = resolve(this.context, spaces?.get(PDFName.of(name)));
-    if (value instanceof PDFName) return this.#colorSpace(value.decodeText(), undefined);
-    const array = value instanceof PDFArray ? value : undefined;
-    if (!array) return "other";
-    const family = nameOf(this.context, array.get(0));
+    if (value instanceof PDFName) return this.colorSpace(value.decodeText(), undefined);
+    if (!(value instanceof PDFArray)) return "other";
+    const family = nameOf(this.context, value.get(0));
     if (family === "ICCBased") {
-      const stream = resolve(this.context, array.get(1));
+      const stream = resolve(this.context, value.get(1));
       const n = stream instanceof PDFStream ? numberOf(this.context, stream.dict.get(PDFName.of("N")), 3) : 3;
-      return n === 1 ? "gray" : n === 4 ? "cmyk" : "rgb";
+      if (n === 1) return "gray";
+      return n === 4 ? "cmyk" : "rgb";
     }
     if (family === "CalGray") return "gray";
     if (family === "CalRGB" || family === "Lab") return "rgb";
@@ -486,15 +259,16 @@ class Interpreter {
   }
 
   /** The image XObject called `name`, or null when it is not an image. */
-  #image(name: string, resources: PDFDict | undefined): { ref: PDFRef | undefined } | null {
+  image(name: string, resources: PDFDict | undefined): { ref: PDFRef | undefined } | null {
     const xobjects = dictOf(this.context, resources?.get(PDFName.of("XObject")));
     const raw = xobjects?.get(PDFName.of(name));
     const stream = resolve(this.context, raw);
-    if (!(stream instanceof PDFStream) || nameOf(this.context, stream.dict.get(PDFName.of("Subtype"))) !== "Image") return null;
+    if (!(stream instanceof PDFStream) || nameOf(this.context, stream.dict.get(PDFName.of("Subtype"))) !== "Image")
+      return null;
     return { ref: raw instanceof PDFRef ? raw : undefined };
   }
 
-  #applyExtGState(name: string, resources: PDFDict | undefined, state: GraphicsState): void {
+  applyExtGState(name: string, resources: PDFDict | undefined, state: GraphicsState): void {
     const states = dictOf(this.context, resources?.get(PDFName.of("ExtGState")));
     const gs = dictOf(this.context, states?.get(PDFName.of(name)));
     if (!gs) return;
@@ -509,14 +283,8 @@ class Interpreter {
     }
   }
 
-  #drawForm(
-    name: string,
-    resources: PDFDict | undefined,
-    path: string,
-    state: GraphicsState,
-    depth: number,
-    visiting: Set<string>,
-  ): void {
+  drawForm(name: string, scope: RunScope, path: string, state: GraphicsState): void {
+    const { resources, depth, visiting } = scope;
     if (depth >= MAX_FORM_DEPTH) return;
     const xobjects = dictOf(this.context, resources?.get(PDFName.of("XObject")));
     const raw = xobjects?.get(PDFName.of(name));
@@ -537,15 +305,343 @@ class Interpreter {
     this.forms.set(path, { path, stream, bytes, operations, resources: formResources });
 
     const inner = cloneState(state);
-    if (matrix && matrix.length === 6) inner.ctm = multiply(state.ctm, matrix as Matrix);
-    const outerTextObject = this.#topTextObject;
-    if (depth === 0) this.#topTextObject = this.#textObjects++;
+    if (matrix?.length === 6) inner.ctm = multiply(state.ctm, matrix as Matrix);
+    const outerTextObject = this.topTextObject;
+    if (depth === 0) this.topTextObject = this.textObjects++;
     visiting.add(id);
     this.run(operations, formResources, path, inner, depth + 1, visiting);
     visiting.delete(id);
-    if (depth === 0) this.#topTextObject = outerTextObject;
+    if (depth === 0) this.topTextObject = outerTextObject;
   }
 }
+
+/** Where a content stream runs: its resources, its form path and how deep in forms. */
+interface RunScope {
+  resources: PDFDict | undefined;
+  /** "" for the page's own content, "12/" for a form drawn by operation 12, and so on. */
+  path: string;
+  depth: number;
+  visiting: Set<string>;
+}
+
+/** The state of one content stream while it is read: graphics, text and the path being built. */
+class ContentRun {
+  readonly stack: GraphicsState[] = [];
+  readonly top: boolean;
+  state: GraphicsState;
+  tm: Matrix = [...IDENTITY];
+  tlm: Matrix = [...IDENTITY];
+  /** Glyphs of the current text object (top level), whose insertion point is its ET. */
+  pending: Glyph[] = [];
+  textObject = -1;
+  /** Points of the path being built, already in page user space. */
+  pathPoints: [number, number][] = [];
+
+  constructor(
+    readonly interpreter: Interpreter,
+    readonly scope: RunScope,
+    initial: GraphicsState,
+  ) {
+    this.top = scope.path === "";
+    this.state = initial;
+  }
+
+  key(i: number): string {
+    return `${this.scope.path}${i}`;
+  }
+
+  addPoints(values: number[]): void {
+    if (!this.interpreter.trackPaints) return;
+    for (let k = 0; k + 1 < values.length; k += 2)
+      this.pathPoints.push(applyToPoint(this.state.ctm, values[k], values[k + 1]));
+  }
+
+  unitSquare(): [number, number][] {
+    const { ctm } = this.state;
+    return [applyToPoint(ctm, 0, 0), applyToPoint(ctm, 1, 0), applyToPoint(ctm, 1, 1), applyToPoint(ctm, 0, 1)];
+  }
+
+  paint(area: PaintedArea): void {
+    if (this.interpreter.trackPaints) this.interpreter.paints.push(area);
+  }
+
+  /** A path painting operator: the path is recorded (when it has points) and ends. */
+  paintPath(i: number): void {
+    if (this.pathPoints.length > 0) this.paint({ key: this.key(i), kind: "path", points: this.pathPoints });
+    this.pathPoints = [];
+  }
+
+  setFont(name: Operand | undefined, size: Operand | undefined): void {
+    const fontDict = dictOf(this.interpreter.context, this.scope.resources?.get(PDFName.of("Font")));
+    const object = isName(name) ? fontDict?.get(PDFName.of(name.value)) : undefined;
+    this.state.text.font = object ? this.interpreter.fonts.get(object) : undefined;
+    this.state.text.fontObject = object;
+    this.state.text.size = num(size);
+  }
+
+  nextLine(tx: number, ty: number): void {
+    this.tlm = multiply(this.tlm, [1, 0, 0, 1, tx, ty]);
+    this.tm = [...this.tlm];
+  }
+
+  beginText(): void {
+    this.tm = [...IDENTITY];
+    this.tlm = [...IDENTITY];
+    this.textObject = this.interpreter.textObjects++;
+  }
+
+  endText(i: number): void {
+    if (this.top) for (const glyph of this.pending) glyph.insertAfter = String(i);
+    this.pending = [];
+  }
+
+  /** Shows strings and adjustments (TJ arrays and the other text operators). */
+  show(opIndex: number, items: Operand[]): void {
+    let index = 0;
+    for (const item of items) {
+      if (typeof item === "number") this.#adjust(item);
+      else if (isString(item)) index = this.#showString(opIndex, item.bytes, index);
+    }
+  }
+
+  /** A number in a TJ array moves the next glyph back (or down, in vertical text). */
+  #adjust(amount: number): void {
+    const { text } = this.state;
+    if (text.font?.vertical) this.tm = multiply(this.tm, [1, 0, 0, 1, 0, (-amount / 1000) * text.size]);
+    else this.tm = multiply(this.tm, [1, 0, 0, 1, (-amount / 1000) * text.size * text.hScale, 0]);
+  }
+
+  #showString(opIndex: number, bytes: Uint8Array, firstIndex: number): number {
+    const { text } = this.state;
+    const font = text.font;
+    if (!font || !text.fontObject) return firstIndex;
+    let index = firstIndex;
+    for (const read of font.readCodes(bytes)) {
+      const spacing = text.charSpacing + (read.length === 1 && read.code === 32 ? text.wordSpacing : 0);
+      const glyph = this.#glyph(opIndex, index, read, font, text.fontObject, spacing);
+      this.interpreter.glyphs.push(glyph);
+      if (this.top) this.pending.push(glyph);
+      const move: Matrix = font.vertical ? [1, 0, 0, 1, 0, -(text.size + spacing)] : [1, 0, 0, 1, glyph.advance, 0];
+      this.tm = multiply(this.tm, move);
+      index++;
+    }
+    return index;
+  }
+
+  #glyph(opIndex: number, index: number, read: CodeRead, font: PdfFont, fontObject: PDFObject, spacing: number): Glyph {
+    const { text } = this.state;
+    const { path } = this.scope;
+    const w0 = font.width(read.code) * font.scale;
+    return {
+      key: `${path}${opIndex}:${index}`,
+      path,
+      op: opIndex,
+      index,
+      code: read.code,
+      length: read.length,
+      unicode: font.unicode(read.code),
+      font,
+      fontObject,
+      size: text.size,
+      hScale: text.hScale,
+      charSpacing: text.charSpacing,
+      wordSpacing: text.wordSpacing,
+      rise: text.rise,
+      renderMode: text.renderMode,
+      textMatrix: this.tm,
+      ctm: this.state.ctm,
+      advance: font.vertical ? 0 : (w0 * text.size + spacing) * text.hScale,
+      width: w0 * text.size * text.hScale,
+      color: this.state.color,
+      alpha: this.state.alpha,
+      insertAfter: this.top ? "end" : (this.interpreter.topOp ?? "end"),
+      textObject: this.interpreter.topTextObject ?? this.textObject,
+      vertical: font.vertical,
+    };
+  }
+
+  /** Draws an XObject: images are recorded (when painting is tracked), forms are run. */
+  drawXObject(name: Operand | undefined, i: number): void {
+    if (!isName(name)) return;
+    const image = this.interpreter.trackPaints ? this.interpreter.image(name.value, this.scope.resources) : null;
+    if (image) {
+      this.paint({ key: this.key(i), kind: "image", points: this.unitSquare(), name: name.value, ref: image.ref });
+    } else {
+      this.interpreter.drawForm(name.value, this.scope, `${this.key(i)}/`, this.state);
+    }
+  }
+
+  setColorSpace(name: Operand | undefined): void {
+    this.state.colorSpace = isName(name) ? this.interpreter.colorSpace(name.value, this.scope.resources) : "other";
+    this.state.color = initialColor(this.state.colorSpace);
+  }
+}
+
+type OperatorHandler = (run: ContentRun, operands: Operand[], i: number) => void;
+
+const coordinates = (operands: Operand[], count: number) => operands.slice(0, count).map(num);
+
+/** A text-showing operator that first moves to the next line ("'" and '"'). */
+const showOnNextLine = (run: ContentRun, item: Operand | undefined, i: number) => {
+  run.nextLine(0, -run.state.text.leading);
+  run.show(i, [item ?? []]);
+};
+
+const PATH_PAINTING = ["S", "s", "f", "F", "f*", "B", "B*", "b", "b*"];
+
+/** What each content stream operator does to the state being followed. */
+const OPERATORS = new Map<string, OperatorHandler>([
+  ["q", (run) => run.stack.push(cloneState(run.state))],
+  [
+    "Q",
+    (run) => {
+      const previous = run.stack.pop();
+      if (previous) run.state = previous;
+    },
+  ],
+  [
+    "cm",
+    (run, operands) => {
+      if (operands.length >= 6)
+        run.state = { ...run.state, ctm: multiply(run.state.ctm, coordinates(operands, 6) as Matrix) };
+    },
+  ],
+  ["BT", (run) => run.beginText()],
+  ["ET", (run, _operands, i) => run.endText(i)],
+  ["Tf", (run, operands) => run.setFont(operands[0], operands[1])],
+  [
+    "Tc",
+    (run, operands) => {
+      run.state.text.charSpacing = num(operands[0]);
+    },
+  ],
+  [
+    "Tw",
+    (run, operands) => {
+      run.state.text.wordSpacing = num(operands[0]);
+    },
+  ],
+  [
+    "Tz",
+    (run, operands) => {
+      run.state.text.hScale = num(operands[0]) / 100;
+    },
+  ],
+  [
+    "TL",
+    (run, operands) => {
+      run.state.text.leading = num(operands[0]);
+    },
+  ],
+  [
+    "Ts",
+    (run, operands) => {
+      run.state.text.rise = num(operands[0]);
+    },
+  ],
+  [
+    "Tr",
+    (run, operands) => {
+      run.state.text.renderMode = num(operands[0]);
+    },
+  ],
+  ["Td", (run, operands) => run.nextLine(num(operands[0]), num(operands[1]))],
+  [
+    "TD",
+    (run, operands) => {
+      run.state.text.leading = -num(operands[1]);
+      run.nextLine(num(operands[0]), num(operands[1]));
+    },
+  ],
+  [
+    "Tm",
+    (run, operands) => {
+      run.tlm = coordinates(operands, 6) as Matrix;
+      run.tm = [...run.tlm];
+    },
+  ],
+  ["T*", (run) => run.nextLine(0, -run.state.text.leading)],
+  ["Tj", (run, operands, i) => run.show(i, [operands[0] ?? []])],
+  ["TJ", (run, operands, i) => run.show(i, Array.isArray(operands[0]) ? operands[0] : [])],
+  ["'", (run, operands, i) => showOnNextLine(run, operands[0], i)],
+  [
+    '"',
+    (run, operands, i) => {
+      run.state.text.wordSpacing = num(operands[0]);
+      run.state.text.charSpacing = num(operands[1]);
+      showOnNextLine(run, operands[2], i);
+    },
+  ],
+  [
+    "g",
+    (run, operands) => {
+      run.state.colorSpace = "gray";
+      run.state.color = { space: "gray", components: [num(operands[0])] };
+    },
+  ],
+  [
+    "rg",
+    (run, operands) => {
+      run.state.colorSpace = "rgb";
+      run.state.color = { space: "rgb", components: coordinates(operands, 3) };
+    },
+  ],
+  [
+    "k",
+    (run, operands) => {
+      run.state.colorSpace = "cmyk";
+      run.state.color = { space: "cmyk", components: coordinates(operands, 4) };
+    },
+  ],
+  ["cs", (run, operands) => run.setColorSpace(operands[0])],
+  [
+    "sc",
+    (run, operands) => {
+      run.state.color = colorFrom(
+        run.state.colorSpace,
+        operands.filter((o): o is number => typeof o === "number"),
+      );
+    },
+  ],
+  [
+    "scn",
+    (run, operands) => {
+      run.state.color = colorFrom(
+        run.state.colorSpace,
+        operands.filter((o): o is number => typeof o === "number"),
+      );
+    },
+  ],
+  [
+    "gs",
+    (run, operands) => {
+      const name = operands[0];
+      if (isName(name)) run.interpreter.applyExtGState(name.value, run.scope.resources, run.state);
+    },
+  ],
+  ["Do", (run, operands, i) => run.drawXObject(operands[0], i)],
+  ["BI", (run, _operands, i) => run.paint({ key: run.key(i), kind: "image", points: run.unitSquare() })],
+  ["m", (run, operands) => run.addPoints(coordinates(operands, 2))],
+  ["l", (run, operands) => run.addPoints(coordinates(operands, 2))],
+  ["c", (run, operands) => run.addPoints(coordinates(operands, 6))],
+  ["v", (run, operands) => run.addPoints(coordinates(operands, 4))],
+  ["y", (run, operands) => run.addPoints(coordinates(operands, 4))],
+  [
+    "re",
+    (run, operands) => {
+      const [x, y, w, h] = coordinates(operands, 4);
+      run.addPoints([x, y, x + w, y, x + w, y + h, x, y + h]);
+    },
+  ],
+  ...PATH_PAINTING.map((op): [string, OperatorHandler] => [op, (run, _operands, i) => run.paintPath(i)]),
+  [
+    "n",
+    (run) => {
+      run.pathPoints = [];
+    },
+  ],
+  ["sh", (run, _operands, i) => run.paint({ key: run.key(i), kind: "shading", points: [] })],
+]);
 
 function initialColor(space: GraphicsState["colorSpace"]): FillColor {
   if (space === "rgb") return { space: "rgb", components: [0, 0, 0] };
@@ -578,7 +674,7 @@ export function renderingMatrix(glyph: Glyph): Matrix {
 export function glyphQuad(glyph: Glyph): [number, number][] {
   const m = renderingMatrix(glyph);
   const em = glyph.size * glyph.hScale;
-  const w = em !== 0 ? glyph.width / em : 0;
+  const w = em === 0 ? 0 : glyph.width / em;
   const { ascent, descent } = glyph.font;
   return [
     applyToPoint(m, 0, descent),

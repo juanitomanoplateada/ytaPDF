@@ -117,11 +117,11 @@ async function apply(doc: PDFDocument, specs: NativeSpec[]): Promise<Uint8Array>
 describe("parseContent", () => {
   it("keeps the byte range of each operation and skips inline image data", () => {
     const source = "BT /F1 12 Tf (a\\)b(c)) Tj [<0041> -20 (d)] TJ ET\nBI /W 1 /H 1 ID \u0000ÿEI Q";
-    const bytes = Uint8Array.from(source, (c) => c.charCodeAt(0));
+    const bytes = Uint8Array.from(source, (c) => c.codePointAt(0) ?? 0);
     const ops = parseContent(bytes);
     expect(ops.map((o) => o.op)).toEqual(["BT", "Tf", "Tj", "TJ", "ET", "BI", "Q"]);
     const tj = ops[2];
-    expect(source.slice(tj.start, tj.end)).toBe("(a\\)b(c)) Tj");
+    expect(source.slice(tj.start, tj.end)).toBe(String.raw`(a\)b(c)) Tj`);
     expect(new TextDecoder().decode((tj.operands[0] as { bytes: Uint8Array }).bytes)).toBe("a)b(c)");
     expect(source.slice(ops[5].start, ops[5].end)).toBe("BI /W 1 /H 1 ID \u0000ÿEI");
   });
@@ -285,7 +285,7 @@ describe("content that is rewritten", () => {
   it("keeps inline images and content split across several streams", async () => {
     const image = "BI /W 2 /H 1 /CS /G /BPC 8 ID \u0000ÿ EI";
     const bytes = await pdfWith(null, async (doc, page) => {
-      const first = doc.context.flateStream(Uint8Array.from(`q 10 0 0 10 50 50 cm ${image} Q BT /F1 12 Tf 50 300 Td (Uno) Tj`, (c) => c.charCodeAt(0)));
+      const first = doc.context.flateStream(Uint8Array.from(`q 10 0 0 10 50 50 cm ${image} Q BT /F1 12 Tf 50 300 Td (Uno) Tj`, (c) => c.codePointAt(0) ?? 0));
       const second = doc.context.flateStream(encoder.encode(" (Dos) Tj ET BT /F1 12 Tf 50 250 Td (Tres) Tj ET"));
       page.node.set(PDFName.of("Contents"), doc.context.obj([doc.context.register(first), doc.context.register(second)]));
     });
@@ -297,7 +297,7 @@ describe("content that is rewritten", () => {
     const reread = await PDFDocument.load(output);
     const content = interpretPage(reread.getPage(0), new FontCache(reread.context));
     const inline = content.operations.find((o) => o.op === "BI")!;
-    expect(Array.from(content.bytes.subarray(inline.start, inline.end), (c) => String.fromCharCode(c)).join("")).toBe(image);
+    expect(Array.from(content.bytes.subarray(inline.start, inline.end), (c) => String.fromCodePoint(c)).join("")).toBe(image);
   });
 
   it("erases text shown with the ' and \" operators", async () => {
@@ -442,47 +442,47 @@ describe("TextDocument", () => {
   });
 });
 
-describe("fonts written like word processors do", () => {
-  /** A simple TrueType font with WinAnsi encoding and explicit widths, as Word writes them. */
-  async function wordLikePdf(content: string): Promise<Uint8Array> {
-    const program = fontkit.create(NOTO_SANS as never) as unknown as {
-      unitsPerEm: number;
-      glyphForCodePoint(cp: number): { advanceWidth: number };
-    };
-    const winAnsi = new TextDecoder("windows-1252");
-    const widths: number[] = [];
-    for (let code = 32; code <= 255; code++) {
-      const char = winAnsi.decode(Uint8Array.of(code));
-      widths.push(Math.round((program.glyphForCodePoint(char.codePointAt(0)!).advanceWidth * 1000) / program.unitsPerEm));
-    }
-    return pdfWith(content, async (doc, page) => {
-      const file = doc.context.flateStream(NOTO_SANS);
-      const descriptor = doc.context.obj({
-        Type: "FontDescriptor",
-        FontName: "ABCDEF+NotoSans-Regular",
-        Flags: 32,
-        Ascent: 1069,
-        Descent: -293,
-        ItalicAngle: 0,
-        FontBBox: [-621, -389, 2800, 1067],
-        StemV: 80,
-        FontFile2: doc.context.register(file),
-      });
-      const font = doc.context.obj({
-        Type: "Font",
-        Subtype: "TrueType",
-        BaseFont: "ABCDEF+NotoSans-Regular",
-        Encoding: "WinAnsiEncoding",
-        FirstChar: 32,
-        LastChar: 255,
-        Widths: widths,
-        FontDescriptor: doc.context.register(descriptor),
-      });
-      const resources = page.node.get(PDFName.of("Resources")) as unknown as { lookup(k: PDFName): { set(k: PDFName, v: unknown): void } };
-      resources.lookup(PDFName.of("Font")).set(PDFName.of("TT0"), doc.context.register(font));
-    });
+/** A simple TrueType font with WinAnsi encoding and explicit widths, as Word writes them. */
+async function wordLikePdf(content: string): Promise<Uint8Array> {
+  const program = fontkit.create(NOTO_SANS as never) as unknown as {
+    unitsPerEm: number;
+    glyphForCodePoint(cp: number): { advanceWidth: number };
+  };
+  const winAnsi = new TextDecoder("windows-1252");
+  const widths: number[] = [];
+  for (let code = 32; code <= 255; code++) {
+    const char = winAnsi.decode(Uint8Array.of(code));
+    widths.push(Math.round((program.glyphForCodePoint(char.codePointAt(0)!).advanceWidth * 1000) / program.unitsPerEm));
   }
+  return pdfWith(content, async (doc, page) => {
+    const file = doc.context.flateStream(NOTO_SANS);
+    const descriptor = doc.context.obj({
+      Type: "FontDescriptor",
+      FontName: "ABCDEF+NotoSans-Regular",
+      Flags: 32,
+      Ascent: 1069,
+      Descent: -293,
+      ItalicAngle: 0,
+      FontBBox: [-621, -389, 2800, 1067],
+      StemV: 80,
+      FontFile2: doc.context.register(file),
+    });
+    const font = doc.context.obj({
+      Type: "Font",
+      Subtype: "TrueType",
+      BaseFont: "ABCDEF+NotoSans-Regular",
+      Encoding: "WinAnsiEncoding",
+      FirstChar: 32,
+      LastChar: 255,
+      Widths: widths,
+      FontDescriptor: doc.context.register(descriptor),
+    });
+    const resources = page.node.get(PDFName.of("Resources")) as unknown as { lookup(k: PDFName): { set(k: PDFName, v: unknown): void } };
+    resources.lookup(PDFName.of("Font")).set(PDFName.of("TT0"), doc.context.register(font));
+  });
+}
 
+describe("fonts written like word processors do", () => {
   it("reads kerned text and rewrites it with the same font, checking glyphs in the program", async () => {
     const bytes = await wordLikePdf(
       "BT /TT0 12 Tf 50 300 Td [(W)60(ord)-10( )-20(k)8(erning)] TJ ET BT /TT0 12 Tf 50 250 Td (Testigo) Tj ET",

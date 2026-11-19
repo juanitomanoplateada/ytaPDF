@@ -59,10 +59,12 @@ export async function readOutline(pdf: PDFDocumentProxy): Promise<SourceOutlineI
       const explicit = typeof dest === "string" ? await pdf.getDestination(dest) : dest;
       if (!Array.isArray(explicit) || explicit.length === 0) return { pageIndex: null, top: null };
       const [ref, mode, ...args] = explicit as [unknown, { name?: string } | undefined, ...unknown[]];
-      const pageIndex =
-        typeof ref === "number" ? ref : ref && typeof ref === "object" ? await pdf.getPageIndex(ref as never) : null;
-      const top =
-        mode?.name === "XYZ" ? args[1] : mode?.name === "FitH" || mode?.name === "FitBH" ? args[0] : null;
+      let pageIndex: number | null = null;
+      if (typeof ref === "number") pageIndex = ref;
+      else if (ref && typeof ref === "object") pageIndex = await pdf.getPageIndex(ref as never);
+      let top: unknown = null;
+      if (mode?.name === "XYZ") top = args[1];
+      else if (mode?.name === "FitH" || mode?.name === "FitBH") top = args[0];
       return { pageIndex, top: typeof top === "number" ? top : null };
     } catch {
       return { pageIndex: null, top: null };

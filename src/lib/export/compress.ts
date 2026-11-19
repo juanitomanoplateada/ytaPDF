@@ -57,22 +57,25 @@ const numberIn = (dict: PDFDict, key: string): number | undefined => {
   return typeof value?.asNumber === "function" ? value.asNumber() : undefined;
 };
 
+/** Colour kind of a number of components (1 or 3), or null. */
+const componentsKind = (n: number | undefined): "rgb" | "gray" | null => {
+  if (n === 3) return "rgb";
+  return n === 1 ? "gray" : null;
+};
+
 /** "rgb", "gray" or null for colour spaces a browser cannot be trusted to keep (CMYK, indexed…). */
 function colorKind(dict: PDFDict): "rgb" | "gray" | null {
   const space = dict.lookup(PDFName.of("ColorSpace"));
   if (space instanceof PDFName) {
     const name = space.decodeText();
-    return name === "DeviceRGB" ? "rgb" : name === "DeviceGray" ? "gray" : null;
+    if (name === "DeviceRGB") return "rgb";
+    return name === "DeviceGray" ? "gray" : null;
   }
-  if (space instanceof PDFArray && space.lookup(0) instanceof PDFName) {
-    const family = (space.lookup(0) as PDFName).decodeText();
-    const profile = space.lookup(1);
-    if (family === "ICCBased" && profile instanceof PDFStream) {
-      const n = numberIn(profile.dict, "N");
-      return n === 3 ? "rgb" : n === 1 ? "gray" : null;
-    }
-  }
-  return null;
+  if (!(space instanceof PDFArray)) return null;
+  const family = space.lookup(0);
+  const profile = space.lookup(1);
+  if (!(family instanceof PDFName) || family.decodeText() !== "ICCBased" || !(profile instanceof PDFStream)) return null;
+  return componentsKind(numberIn(profile.dict, "N"));
 }
 
 /** Whether an image is a plain 8-bit JPEG this module can re-encode without changing its colours. */
@@ -118,52 +121,66 @@ export async function compressImages(
   recode: ImageRecoder,
 ): Promise<CompressionReport> {
   const report: CompressionReport = { images: 0, before: 0, after: 0 };
-  const { context } = doc;
-  for (const { ref, width: shownWidth, height: shownHeight } of displaySizes(pages, fonts).values()) {
-    const stream = context.lookup(ref);
-    if (!(stream instanceof PDFRawStream) || !isRecodableJpeg(stream)) continue;
-    const width = numberIn(stream.dict, "Width") ?? 0;
-    const height = numberIn(stream.dict, "Height") ?? 0;
-    if (width <= 0 || height <= 0) continue;
-
-    // Pixels needed to show the image at `maxDpi` where it is largest.
-    const needed = Math.max(
-      ((shownWidth / 72) * options.maxDpi) / width,
-      ((shownHeight / 72) * options.maxDpi) / height,
-    );
-    const scale = needed < MIN_DOWNSCALE ? Math.max(needed, 16 / Math.min(width, height)) : 1;
-    const targetWidth = Math.max(1, Math.round(width * Math.min(1, scale)));
-    const targetHeight = Math.max(1, Math.round(height * Math.min(1, scale)));
-
-    const original = stream.getContents();
-    let bytes: Uint8Array | null = null;
-    try {
-      bytes = await recode({ bytes: original, width, height, targetWidth, targetHeight, quality: options.quality });
-    } catch (error) {
-      console.error("No se pudo recomprimir una imagen:", error);
-    }
-    if (!bytes || bytes.length > original.length * (1 - MIN_SAVING)) continue;
-
-    const dict = context.obj({});
-    for (const [key, value] of stream.dict.entries()) {
-      const name = key.decodeText();
-      if (["Length", "Filter", "DecodeParms", "Width", "Height"].includes(name)) continue;
-      dict.set(key, value);
-    }
-    dict.set(PDFName.of("Filter"), PDFName.of("DCTDecode"));
-    dict.set(PDFName.of("Width"), context.obj(targetWidth));
-    dict.set(PDFName.of("Height"), context.obj(targetHeight));
-    dict.set(PDFName.of("BitsPerComponent"), context.obj(8));
-    // Browsers always encode three channels.
-    if (colorKind(stream.dict) === "gray") dict.set(PDFName.of("ColorSpace"), PDFName.of("DeviceRGB"));
-    context.assign(ref, PDFRawStream.of(dict, bytes));
-
+  for (const shown of displaySizes(pages, fonts).values()) {
+    const result = await recompress(doc, shown, options, recode);
+    if (!result) continue;
     report.images++;
-    report.before += original.length;
-    report.after += bytes.length;
+    report.before += result.before;
+    report.after += result.after;
   }
   return report;
 }
+
+/** Pixels an image needs to be shown at `maxDpi` where it is largest, never more than it has. */
+function targetSize(width: number, height: number, shown: { width: number; height: number }, maxDpi: number) {
+  const needed = Math.max(((shown.width / 72) * maxDpi) / width, ((shown.height / 72) * maxDpi) / height);
+  const scale = needed < MIN_DOWNSCALE ? Math.max(needed, 16 / Math.min(width, height)) : 1;
+  return {
+    targetWidth: Math.max(1, Math.round(width * Math.min(1, scale))),
+    targetHeight: Math.max(1, Math.round(height * Math.min(1, scale))),
+  };
+}
+
+/** Re-encodes one image in place. Returns its sizes, or null when it was left as it was. */
+async function recompress(
+  doc: PDFDocument,
+  shown: { ref: PDFRef; width: number; height: number },
+  options: CompressionOptions,
+  recode: ImageRecoder,
+): Promise<{ before: number; after: number } | null> {
+  const { context } = doc;
+  const stream = context.lookup(shown.ref);
+  if (!(stream instanceof PDFRawStream) || !isRecodableJpeg(stream)) return null;
+  const width = numberIn(stream.dict, "Width") ?? 0;
+  const height = numberIn(stream.dict, "Height") ?? 0;
+  if (width <= 0 || height <= 0) return null;
+  const { targetWidth, targetHeight } = targetSize(width, height, shown, options.maxDpi);
+
+  const original = stream.getContents();
+  let bytes: Uint8Array | null = null;
+  try {
+    bytes = await recode({ bytes: original, width, height, targetWidth, targetHeight, quality: options.quality });
+  } catch (error) {
+    console.error("No se pudo recomprimir una imagen:", error);
+  }
+  if (!bytes || bytes.length > original.length * (1 - MIN_SAVING)) return null;
+
+  const dict = context.obj({});
+  for (const [key, value] of stream.dict.entries()) {
+    if (!REPLACED_KEYS.has(key.decodeText())) dict.set(key, value);
+  }
+  dict.set(PDFName.of("Filter"), PDFName.of("DCTDecode"));
+  dict.set(PDFName.of("Width"), context.obj(targetWidth));
+  dict.set(PDFName.of("Height"), context.obj(targetHeight));
+  dict.set(PDFName.of("BitsPerComponent"), context.obj(8));
+  // Browsers always encode three channels.
+  if (colorKind(stream.dict) === "gray") dict.set(PDFName.of("ColorSpace"), PDFName.of("DeviceRGB"));
+  context.assign(shown.ref, PDFRawStream.of(dict, bytes));
+  return { before: original.length, after: bytes.length };
+}
+
+/** Image dictionary entries the re-encoded copy writes anew. */
+const REPLACED_KEYS = new Set(["Length", "Filter", "DecodeParms", "Width", "Height"]);
 
 /** The browser's own decoder and encoder. */
 export const browserRecoder: ImageRecoder = async ({ bytes, width, height, targetWidth, targetHeight, quality }) => {

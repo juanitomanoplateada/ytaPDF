@@ -5,7 +5,7 @@
 
 export type ParsedLink = { kind: "page"; number: number } | { kind: "url"; url: string } | { kind: "invalid" };
 
-const SAFE_SCHEMES = ["http:", "https:", "mailto:", "tel:"];
+const SAFE_SCHEMES = new Set(["http:", "https:", "mailto:", "tel:"]);
 
 export function parseLinkInput(value: string): ParsedLink {
   const text = value.trim();
@@ -16,7 +16,7 @@ export function parseLinkInput(value: string): ParsedLink {
   const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(text)?.[1];
   if (scheme) {
     // Anything that could run code or open local files stays out of the PDF.
-    return SAFE_SCHEMES.includes(`${scheme.toLowerCase()}:`) ? { kind: "url", url: text } : { kind: "invalid" };
+    return SAFE_SCHEMES.has(`${scheme.toLowerCase()}:`) ? { kind: "url", url: text } : { kind: "invalid" };
   }
   if (/^[^@/]+@[^@/]+\.[^@/]+$/.test(text)) return { kind: "url", url: `mailto:${text}` };
   if (/^[^./]+(\.[^./]+)+/.test(text)) return { kind: "url", url: `https://${text}` };

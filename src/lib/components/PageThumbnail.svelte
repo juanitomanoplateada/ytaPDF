@@ -42,7 +42,15 @@
     // Repaints caused by editing are debounced; the first paint is immediate.
     const delay = untrack(() => ready) ? 250 : 0;
     const timer = setTimeout(() => {
-      renderThumbnail(canvas, source, ref, cssWidth, data, formRevision, untrack(() => editor.formValues[ref.sourceId] ?? {}), controller.signal)
+      renderThumbnail(canvas, {
+        source,
+        page: ref,
+        cssWidth,
+        annotations: data,
+        formRevision,
+        formValues: untrack(() => editor.formValues[ref.sourceId] ?? {}),
+        signal: controller.signal,
+      })
         .then(() => {
           if (!controller.signal.aborted) ready = true;
         })

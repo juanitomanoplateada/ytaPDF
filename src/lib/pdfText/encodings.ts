@@ -98,9 +98,9 @@ function addName(name: string, value: string): void {
   if (name && !NAME_TO_UNICODE.has(name)) NAME_TO_UNICODE.set(name, value);
 }
 
-ASCII_NAMES.forEach((name, i) => addName(name, String.fromCharCode(32 + i)));
+ASCII_NAMES.forEach((name, i) => addName(name, String.fromCodePoint(32 + i)));
 LATIN1_NAMES.forEach((name, i) => {
-  if (i > 0) addName(name, String.fromCharCode(160 + i));
+  if (i > 0) addName(name, String.fromCodePoint(160 + i));
 });
 {
   const parts = EXTRA_NAMES.split(" ");
@@ -125,21 +125,21 @@ export function glyphNameToUnicode(name: string): string | undefined {
   }
 
   const uni = /^uni((?:[0-9A-F]{4})+)$/.exec(base);
-  if (uni) {
-    let out = "";
-    for (let i = 0; i < uni[1].length; i += 4) {
-      const value = Number.parseInt(uni[1].slice(i, i + 4), 16);
-      if (value >= 0xd800 && value <= 0xdfff) return undefined;
-      out += String.fromCharCode(value);
-    }
-    return out;
-  }
+  if (uni) return fromUniName(uni[1]);
   const u = /^u([0-9A-F]{4,6})$/.exec(base);
   if (u) {
     const value = Number.parseInt(u[1], 16);
-    return value <= 0x10ffff && (value < 0xd800 || value > 0xdfff) ? String.fromCodePoint(value) : undefined;
+    return value <= 0x10ffff && !isSurrogate(value) ? String.fromCodePoint(value) : undefined;
   }
   return undefined;
+}
+
+const isSurrogate = (value: number) => value >= 0xd800 && value <= 0xdfff;
+
+/** The text of a `uniXXXXYYYY…` name: groups of four hex digits, none of them a surrogate. */
+function fromUniName(hex: string): string | undefined {
+  const values = hex.match(/.{4}/g)?.map((group) => Number.parseInt(group, 16)) ?? [];
+  return values.some(isSurrogate) ? undefined : String.fromCodePoint(...values);
 }
 
 /** Inverse of {@link glyphNameToUnicode} for the names the tables know. */

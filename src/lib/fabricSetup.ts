@@ -456,7 +456,7 @@ function readTextStyle(text: FabricText): TextStyle {
 const ALIGNMENTS: TextAlign[] = ["left", "center", "right"];
 
 /** Paragraph settings that only plain text takes: document text keeps its own layout. */
-const PLAIN_TEXT_ONLY: (keyof TextStyle)[] = ["textAlign", "lineHeight", "linethrough"];
+const PLAIN_TEXT_ONLY = new Set<string>(["textAlign", "lineHeight", "linethrough"] satisfies (keyof TextStyle)[]);
 
 const STROKED = new Set<ObjectKind>(["rect", "ellipse", "line", "arrow", "signature", "ink", "mark"]);
 
@@ -621,33 +621,36 @@ export function ungroupSelected(canvas: Canvas): FabricObject[] {
 export function setObjectBounds(canvas: Canvas, change: BoundsChange, keepRatio: boolean): boolean {
   const active = canvas.getActiveObject();
   if (!active || selectedObjects(canvas).some(isLocked)) return false;
-  if (change.width !== undefined || change.height !== undefined) {
-    // Resizing keeps the top left corner of the box where it is.
-    const before = active.getBoundingRect();
-    const width = active.getScaledWidth();
-    const height = active.getScaledHeight();
-    let sx = change.width !== undefined && width > 0 ? change.width / width : 1;
-    let sy = change.height !== undefined && height > 0 ? change.height / height : 1;
-    // Text and proportional resizing scale both sides alike.
-    if (keepRatio || isText(active)) {
-      const factor = change.width !== undefined ? sx : sy;
-      sx = factor;
-      sy = factor;
-    }
-    if (Math.abs(sx) > 1e-3 && Math.abs(sy) > 1e-3) {
-      active.set({ scaleX: (active.scaleX || 1) * sx, scaleY: (active.scaleY || 1) * sy });
-      active.setCoords();
-      if (!(active instanceof ActiveSelection)) bakeScale(active);
-      const after = active.getBoundingRect();
-      moveBy(active, before.left - after.left, before.top - after.top);
-    }
-  }
+  if (change.width !== undefined || change.height !== undefined) resizeKeepingCorner(active, change, keepRatio);
   if (change.left !== undefined || change.top !== undefined) {
     const box = active.getBoundingRect();
-    moveBy(active, change.left !== undefined ? change.left - box.left : 0, change.top !== undefined ? change.top - box.top : 0);
+    moveBy(active, change.left === undefined ? 0 : change.left - box.left, change.top === undefined ? 0 : change.top - box.top);
   }
   canvas.requestRenderAll();
   return true;
+}
+
+/** The scale factors that give an object the requested size (text and proportional resizing scale alike). */
+function scaleFactors(object: FabricObject, change: BoundsChange, keepRatio: boolean): [number, number] {
+  const width = object.getScaledWidth();
+  const height = object.getScaledHeight();
+  const sx = change.width !== undefined && width > 0 ? change.width / width : 1;
+  const sy = change.height !== undefined && height > 0 ? change.height / height : 1;
+  if (!keepRatio && !isText(object)) return [sx, sy];
+  const factor = change.width === undefined ? sy : sx;
+  return [factor, factor];
+}
+
+/** Resizes an object (or a selection) keeping the top left corner of its box where it is. */
+function resizeKeepingCorner(active: FabricObject, change: BoundsChange, keepRatio: boolean): void {
+  const before = active.getBoundingRect();
+  const [sx, sy] = scaleFactors(active, change, keepRatio);
+  if (Math.abs(sx) <= 1e-3 || Math.abs(sy) <= 1e-3) return;
+  active.set({ scaleX: (active.scaleX || 1) * sx, scaleY: (active.scaleY || 1) * sy });
+  active.setCoords();
+  if (!(active instanceof ActiveSelection)) bakeScale(active);
+  const after = active.getBoundingRect();
+  moveBy(active, before.left - after.left, before.top - after.top);
 }
 
 /** Objects of the selection that may be edited (locked ones are skipped). */
@@ -658,30 +661,30 @@ export function editableSelection(canvas: Canvas): FabricObject[] {
 export function applyTextStyle(canvas: Canvas, style: Partial<TextStyle>): boolean {
   const texts = editableSelection(canvas).filter(isText);
   if (texts.length === 0) return false;
-  for (const text of texts) {
-    const { fontSize, ...all } = style;
-    const rest = isNative(text)
-      ? Object.fromEntries(Object.entries(all).filter(([key]) => !PLAIN_TEXT_ONLY.includes(key as keyof TextStyle)))
-      : all;
-    if (isNative(text) && Object.keys(rest).length === 0 && fontSize === undefined) continue;
-    text.set(rest);
-    if (fontSize !== undefined) text.set("fontSize", fontSize / (text.scaleY || 1));
-    if (isNative(text)) {
-      // Document text keeps a style per character (its original fonts):
-      // the change applies to every character instead of clearing them.
-      const change: Record<string, unknown> = { ...rest };
-      if (fontSize !== undefined) change.fontSize = fontSize / (text.scaleY || 1);
-      text.setSelectionStyles(change, 0, text.text.length);
-    } else if (text.styles && Object.keys(text.styles).length > 0) {
-      // Per-character styles from typing would override object-level styles.
-      text.set("styles", {});
-    }
-    text.initDimensions();
-    text.setCoords();
-  }
+  for (const text of texts) styleText(text, style);
   canvas.getActiveObject()?.setCoords();
   canvas.requestRenderAll();
   return true;
+}
+
+function styleText(text: FabricText, style: Partial<TextStyle>): void {
+  const { fontSize, ...all } = style;
+  const native = isNative(text);
+  const rest = native ? Object.fromEntries(Object.entries(all).filter(([key]) => !PLAIN_TEXT_ONLY.has(key))) : all;
+  if (native && Object.keys(rest).length === 0 && fontSize === undefined) return;
+  const size = fontSize === undefined ? undefined : fontSize / (text.scaleY || 1);
+  text.set(rest);
+  if (size !== undefined) text.set("fontSize", size);
+  if (native) {
+    // Document text keeps a style per character (its original fonts):
+    // the change applies to every character instead of clearing them.
+    text.setSelectionStyles(size === undefined ? { ...rest } : { ...rest, fontSize: size }, 0, text.text.length);
+  } else if (text.styles && Object.keys(text.styles).length > 0) {
+    // Per-character styles from typing would override object-level styles.
+    text.set("styles", {});
+  }
+  text.initDimensions();
+  text.setCoords();
 }
 
 export function applyShapeStyle(canvas: Canvas, style: Partial<ShapeStyle>, highlight?: string): boolean {

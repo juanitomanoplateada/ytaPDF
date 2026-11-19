@@ -121,37 +121,13 @@ export async function assembleDocument(
   }
 
   const doc = await PDFDocument.create({ updateMetadata: false });
-
-  // One copyPages call per source lets pages share fonts and images. A page
-  // used more than once (duplicated) is copied again in a later round, with a
-  // copier of its own, so each copy has its own content and can be drawn on
-  // without the other one changing.
-  const rounds: Map<string, number[]>[] = [];
-  const uses = new Map<string, number>();
-  for (const placement of placements) {
-    if (isRaster(placement)) continue;
-    const key = `${placement.sourceId}:${placement.sourceIndex}`;
-    const round = uses.get(key) ?? 0;
-    uses.set(key, round + 1);
-    rounds[round] ??= new Map();
-    const indices = rounds[round].get(placement.sourceId) ?? [];
-    indices.push(placement.sourceIndex);
-    rounds[round].set(placement.sourceId, indices);
-  }
-
   const loadedDocs = new Map<string, PDFDocument>();
+  const load = (sourceId: string) => loadOnce(loadedDocs, sources, sourceId, fill);
+
   const copies = new Map<string, PDFPage[]>();
-  for (const round of rounds) {
+  for (const round of copyRounds(placements)) {
     for (const [sourceId, indices] of round) {
-      let sourceDoc = loadedDocs.get(sourceId);
-      if (!sourceDoc) {
-        const source = sources.get(sourceId);
-        if (!source) throw new Error("Falta el documento de origen.");
-        sourceDoc = await loadSource(source);
-        await fill(sourceDoc, sourceId);
-        loadedDocs.set(sourceId, sourceDoc);
-      }
-      const copied = await doc.copyPages(sourceDoc, indices);
+      const copied = await doc.copyPages(await load(sourceId), indices);
       copied.forEach((page, i) => {
         const key = `${sourceId}:${indices[i]}`;
         copies.set(key, [...(copies.get(key) ?? []), page]);
@@ -175,6 +151,45 @@ export async function assembleDocument(
   );
   if (loaded[0]) copyDocumentInfo(loaded[0], doc);
   return { doc, pages, inPlace: false, failedFields };
+}
+
+/** A source parsed with pdf-lib (and its form values written) the first time it is needed. */
+async function loadOnce(
+  loaded: Map<string, PDFDocument>,
+  sources: Map<string, ExportSource>,
+  sourceId: string,
+  fill: (doc: PDFDocument, sourceId: string) => Promise<void>,
+): Promise<PDFDocument> {
+  const known = loaded.get(sourceId);
+  if (known) return known;
+  const source = sources.get(sourceId);
+  if (!source) throw new Error("Falta el documento de origen.");
+  const doc = await loadSource(source);
+  await fill(doc, sourceId);
+  loaded.set(sourceId, doc);
+  return doc;
+}
+
+/**
+ * One copyPages call per source lets pages share fonts and images. A page
+ * used more than once (duplicated) is copied again in a later round, with a
+ * copier of its own, so each copy has its own content and can be drawn on
+ * without the other one changing.
+ */
+function copyRounds(placements: PagePlacement[]): Map<string, number[]>[] {
+  const rounds: Map<string, number[]>[] = [];
+  const uses = new Map<string, number>();
+  for (const placement of placements) {
+    if (isRaster(placement)) continue;
+    const key = `${placement.sourceId}:${placement.sourceIndex}`;
+    const round = uses.get(key) ?? 0;
+    uses.set(key, round + 1);
+    rounds[round] ??= new Map();
+    const indices = rounds[round].get(placement.sourceId) ?? [];
+    indices.push(placement.sourceIndex);
+    rounds[round].set(placement.sourceId, indices);
+  }
+  return rounds;
 }
 
 /** Applies the user's rotation and crop to an output page. */
@@ -402,24 +417,7 @@ export function flattenForm(doc: PDFDocument): void {
  */
 export function removeUnreachableObjects(doc: PDFDocument): number {
   const { context } = doc;
-  const reachable = new Set<string>();
-  const trailer = context.trailerInfo;
-  const pending: (PDFObject | undefined)[] = [trailer.Root, trailer.Info, trailer.Encrypt, trailer.ID];
-  while (pending.length > 0) {
-    const object = pending.pop();
-    if (object instanceof PDFRef) {
-      const id = object.toString();
-      if (reachable.has(id)) continue;
-      reachable.add(id);
-      pending.push(context.lookup(object));
-    } else if (object instanceof PDFDict) {
-      for (const [, value] of object.entries()) pending.push(value);
-    } else if (object instanceof PDFArray) {
-      for (let i = 0; i < object.size(); i++) pending.push(object.get(i));
-    } else if (object instanceof PDFStream) {
-      pending.push(object.dict);
-    }
-  }
+  const reachable = reachableObjects(doc);
   let removed = 0;
   for (const [ref] of context.enumerateIndirectObjects()) {
     if (reachable.has(ref.toString())) continue;
@@ -427,6 +425,34 @@ export function removeUnreachableObjects(doc: PDFDocument): number {
     removed++;
   }
   return removed;
+}
+
+/** The objects a direct object points to, or contains. */
+function childrenOf(object: PDFObject | undefined): (PDFObject | undefined)[] {
+  if (object instanceof PDFDict) return [...object.entries()].map(([, value]) => value);
+  if (object instanceof PDFArray) return object.asArray();
+  if (object instanceof PDFStream) return [object.dict];
+  return [];
+}
+
+/** References (as text) of every object reachable from the trailer. */
+function reachableObjects(doc: PDFDocument): Set<string> {
+  const { context } = doc;
+  const reachable = new Set<string>();
+  const trailer = context.trailerInfo;
+  const pending: (PDFObject | undefined)[] = [trailer.Root, trailer.Info, trailer.Encrypt, trailer.ID];
+  while (pending.length > 0) {
+    const object = pending.pop();
+    if (!(object instanceof PDFRef)) {
+      pending.push(...childrenOf(object));
+      continue;
+    }
+    const id = object.toString();
+    if (reachable.has(id)) continue;
+    reachable.add(id);
+    pending.push(context.lookup(object));
+  }
+  return reachable;
 }
 
 /**

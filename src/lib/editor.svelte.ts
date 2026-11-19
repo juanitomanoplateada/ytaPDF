@@ -61,12 +61,75 @@ function certificateMessage(problem: CertificateProblem): string {
   }
 }
 
+/**
+ * What Save as reports: some pages exported (`target` is how many), the whole
+ * document saved into a file (its name) or downloaded (null).
+ */
+function saveMessage(protectedFile: boolean, target: number | string | null): string {
+  if (typeof target === "number") {
+    return protectedFile
+      ? t("Se exportaron {pages} con contraseña.", { pages: pagesLabel(target) })
+      : t("Se exportaron {pages}.", { pages: pagesLabel(target) });
+  }
+  if (target !== null) {
+    return protectedFile ? t("Se guardó «{name}» con contraseña.", { name: target }) : t("Se guardó «{name}».", { name: target });
+  }
+  return protectedFile ? t("PDF exportado con contraseña.") : t("PDF exportado correctamente.");
+}
+
+/** Annotations moved by (dx, dy), as when the crop box moves the page's origin. */
+function shiftAnnotations(data: PageAnnotations, dx: number, dy: number): PageAnnotations {
+  return {
+    ...data,
+    objects: data.objects.map((object) => ({
+      ...object,
+      left: Number(object.left ?? 0) + dx,
+      top: Number(object.top ?? 0) + dy,
+    })),
+  };
+}
+
+/**
+ * The crop box for a scene rectangle of a page as shown now, or null when it
+ * is too small or misses what the page shows.
+ */
+function cropFor(
+  page: PageRef,
+  view: Box,
+  transform: number[],
+  rect: { x0: number; y0: number; x1: number; y1: number },
+): Box | null {
+  if (rect.x1 - rect.x0 < MIN_CROP || rect.y1 - rect.y0 < MIN_CROP) return null;
+  const visible = (page.crop ?? view).slice() as Box;
+  return intersectBox(sceneRectToBox(transform as Box & number[], rect), visible) ?? null;
+}
+
+export interface OcrOptions {
+  /** Skips pages that already have text of their own. */
+  onlyWithoutText?: boolean;
+  signal?: AbortSignal;
+  onProgress?: (progress: { page: number; total: number; fraction: number; loading: boolean }) => void;
+}
+
+/** `promise`, or a rejection as soon as `signal` aborts. */
+function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      const abort = () => reject(new DOMException("Detenido", "AbortError"));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    }),
+  ]);
+}
+
 /** Whether a page has text of its own (it is not just a scanned image). */
 async function hasOwnText(proxy: PDFPageProxy): Promise<boolean> {
   try {
     const content = await pageTextContent(proxy);
     let chars = 0;
-    for (const item of content.items) if ("str" in item) chars += item.str.replace(/\s+/g, "").length;
+    for (const item of content.items) if ("str" in item) chars += item.str.replaceAll(/\s+/g, "").length;
     return chars >= 20;
   } catch {
     return false;
@@ -315,8 +378,18 @@ export interface OverwriteRequest {
 const EMPTY_METADATA: DocumentMetadata = { title: "", author: "", subject: "", keywords: "" };
 
 /** Width at which a signature (or initials) is inserted on a page this wide. */
-export function signatureWidth(pageWidth: number, initials = false): number {
-  return initials ? Math.min(90, pageWidth * 0.18) : Math.min(220, pageWidth * 0.4);
+export function signatureWidth(pageWidth: number): number {
+  return Math.min(220, pageWidth * 0.4);
+}
+
+/** Initials are placed smaller than a full signature. */
+export function initialsWidth(pageWidth: number): number {
+  return Math.min(90, pageWidth * 0.18);
+}
+
+/** Width to place a saved signature or initials at on a page of `pageWidth`. */
+export function placedSignatureWidth(pageWidth: number, signature: { initials?: boolean }): number {
+  return signature.initials ? initialsWidth(pageWidth) : signatureWidth(pageWidth);
 }
 
 const HISTORY_LIMIT = 100;
@@ -745,7 +818,10 @@ class Editor {
     try {
       const { info } = await source.pdf.getMetadata();
       const fields = (info ?? {}) as Record<string, unknown>;
-      const read = (key: string) => (typeof fields[key] === "string" ? (fields[key] as string) : "");
+      const read = (key: string) => {
+        const value = fields[key];
+        return typeof value === "string" ? value : "";
+      };
       return { title: read("Title"), author: read("Author"), subject: read("Subject"), keywords: read("Keywords") };
     } catch {
       return { ...EMPTY_METADATA };
@@ -764,8 +840,7 @@ class Editor {
       try {
         // PDF.js 6 returns a Map; older versions, a plain object.
         const fields: unknown = await this.sources.get(sourceId)?.pdf.getFieldObjects();
-        const count = fields instanceof Map ? fields.size : fields ? Object.keys(fields).length : 0;
-        if (count > 0) return true;
+        if (fields instanceof Map ? fields.size > 0 : !!fields && Object.keys(fields).length > 0) return true;
       } catch {
         // A document whose fields cannot be read has none to flatten.
       }
@@ -845,60 +920,57 @@ class Editor {
     const name = `${sanitizeFileName(options.fileName) || this.fileName}.pdf`;
     if (whole) this.setFileName(options.fileName);
 
-    let handle: SaveHandle | null = null;
-    if (canPickSaveLocation) {
-      try {
-        handle = await pickSaveLocation(name, MIME.pdf);
-        if (!handle) return false;
-      } catch (error) {
-        // Picker refused (policy, no user gesture): fall back to a download.
-        console.error("No se pudo abrir el selector de archivos:", error);
-      }
-    }
+    const picked = await this.#pickSaveLocation(name);
+    if (!picked) return false;
+    const { handle } = picked;
 
     const result = await this.#buildPdf(pages, options);
-    if (!result) return false;
-    if (handle) {
-      try {
-        await writeToHandle(handle, result.bytes);
-      } catch (error) {
-        console.error("Error al guardar:", error);
-        notifications.error(t("No se pudo guardar «{name}».", { name: handle.name }));
-        return false;
-      }
-    } else {
-      downloadBytes(result.bytes, name, MIME.pdf);
-    }
+    if (!result || !(await this.#writePdf(result.bytes, handle, name))) return false;
 
     if (whole) {
       this.#markSaved();
       if (handle) {
-        this.#saveTarget = {
-          handle,
-          confirmed: true,
-          password: options.password,
-          flattenForms: options.flattenForms,
-          compression: options.compression,
-          signature: options.signature,
-        };
+        const { password, flattenForms, compression, signature } = options;
+        this.#saveTarget = { handle, confirmed: true, password, flattenForms, compression, signature };
         this.saveTargetName = handle.name;
       }
     }
-    let message: string;
-    if (!whole) {
-      message = options.password
-        ? t("Se exportaron {pages} con contraseña.", { pages: pagesLabel(pages.length) })
-        : t("Se exportaron {pages}.", { pages: pagesLabel(pages.length) });
-    } else if (handle) {
-      message = options.password
-        ? t("Se guardó «{name}» con contraseña.", { name: handle.name })
-        : t("Se guardó «{name}».", { name: handle.name });
-    } else {
-      message = options.password ? t("PDF exportado con contraseña.") : t("PDF exportado correctamente.");
-    }
+    let message = saveMessage(!!options.password, whole ? (handle?.name ?? null) : pages.length);
     if (options.signature) message += ` ${t("Lleva tu firma digital: cualquier cambio posterior la invalidará.")}`;
     this.#report(result.warnings, message);
     return true;
+  }
+
+  /**
+   * Asks where to save, where the browser can. Resolves to null when the
+   * user cancels, and to no handle when the file is to be downloaded.
+   */
+  async #pickSaveLocation(name: string): Promise<{ handle: SaveHandle | null } | null> {
+    if (!canPickSaveLocation) return { handle: null };
+    try {
+      const handle = await pickSaveLocation(name, MIME.pdf);
+      return handle ? { handle } : null;
+    } catch (error) {
+      // Picker refused (policy, no user gesture): fall back to a download.
+      console.error("No se pudo abrir el selector de archivos:", error);
+      return { handle: null };
+    }
+  }
+
+  /** Writes the file where the user chose, or downloads it. */
+  async #writePdf(bytes: Uint8Array, handle: SaveHandle | null, name: string): Promise<boolean> {
+    if (!handle) {
+      downloadBytes(bytes, name, MIME.pdf);
+      return true;
+    }
+    try {
+      await writeToHandle(handle, bytes);
+      return true;
+    } catch (error) {
+      console.error("Error al guardar:", error);
+      notifications.error(t("No se pudo guardar «{name}».", { name: handle.name }));
+      return false;
+    }
   }
 
   /** Exports only some pages, in the current order, as a separate file. */
@@ -1316,34 +1388,17 @@ class Editor {
     const pages = [...this.pages];
     let changed = 0;
     for (const [i, page] of this.pages.entries()) {
-      if (!ids.has(page.id)) continue;
-      const source = this.sources.get(page.sourceId);
+      const source = ids.has(page.id) ? this.sources.get(page.sourceId) : undefined;
       if (!source) continue;
       const proxy = await source.pdf.getPage(page.sourceIndex + 1);
       const before = viewportOf(proxy, 1, page);
-      let crop: Box | undefined;
-      if (area) {
-        const rect = area(page);
-        if (rect.x1 - rect.x0 < MIN_CROP || rect.y1 - rect.y0 < MIN_CROP) continue;
-        const visible = (page.crop ?? (proxy.view as Box)).slice() as Box;
-        const box = intersectBox(sceneRectToBox(before.transform as Box & number[], rect), visible);
-        if (!box) continue;
-        crop = box;
-      }
+      const crop = area ? cropFor(page, proxy.view as Box, before.transform, area(page)) : undefined;
+      if (crop === null) continue;
       const after = viewportOf(proxy, 1, { rotation: page.rotation, crop });
       const [dx, dy] = cropShift(before.transform, after.transform);
       pages[i] = { ...page, crop, width: after.width, height: after.height };
       const data = annotations[page.id];
-      if (data && (dx !== 0 || dy !== 0)) {
-        annotations[page.id] = {
-          ...data,
-          objects: data.objects.map((object) => ({
-            ...object,
-            left: Number(object.left ?? 0) + dx,
-            top: Number(object.top ?? 0) + dy,
-          })),
-        };
-      }
+      if (data && (dx !== 0 || dy !== 0)) annotations[page.id] = shiftAnnotations(data, dx, dy);
       changed += 1;
     }
     if (changed > 0) this.#commit({ pages, annotations });
@@ -1423,7 +1478,7 @@ class Editor {
     try {
       const url = await importImage(await (await fetch(content.image)).blob());
       const page = this.pages.find((p) => p.id === this.currentPageId) ?? this.pages[0];
-      await controller.addImage(url, { width: signatureWidth(page?.width ?? 595, content.initials) });
+      await controller.addImage(url, { width: placedSignatureWidth(page?.width ?? 595, content) });
     } catch (error) {
       console.error("Error al insertar la firma:", error);
       notifications.error(t("No se pudo insertar la firma."));
@@ -1451,7 +1506,7 @@ class Editor {
    * the text tool, fitted to each line.
    */
   markSelectedText(kind: TextMarkKind): void {
-    const selection = typeof window === "undefined" ? null : window.getSelection();
+    const selection = globalThis.getSelection?.() ?? null;
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
     const range = selection.getRangeAt(0);
     let marked = 0;
@@ -1580,16 +1635,34 @@ class Editor {
    * redacted, and the export adds it to the file as invisible text.
    * Returns false when it was stopped or failed.
    */
-  async recognizeText(
-    pageIds: string[],
-    languages: OcrLanguage[],
-    options: {
-      onlyWithoutText?: boolean;
-      signal?: AbortSignal;
-      onProgress?: (progress: { page: number; total: number; fraction: number; loading: boolean }) => void;
-    } = {},
-  ): Promise<boolean> {
-    const { recognizePage, stopOcr } = await import("./ocr");
+  async recognizeText(pageIds: string[], languages: OcrLanguage[], options: OcrOptions = {}): Promise<boolean> {
+    const targets = await this.#ocrTargets(pageIds, options.onlyWithoutText ?? false);
+    if (targets.length === 0) {
+      notifications.info(t("Todas las páginas elegidas ya tienen texto. Elige «Todas» para reconocerlas igualmente."));
+      return true;
+    }
+    const tally = { pages: 0, words: 0 };
+    try {
+      await this.#recognizeTargets(targets, languages, options, tally);
+    } catch (error) {
+      await this.#ocrStopped(error, tally.pages);
+      return false;
+    }
+    this.#scheduleAutosave();
+    if (tally.words === 0) {
+      notifications.info(t("No se encontró texto en {pages}.", { pages: pagesLabel(tally.pages) }));
+    } else {
+      notifications.success(
+        t("Se reconoció el texto de {pages}. Ya se puede buscar, seleccionar y copiar, y se guardará en el PDF.", {
+          pages: pagesLabel(tally.pages),
+        }),
+      );
+    }
+    return true;
+  }
+
+  /** Source pages to recognise, once each, optionally only those without text of their own. */
+  async #ocrTargets(pageIds: string[], onlyWithoutText: boolean): Promise<{ proxy: PDFPageProxy; key: string }[]> {
     const wanted = new Set(pageIds);
     const targets: { proxy: PDFPageProxy; key: string }[] = [];
     const seen = new Set<string>();
@@ -1599,66 +1672,49 @@ class Editor {
       if (!wanted.has(page.id) || seen.has(key) || !source) continue;
       seen.add(key);
       const proxy = await source.pdf.getPage(page.sourceIndex + 1);
-      if (options.onlyWithoutText && (await hasOwnText(proxy))) continue;
+      if (onlyWithoutText && (await hasOwnText(proxy))) continue;
       targets.push({ proxy, key });
     }
-    if (targets.length === 0) {
-      notifications.info(t("Todas las páginas elegidas ya tienen texto. Elige «Todas» para reconocerlas igualmente."));
-      return true;
-    }
+    return targets;
+  }
 
-    const aborted = new Promise<never>((_, reject) => {
-      options.signal?.addEventListener("abort", () => reject(new DOMException("Detenido", "AbortError")), { once: true });
-    });
-    aborted.catch(() => undefined);
-    let recognised = 0;
-    let words = 0;
-    try {
-      for (let i = 0; i < targets.length; i++) {
-        if (options.signal?.aborted) throw new DOMException("Detenido", "AbortError");
-        const { proxy, key } = targets[i];
-        options.onProgress?.({ page: i + 1, total: targets.length, fraction: 0, loading: true });
-        const result = await Promise.race([
-          recognizePage(proxy, languages, ({ progress, status }) =>
-            options.onProgress?.({
-              page: i + 1,
-              total: targets.length,
-              fraction: status === "recognizing" ? progress : 0,
-              loading: status !== "recognizing",
-            }),
-          ),
-          aborted,
-        ]);
-        this.ocr = { ...this.ocr, [key]: result };
-        recognised++;
-        words += result.lines.reduce((n, line) => n + line.words.length, 0);
-      }
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        await stopOcr();
-        if (recognised > 0) this.#scheduleAutosave();
-        notifications.info(
-          recognised === 0
-            ? t("Se detuvo el reconocimiento de texto.")
-            : t("Se detuvo el reconocimiento: se reconoció el texto de {pages}.", { pages: pagesLabel(recognised) }),
-        );
-        return false;
-      }
+  async #recognizeTargets(
+    targets: { proxy: PDFPageProxy; key: string }[],
+    languages: OcrLanguage[],
+    { signal, onProgress }: OcrOptions,
+    tally: { pages: number; words: number },
+  ): Promise<void> {
+    const { recognizePage } = await import("./ocr");
+    const total = targets.length;
+    for (const [i, { proxy, key }] of targets.entries()) {
+      if (signal?.aborted) throw new DOMException("Detenido", "AbortError");
+      onProgress?.({ page: i + 1, total, fraction: 0, loading: true });
+      const recognising = recognizePage(proxy, languages, ({ progress, status }) => {
+        const working = status === "recognizing";
+        onProgress?.({ page: i + 1, total, fraction: working ? progress : 0, loading: !working });
+      });
+      const result = await untilAborted(recognising, signal);
+      this.ocr = { ...this.ocr, [key]: result };
+      tally.pages++;
+      tally.words += result.lines.reduce((n, line) => n + line.words.length, 0);
+    }
+  }
+
+  /** Reports why recognition ended early; what was recognised before is kept. */
+  async #ocrStopped(error: unknown, recognised: number): Promise<void> {
+    if (!(error instanceof DOMException && error.name === "AbortError")) {
       console.error("No se pudo reconocer el texto:", error);
       notifications.error(t("No se pudo reconocer el texto de la página. Comprueba la conexión la primera vez que lo uses."));
-      return false;
+      return;
     }
-    this.#scheduleAutosave();
-    if (words === 0) {
-      notifications.info(t("No se encontró texto en {pages}.", { pages: pagesLabel(recognised) }));
-    } else {
-      notifications.success(
-        t("Se reconoció el texto de {pages}. Ya se puede buscar, seleccionar y copiar, y se guardará en el PDF.", {
-          pages: pagesLabel(recognised),
-        }),
-      );
-    }
-    return true;
+    const { stopOcr } = await import("./ocr");
+    await stopOcr();
+    if (recognised > 0) this.#scheduleAutosave();
+    notifications.info(
+      recognised === 0
+        ? t("Se detuvo el reconocimiento de texto.")
+        : t("Se detuvo el reconocimiento: se reconoció el texto de {pages}.", { pages: pagesLabel(recognised) }),
+    );
   }
 
   /**
@@ -1978,7 +2034,7 @@ class Editor {
       pages: changes.pages ?? this.pages,
       annotations: changes.annotations ?? this.annotations,
       formValues: changes.formValues ?? this.formValues,
-      decorations: changes.decorations !== undefined ? changes.decorations : this.decorations,
+      decorations: changes.decorations === undefined ? this.decorations : changes.decorations,
     };
     const now = performance.now();
     let history = this.#history.slice(0, this.#historyIndex + 1);

@@ -9,7 +9,7 @@ import { TextDocument } from "./textDocument";
  */
 
 const documents = new Map<string, Promise<TextDocument>>();
-const scope = self as unknown as DedicatedWorkerGlobalScope;
+const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 
 function documentFor(sourceId: string): Promise<TextDocument> {
   const document = documents.get(sourceId);

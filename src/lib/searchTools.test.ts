@@ -145,7 +145,7 @@ describe("chunkText", () => {
     const text = "Primer párrafo corto.\n\nSegundo párrafo. Tiene dos frases largas de verdad.\n\nTercero.";
     const chunks = chunkText(text, 40);
     expect(chunks.every((chunk) => chunk.length <= 40)).toBe(true);
-    expect(chunks.join(" ").replace(/\s+/g, " ")).toBe(text.replace(/\s+/g, " "));
+    expect(chunks.join(" ").replaceAll(/\s+/g, " ")).toBe(text.replaceAll(/\s+/g, " "));
     expect(chunkText("uno\n\ndos", 100)).toEqual(["uno\n\ndos"]);
   });
 });

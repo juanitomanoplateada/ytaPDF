@@ -33,15 +33,7 @@ export class CMap {
     let code = 0;
     for (let length = 1; length <= 4 && offset + length <= bytes.length; length++) {
       code = (code << 8) | bytes[offset + length - 1];
-      for (const range of this.codespaces) {
-        if (range.low.length !== length) continue;
-        let inside = true;
-        for (let i = 0; i < length && inside; i++) {
-          const byte = bytes[offset + i];
-          inside = byte >= range.low[i] && byte <= range.high[i];
-        }
-        if (inside) return { code: code >>> 0, length };
-      }
+      if (this.codespaces.some((range) => inRange(range, bytes, offset, length))) return { code: code >>> 0, length };
     }
     // Not in any range: take the shortest length, as viewers do.
     const length = Math.min(this.shortestCode(), bytes.length - offset);
@@ -61,7 +53,8 @@ export class CMap {
       const high = bytesToNumber(range.high);
       if (code >= low && code <= high) return range.low.length;
     }
-    return this.codespaces.length > 0 ? this.shortestCode() : code > 0xff ? 2 : 1;
+    if (this.codespaces.length > 0) return this.shortestCode();
+    return code > 0xff ? 2 : 1;
   }
 
   cid(code: number): number | undefined {
@@ -74,6 +67,16 @@ export class CMap {
   }
 }
 
+/** Whether the `length` bytes at `offset` fall in a codespace range of that length. */
+function inRange(range: CodespaceRange, bytes: Uint8Array, offset: number, length: number): boolean {
+  if (range.low.length !== length) return false;
+  for (let i = 0; i < length; i++) {
+    const byte = bytes[offset + i];
+    if (byte < range.low[i] || byte > range.high[i]) return false;
+  }
+  return true;
+}
+
 function bytesToNumber(bytes: Uint8Array): number {
   let value = 0;
   for (const byte of bytes) value = value * 256 + byte;
@@ -82,85 +85,82 @@ function bytesToNumber(bytes: Uint8Array): number {
 
 /** UTF-16BE bytes (a ToUnicode destination) as text. */
 function utf16(bytes: Uint8Array): string {
-  if (bytes.length === 1) return String.fromCharCode(bytes[0]);
+  if (bytes.length === 1) return String.fromCodePoint(bytes[0]);
   let out = "";
-  for (let i = 0; i + 1 < bytes.length; i += 2) out += String.fromCharCode((bytes[i] << 8) | bytes[i + 1]);
+  for (let i = 0; i + 1 < bytes.length; i += 2) out += String.fromCodePoint((bytes[i] << 8) | bytes[i + 1]);
   return out;
 }
 
 /** Adds `offset` to the last UTF-16 unit of `text` (bfrange destinations). */
 function incrementLast(text: string, offset: number): string {
   if (offset === 0 || text.length === 0) return text;
-  return text.slice(0, -1) + String.fromCharCode(text.charCodeAt(text.length - 1) + offset);
+  return text.slice(0, -1) + String.fromCodePoint((text.codePointAt(text.length - 1) ?? 0) + offset);
 }
 
 export function parseCMap(bytes: Uint8Array): CMap {
   const cmap = new CMap();
-  for (const { op, operands } of parseContent(bytes)) {
-    switch (op) {
-      case "endcodespacerange":
-        for (let i = 0; i + 1 < operands.length; i += 2) {
-          const low = operands[i];
-          const high = operands[i + 1];
-          if (isString(low) && isString(high) && low.bytes.length === high.bytes.length && low.bytes.length > 0) {
-            cmap.codespaces.push({ low: low.bytes, high: high.bytes });
-          }
-        }
-        break;
-      case "endbfchar":
-        for (let i = 0; i + 1 < operands.length; i += 2) {
-          const src = operands[i];
-          const dst = operands[i + 1];
-          if (!isString(src)) continue;
-          const text = destination(dst);
-          if (text !== undefined) cmap.unicode.set(bytesToNumber(src.bytes), text);
-        }
-        break;
-      case "endbfrange":
-        for (let i = 0; i + 2 < operands.length; i += 3) {
-          const low = operands[i];
-          const high = operands[i + 1];
-          const dst = operands[i + 2];
-          if (!isString(low) || !isString(high)) continue;
-          const from = bytesToNumber(low.bytes);
-          const to = Math.min(bytesToNumber(high.bytes), from + 0xffff);
-          if (Array.isArray(dst)) {
-            dst.forEach((item, k) => {
-              const text = destination(item);
-              if (text !== undefined && from + k <= to) cmap.unicode.set(from + k, text);
-            });
-          } else {
-            const base = destination(dst);
-            if (base === undefined) continue;
-            for (let code = from; code <= to; code++) cmap.unicode.set(code, incrementLast(base, code - from));
-          }
-        }
-        break;
-      case "endcidchar":
-        for (let i = 0; i + 1 < operands.length; i += 2) {
-          const src = operands[i];
-          const cid = operands[i + 1];
-          if (isString(src) && typeof cid === "number") cmap.cids.set(bytesToNumber(src.bytes), cid);
-        }
-        break;
-      case "endcidrange":
-        for (let i = 0; i + 2 < operands.length; i += 3) {
-          const low = operands[i];
-          const high = operands[i + 1];
-          const cid = operands[i + 2];
-          if (isString(low) && isString(high) && typeof cid === "number") {
-            cmap.cidRanges.push({ low: bytesToNumber(low.bytes), high: bytesToNumber(high.bytes), cid });
-          }
-        }
-        break;
-      case "usecmap": {
-        const name = operands[0];
-        if (isName(name)) cmap.useCMap = name.value;
-        break;
+  for (const { op, operands } of parseContent(bytes)) SECTIONS.get(op)?.(cmap, operands);
+  return cmap;
+}
+
+/** Operands taken `size` at a time (the entries of a CMap section). */
+function* entries(operands: Operand[], size: number): Generator<Operand[]> {
+  for (let i = 0; i + size - 1 < operands.length; i += size) yield operands.slice(i, i + size);
+}
+
+/** What each section of a CMap adds to it, by the operator that ends the section. */
+const SECTIONS = new Map<string, (cmap: CMap, operands: Operand[]) => void>(Object.entries({
+  endcodespacerange(cmap: CMap, operands: Operand[]) {
+    for (const [low, high] of entries(operands, 2)) {
+      if (isString(low) && isString(high) && low.bytes.length === high.bytes.length && low.bytes.length > 0) {
+        cmap.codespaces.push({ low: low.bytes, high: high.bytes });
       }
     }
+  },
+  endbfchar(cmap: CMap, operands: Operand[]) {
+    for (const [src, dst] of entries(operands, 2)) {
+      if (!isString(src)) continue;
+      const text = destination(dst);
+      if (text !== undefined) cmap.unicode.set(bytesToNumber(src.bytes), text);
+    }
+  },
+  endbfrange(cmap: CMap, operands: Operand[]) {
+    for (const [low, high, dst] of entries(operands, 3)) {
+      if (!isString(low) || !isString(high)) continue;
+      const from = bytesToNumber(low.bytes);
+      addRange(cmap, from, Math.min(bytesToNumber(high.bytes), from + 0xffff), dst);
+    }
+  },
+  endcidchar(cmap: CMap, operands: Operand[]) {
+    for (const [src, cid] of entries(operands, 2)) {
+      if (isString(src) && typeof cid === "number") cmap.cids.set(bytesToNumber(src.bytes), cid);
+    }
+  },
+  endcidrange(cmap: CMap, operands: Operand[]) {
+    for (const [low, high, cid] of entries(operands, 3)) {
+      if (isString(low) && isString(high) && typeof cid === "number") {
+        cmap.cidRanges.push({ low: bytesToNumber(low.bytes), high: bytesToNumber(high.bytes), cid });
+      }
+    }
+  },
+  usecmap(cmap: CMap, operands: Operand[]) {
+    const name = operands[0];
+    if (isName(name)) cmap.useCMap = name.value;
+  },
+}));
+
+/** A bfrange entry: an array of destinations, or one whose last unit counts up. */
+function addRange(cmap: CMap, from: number, to: number, dst: Operand | undefined): void {
+  if (Array.isArray(dst)) {
+    dst.forEach((item, k) => {
+      const text = destination(item);
+      if (text !== undefined && from + k <= to) cmap.unicode.set(from + k, text);
+    });
+    return;
   }
-  return cmap;
+  const base = destination(dst);
+  if (base === undefined) return;
+  for (let code = from; code <= to; code++) cmap.unicode.set(code, incrementLast(base, code - from));
 }
 
 function destination(value: Operand | undefined): string | undefined {

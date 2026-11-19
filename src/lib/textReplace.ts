@@ -91,6 +91,30 @@ export interface ReplaceResult {
 }
 
 /**
+ * Replaces the matches in the document text already edited on a page (its
+ * objects are updated in place) and notes the glyphs those edits cover.
+ */
+async function replaceInEdited(
+  objects: Record<string, unknown>[],
+  query: string,
+  replacement: string,
+  taken: Set<string>,
+): Promise<number> {
+  let replaced = 0;
+  for (let i = 0; i < objects.length; i++) {
+    if (!isNativeData(objects[i])) continue;
+    const [object] = await util.enlivenObjects<FabricObject>([objects[i]]);
+    if (!isNative(object)) continue;
+    for (const key of glyphKeys(object.ytaNative.erase)) taken.add(key);
+    const count = replaceInObject(object, query, replacement);
+    if (count === 0) continue;
+    objects[i] = serialize(object);
+    replaced += count;
+  }
+  return replaced;
+}
+
+/**
  * Replaces `query` with `replacement` on one page: in the text already
  * edited on it and in the lines of the document's text that contain it.
  * `viewport` is the PDF.js viewport transform at scale 1.
@@ -103,28 +127,15 @@ export async function replaceOnPage(
   replacement: string,
 ): Promise<ReplaceResult> {
   const objects = [...(data?.objects ?? [])];
-  let replaced = 0;
-  let skipped = 0;
   const taken = new Set<string>();
-
   // Text the user already edited: change it where it is.
-  for (let i = 0; i < objects.length; i++) {
-    if (!isNativeData(objects[i])) continue;
-    const [object] = await util.enlivenObjects<FabricObject>([objects[i]]);
-    if (!isNative(object)) continue;
-    for (const key of glyphKeys(object.ytaNative.erase)) taken.add(key);
-    const count = replaceInObject(object, query, replacement);
-    if (count > 0) {
-      objects[i] = serialize(object);
-      replaced += count;
-    }
-  }
+  let replaced = await replaceInEdited(objects, query, replacement, taken);
+  let skipped = 0;
 
   // Lines of the document's text.
   for (const unit of analysis.lines) {
     const matches = findInString(lineText(unit.lines[0] ?? []), query);
-    if (matches.length === 0) continue;
-    if (glyphKeys(unit.erase).some((key) => taken.has(key))) continue;
+    if (matches.length === 0 || glyphKeys(unit.erase).some((key) => taken.has(key))) continue;
     if (!unit.editable) {
       skipped += matches.length;
       continue;
@@ -178,7 +189,7 @@ function charsQuad(unit: TextUnit, line: number, first: number, last: number, vi
     x0 = Math.min(x0, c.x0);
     x1 = Math.max(x1, c.x1);
   }
-  if (!(x1 > x0)) return null;
+  if (x1 <= x0) return null;
   const [u0, u1] = unit.u;
   const at = (p: Point, x: number): Point => applyToPoint(viewport, p[0] + u0 * x, p[1] + u1 * x);
   return [at(quad[0], x0), at(quad[0], x1), at(quad[3], x1), at(quad[3], x0)];
@@ -191,7 +202,7 @@ export function redactionBoxesFor(analysis: PageTextAnalysis, viewport: Matrix, 
     const chars = unit.lines[0] ?? [];
     const charAt: number[] = [];
     chars.forEach((c, i) => {
-      for (let k = 0; k < c.text.length; k++) charAt.push(i);
+      charAt.push(...Array.from({ length: c.text.length }, () => i));
     });
     for (const { start, end } of findInString(lineText(chars), query)) {
       const corners = charsQuad(unit, 0, charAt[start], charAt[end - 1], viewport);

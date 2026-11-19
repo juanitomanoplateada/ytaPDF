@@ -56,7 +56,7 @@ const BYTE_RANGE_PLACEHOLDER = "**********";
 
 const toBinary = (bytes: Uint8Array) => {
   let out = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCodePoint(...bytes.subarray(i, i + 0x8000));
   return out;
 };
 
@@ -90,7 +90,7 @@ export function readPkcs12(bytes: Uint8Array, password: string): SigningIdentity
     .filter((cert): cert is forge.pki.Certificate => !!cert);
   if (!keyBag) throw new CertificateError("no-key");
   // forge reads RSA keys only: elliptic-curve keys come back empty.
-  const key = keyBag.key as forge.pki.rsa.PrivateKey | undefined;
+  const key = keyBag.key;
   if (!key || certificates.length === 0) throw new CertificateError("unsupported-key");
 
   const own = certificates.find((cert) => {

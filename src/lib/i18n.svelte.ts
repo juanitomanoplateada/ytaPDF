@@ -29,7 +29,7 @@ function initialLocale(): Locale {
 }
 
 class I18n {
-  locale = $state<Locale>(typeof window === "undefined" ? "es" : initialLocale());
+  locale = $state<Locale>(globalThis.window === undefined ? "es" : initialLocale());
 
   set(locale: Locale): void {
     this.locale = locale;

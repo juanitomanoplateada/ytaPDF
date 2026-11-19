@@ -301,11 +301,12 @@ describe("translations", () => {
   });
 
   it("keeps the placeholders of each text in its translation", () => {
-    const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
+    const byName = (a: string, b: string) => a.localeCompare(b);
+    const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort(byName);
     // Documented tokens of headers and footers have English names in English.
     const renamed: Record<string, string> = { fecha: "date", nombre: "name" };
     for (const [spanish, english] of Object.entries(EN)) {
-      const expected = placeholders(spanish).map((name) => renamed[name] ?? name).sort();
+      const expected = placeholders(spanish).map((name) => renamed[name] ?? name).sort(byName);
       expect(placeholders(english), spanish).toEqual(expected);
     }
   });

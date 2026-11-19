@@ -43,7 +43,10 @@ export function analyzePage(page: PDFPage, fonts: FontCache, reader?: FontProgra
   const observed = new Map<PdfFont, Set<number>>();
   for (const glyph of content.glyphs) {
     let codes = observed.get(glyph.font);
-    if (!codes) observed.set(glyph.font, (codes = new Set()));
+    if (!codes) {
+      codes = new Set();
+      observed.set(glyph.font, codes);
+    }
     codes.add(glyph.code);
   }
 
@@ -88,8 +91,7 @@ export function analyzePage(page: PDFPage, fonts: FontCache, reader?: FontProgra
 function lineParagraph(line: LayoutLine, paragraph: LayoutParagraph | undefined): LayoutParagraph {
   const index = paragraph?.lines.indexOf(line) ?? -1;
   const full =
-    paragraph !== undefined &&
-    paragraph.align === "justify" &&
+    paragraph?.align === "justify" &&
     index >= 0 &&
     index < paragraph.lines.length - 1 &&
     paragraph.joins[index] !== "\n";
@@ -119,7 +121,7 @@ function toUnit(
   const chars = lines.map((line) =>
     line.chars.map((c): AnalyzedChar => {
       const g = c.glyph;
-      const scale = g.glyph.size !== 0 ? g.size / g.glyph.size : 1;
+      const scale = g.glyph.size === 0 ? 1 : g.size / g.glyph.size;
       // Inferred spaces sit in the gap after their glyph: they take no width here.
       const x0 = (c.inferred ? g.x1 : g.x0) - line.start;
       const x1 = g.x1 - line.start;
@@ -246,26 +248,38 @@ function recoverUnicode(glyphs: Glyph[], programs: ProgramCache): void {
   for (const glyph of glyphs) {
     if (glyph.unicode !== undefined || done.has(glyph.font)) continue;
     done.add(glyph.font);
-    const font = glyph.font;
-    const program = programs.get(font);
-    if (!program || !font.composite || !program.characterSet) continue;
-    const gidToCid = new Map<number, number>();
-    if (font.cidToGid instanceof Uint16Array) font.cidToGid.forEach((gid, cid) => gidToCid.set(gid, cid));
-    const map = new Map<number, string>();
-    for (const cp of program.characterSet) {
-      try {
-        const gid = program.glyphForCodePoint(cp).id;
-        if (gid <= 0) continue;
-        const cid = font.cidToGid === "identity" ? gid : gidToCid.get(gid);
-        // Identity-H: the code is the CID.
-        if (cid !== undefined && !map.has(cid)) map.set(cid, String.fromCodePoint(cp));
-      } catch {
-        break;
-      }
-    }
-    if (map.size > 0) font.setProgramUnicode(map);
+    const program = programs.get(glyph.font);
+    if (!program || !glyph.font.composite || !program.characterSet) continue;
+    const map = programUnicode(glyph.font, program, program.characterSet);
+    if (map.size > 0) glyph.font.setProgramUnicode(map);
   }
   for (const glyph of glyphs) glyph.unicode ??= glyph.font.unicode(glyph.code);
+}
+
+/** CID → text from a composite font's program (Identity-H: the code is the CID). */
+function programUnicode(font: PdfFont, program: FontProgram, characterSet: number[]): Map<number, string> {
+  const gidToCid = new Map<number, number>();
+  if (font.cidToGid instanceof Uint16Array) font.cidToGid.forEach((gid, cid) => gidToCid.set(gid, cid));
+  const map = new Map<number, string>();
+  for (const cp of characterSet) {
+    let gid: number;
+    try {
+      gid = program.glyphForCodePoint(cp).id;
+    } catch {
+      break;
+    }
+    if (gid <= 0) continue;
+    const cid = font.cidToGid === "identity" ? gid : gidToCid.get(gid);
+    if (cid !== undefined && !map.has(cid)) map.set(cid, String.fromCodePoint(cp));
+  }
+  return map;
+}
+
+/** The text a code draws (NFC), or undefined for codes without text or with control characters. */
+function drawableText(font: PdfFont, code: number): string | undefined {
+  const raw = font.unicode(code);
+  if (!raw || /^[\u0000-\u001f]+$/.test(raw)) return undefined;
+  return raw.normalize("NFC");
 }
 
 function describeFont(sample: Glyph, observed: Set<number>, programs: ProgramCache): AnalyzedFont {
@@ -275,15 +289,13 @@ function describeFont(sample: Glyph, observed: Set<number>, programs: ProgramCac
   const fromObserved = new Set<string>();
 
   for (const code of new Set([...observed, ...font.mappedCodes()])) {
-    const raw = font.unicode(code);
-    if (!raw || /^[\u0000-\u001f]+$/.test(raw)) continue;
-    const text = raw.normalize("NFC");
+    const text = drawableText(font, code);
+    if (text === undefined) continue;
     const seen = observed.has(code);
-    if (!seen) {
-      if (fromObserved.has(text) || !isUseful(text)) continue;
-      if (!available(font, program, code, text)) continue;
+    // Codes seen on the page win over others with the same text.
+    if (fromObserved.has(text) || (!seen && (glyphs[text] || !isUseful(text) || !available(font, program, code, text)))) {
+      continue;
     }
-    if (glyphs[text] && (fromObserved.has(text) || !seen)) continue;
     glyphs[text] = [code, font.codeLength(code), font.width(code) * font.scale * 1000];
     if (seen) fromObserved.add(text);
   }

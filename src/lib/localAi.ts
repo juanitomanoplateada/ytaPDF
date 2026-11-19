@@ -103,36 +103,46 @@ const monitorWith = (onProgress?: ProgressHandler) => (monitor: DownloadMonitor)
  * where possible, then at sentence ends, then at spaces.
  */
 export function chunkText(text: string, max: number): string[] {
-  const chunks: string[] = [];
-  let current = "";
-  const flush = () => {
-    if (current.trim()) chunks.push(current.trim());
-    current = "";
-  };
-  const add = (piece: string, separator: string) => {
-    if (!piece.trim()) return;
-    if (current && current.length + separator.length + piece.length > max) flush();
-    if (piece.length <= max) {
-      current = current ? `${current}${separator}${piece}` : piece;
+  const chunker = new Chunker(max);
+  for (const paragraph of text.split(/\n\s*\n|\n(?=\s*[-•*\d])/)) chunker.addParagraph(paragraph.replaceAll(/\s*\n\s*/g, " "));
+  chunker.flush();
+  return chunker.chunks;
+}
+
+class Chunker {
+  readonly chunks: string[] = [];
+  #current = "";
+
+  constructor(private readonly max: number) {}
+
+  flush(): void {
+    if (this.#current.trim()) this.chunks.push(this.#current.trim());
+    this.#current = "";
+  }
+
+  addParagraph(paragraph: string): void {
+    if (!paragraph.trim()) return;
+    const separator = "\n\n";
+    if (this.#current && this.#current.length + separator.length + paragraph.length > this.max) this.flush();
+    if (paragraph.length <= this.max) {
+      this.#current = this.#current ? `${this.#current}${separator}${paragraph}` : paragraph;
       return;
     }
     // A paragraph too long for one piece: by sentences, then by words.
-    const parts = piece.match(/[^.!?。！？]+[.!?。！？]*\s*/g) ?? [piece];
-    for (const part of parts) {
-      if (part.length <= max) {
-        if (current && current.length + part.length > max) flush();
-        current += part;
-      } else {
-        for (const word of part.split(/(\s+)/)) {
-          if (current.length + word.length > max) flush();
-          current += word.length > max ? word.slice(0, max) : word;
-        }
-      }
+    for (const sentence of paragraph.match(/[^.!?。！？]+[.!?。！？]*\s*/g) ?? [paragraph]) this.#addSentence(sentence);
+  }
+
+  #addSentence(sentence: string): void {
+    if (sentence.length <= this.max) {
+      if (this.#current && this.#current.length + sentence.length > this.max) this.flush();
+      this.#current += sentence;
+      return;
     }
-  };
-  for (const paragraph of text.split(/\n\s*\n|\n(?=\s*[-•*\d])/)) add(paragraph.replace(/\s*\n\s*/g, " "), "\n\n");
-  flush();
-  return chunks;
+    for (const word of sentence.split(/(\s+)/)) {
+      if (this.#current.length + word.length > this.max) this.flush();
+      this.#current += word.length > this.max ? word.slice(0, this.max) : word;
+    }
+  }
 }
 
 /** Characters per piece sent to the Summarizer: well within its input quota. */

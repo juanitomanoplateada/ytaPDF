@@ -120,7 +120,10 @@ export function decorationObjects(decorations: PageDecorations, context: Decorat
   const objects: Record<string, unknown>[] = [];
   const style = { fontSize: decorations.fontSize, fill: decorations.color };
   const margin = decorations.margin;
-  const x = (align: DecorationAlign) => (align === "left" ? margin : align === "right" ? width - margin : width / 2);
+  const x = (align: DecorationAlign) => {
+    if (align === "left") return margin;
+    return align === "right" ? width - margin : width / 2;
+  };
 
   const watermark = decorations.watermark.text.trim();
   if (watermark) {

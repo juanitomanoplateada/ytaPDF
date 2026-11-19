@@ -19,7 +19,7 @@ import {
   type PagePlacement,
 } from "./assemble";
 import { DrawContext, drawOnPage, type FontkitLike, type ImageData } from "./drawing";
-import { fabricToDrawables, hasRedactions, redactionAreas, sceneAnnotations } from "./fabricDrawables";
+import { fabricToDrawables, hasRedactions, redactionAreas, sceneAnnotations, type SceneAnnotation } from "./fabricDrawables";
 import { addPageAnnotations, type PageAnnotation, type UserRect } from "./pdfAnnotations";
 import { browserRecoder, compressImages, type CompressionReport, type ImageRecoder } from "./compress";
 import type { CompressionOptions } from "../compression";
@@ -105,192 +105,28 @@ export async function exportDocument(input: ExportInput, forcedRaster: ReadonlyS
   const identity = input.signature ? readPkcs12(input.signature.certificate, input.signature.password) : null;
   if (identity && input.password) throw new Error("Un documento firmado no se puede cifrar con contraseña.");
 
-  const sourceOf = (page: PageRef) => {
-    const source = input.sources.get(page.sourceId);
-    if (!source) throw new Error("Falta el documento de origen.");
-    return source;
-  };
-
-  // What lies under redaction boxes is removed from the page's content. Pages
-  // where that cannot be done exactly are exported as an image instead.
-  const redactions = new Map<string, Point[][]>();
-  const rasterIds = new Set(forcedRaster);
-  for (const page of input.pages) {
-    const data = input.annotations[page.id];
-    if (!data || !hasRedactions(data)) continue;
-    const { areas, coversContent } = await redactionAreas(data);
-    redactions.set(page.id, areas);
-    if (coversContent) rasterIds.add(page.id);
-  }
-  const rasters = new Map<string, Uint8Array>();
-  for (const page of input.pages) {
-    if (!rasterIds.has(page.id)) continue;
-    rasters.set(
-      page.id,
-      await rasterizePage(page, sourceOf(page), input.annotations[page.id], input.formValues, {
-        dpi: RASTER_DPI,
-        format: "image/jpeg",
-      }),
-    );
-  }
-
-  const placements: PagePlacement[] = input.pages.map((page) =>
-    rasters.has(page.id)
-      ? { kind: "raster", width: page.width, height: page.height }
-      : { sourceId: page.sourceId, sourceIndex: page.sourceIndex, rotation: page.rotation, crop: page.crop },
-  );
-
-  const fieldFont = async (doc: PDFDocument) => {
-    doc.registerFontkit((await loadFontkit()) as never);
-    return doc.embedFont(await embeddedFontBytes("noto-sans", "regular"), { subset: true });
-  };
-  const { doc, pages, inPlace, failedFields } = await assembleDocument(placements, input.sources, {
-    formValues: input.formValues,
-    fieldFont,
-  });
-
-  const context = new DrawContext(doc, {
-    loadImage,
-    loadFont: embeddedFontBytes,
-    loadScriptFont: scriptFontBytes,
-    fontkit: await loadFontkit(),
-  });
-  const fonts = new FontCache(doc.context);
-  const failedText: string[] = [];
-  const substituted = new Set<string>();
+  const job = new ExportJob(input, forcedRaster);
+  await job.planRedactions();
+  await job.rasterize();
+  const { doc, pages } = await job.assemble();
 
   // Document text first: it rewrites the page content, which the flattened
   // fields and the annotations are then drawn on top of.
-  for (let i = 0; i < input.pages.length; i++) {
-    const page = input.pages[i];
-    const data = input.annotations[page.id];
-    if (rasters.has(page.id) || !data || data.objects.length === 0) continue;
-    const specs = await pageSpecs(sourceOf(page), page, data);
-    if (specs.length === 0) continue;
-    const report = await applyNativeSpecs(pages[i], specs, fonts, fallbackResources(context));
-    failedText.push(...report.failed);
-    for (const run of specs.flatMap((spec) => spec.runs)) {
-      if (run.font.kind === "fallback" && run.font.substitute) {
-        for (const glyph of run.glyphs) substituted.add(glyph.text);
-      }
-    }
-  }
-
+  await job.applyEditedText();
   if (input.flattenForms) flattenForm(doc);
 
   // Redaction comes after the edited text and the flattened fields, so both
-  // are cut as well.
-  const unredactable: string[] = [];
-  for (let i = 0; i < input.pages.length; i++) {
-    const page = input.pages[i];
-    const areas = redactions.get(page.id);
-    if (!areas || rasterIds.has(page.id)) continue;
-    const pdfjsPage = await sourceOf(page).pdf.getPage(page.sourceIndex + 1);
-    const toPdf = sceneToPdf(viewportOf(pdfjsPage, 1, page).transform);
-    const userAreas = areas.map((area) => area.map(([x, y]) => applyToPoint(toPdf, x, y)));
-    const outcome = await redactPage(pages[i], userAreas, fonts, fallbackResources(context));
-    if (!outcome.done) unredactable.push(page.id);
-  }
-  if (unredactable.length > 0) return exportDocument(input, new Set([...rasterIds, ...unredactable]));
+  // are cut as well. Pages where it cannot be done exactly start again as images.
+  const unredactable = await job.redact();
+  if (unredactable.length > 0) return exportDocument(input, new Set([...job.rasterIds, ...unredactable]));
 
-  for (let i = 0; i < input.pages.length; i++) {
-    const page = input.pages[i];
-    const raster = rasters.get(page.id);
-    if (raster) {
-      const image = await doc.embedJpg(raster);
-      pages[i].drawImage(image, { x: 0, y: 0, width: page.width, height: page.height });
-      continue;
-    }
-    const data = input.annotations[page.id];
-    if (!data || data.objects.length === 0) continue;
-    await ensureFontsFor(data.objects);
-    const pdfjsPage = await sourceOf(page).pdf.getPage(page.sourceIndex + 1);
-    const { transform } = viewportOf(pdfjsPage, 1, page);
-    const drawables = await fabricToDrawables(data);
-    if (drawables.length === 0) continue;
-    isolateContent(pages[i]);
-    await drawOnPage(pages[i], drawables, transform, context);
-  }
-
-  // Recognised text of scanned pages, invisible over the picture of each word.
-  let ocrFont: Awaited<ReturnType<DrawContext["font"]>> | null = null;
-  for (let i = 0; i < input.pages.length; i++) {
-    const page = input.pages[i];
-    const recognised = input.ocr?.[ocrKey(page.sourceId, page.sourceIndex)];
-    if (!recognised || recognised.lines.length === 0) continue;
-    const pdfjsPage = await sourceOf(page).pdf.getPage(page.sourceIndex + 1);
-    const viewport = viewportOf(pdfjsPage, 1, page).transform as Matrix;
-    // Raster pages have their own space: the editor's scene, upside down.
-    const toPage: Matrix = rasters.has(page.id) ? multiply([1, 0, 0, -1, 0, page.height], viewport) : IDENTITY;
-    const hidden = redactions.get(page.id) ?? [];
-    const words = recognised.lines
-      .flatMap((line) => line.words)
-      .filter((word) => !hidden.some((area) => overlapArea(toSceneQuad(word.quad, viewport), area) > 0))
-      .map((word) => ({ text: word.text, quad: word.quad.map(([x, y]) => applyToPoint(toPage, x, y)) }));
-    if (words.length === 0) continue;
-    ocrFont ??= await context.font({ kind: "embedded", family: "noto-sans", variant: "regular" });
-    isolateContent(pages[i]);
-    addInvisibleText(pages[i], words, ocrFont.font, ocrFont.canEncode);
-  }
-
-  // Notes and links, as annotations other readers can open and follow.
-  const indexOfPage = new Map(input.pages.map((page, i) => [page.id, i]));
-  let droppedLinks = 0;
-  for (let i = 0; i < input.pages.length; i++) {
-    const page = input.pages[i];
-    const data = input.annotations[page.id];
-    if (!data) continue;
-    const found = await sceneAnnotations(data);
-    if (found.length === 0) continue;
-    let toPdf: Matrix;
-    if (rasters.has(page.id)) {
-      toPdf = [1, 0, 0, -1, 0, page.height];
-    } else {
-      const pdfjsPage = await sourceOf(page).pdf.getPage(page.sourceIndex + 1);
-      toPdf = sceneToPdf(viewportOf(pdfjsPage, 1, page).transform);
-    }
-    const hidden = redactions.get(page.id) ?? [];
-    const list: PageAnnotation[] = [];
-    for (const item of found) {
-      // Whatever a redaction box covers is gone, notes and links included.
-      if (hidden.some((area) => overlapArea(item.corners, area) > 0.5)) continue;
-      const points = item.corners.map(([x, y]) => applyToPoint(toPdf, x, y));
-      const xs = points.map((p) => p[0]);
-      const ys = points.map((p) => p[1]);
-      const rect: UserRect = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
-      if (item.kind === "note") {
-        list.push({ kind: "note", rect, text: item.text, color: [item.color.r, item.color.g, item.color.b] });
-      } else if (item.link?.pageId) {
-        const target = indexOfPage.get(item.link.pageId);
-        if (target === undefined) droppedLinks++;
-        else list.push({ kind: "link", rect, pageIndex: target });
-      } else if (item.link?.url) {
-        list.push({ kind: "link", rect, url: item.link.url });
-      } else {
-        droppedLinks++;
-      }
-    }
-    addPageAnnotations(doc, pages[i], list, pages);
-  }
-
-  if (input.stripMetadata) {
-    stripMetadata(doc);
-  } else {
-    const now = new Date();
-    doc.setProducer("ytaPDF");
-    doc.setModificationDate(now);
-    if (!inPlace) {
-      doc.setCreator("ytaPDF");
-      doc.setCreationDate(now);
-      if (!doc.getTitle()) doc.setTitle(input.title);
-    }
-    if (input.metadata) applyMetadata(doc, input.metadata);
-  }
-
-  if (!inPlace && input.outline && input.outline.length > 0) writeOutline(doc, pages, input.outline);
+  await job.drawAnnotations();
+  await job.addRecognisedText();
+  await job.addNotesAndLinks();
+  job.writeProperties();
 
   const compression = input.compression
-    ? await compressImages(doc, pages, fonts, input.compression, input.recodeImage ?? browserRecoder)
+    ? await compressImages(doc, pages, job.fonts, input.compression, input.recodeImage ?? browserRecoder)
     : undefined;
 
   // Replaced content, removed annotations and dropped images must not stay in
@@ -312,22 +148,265 @@ export async function exportDocument(input: ExportInput, forcedRaster: ReadonlyS
   // into the saved bytes, which must hold it uncompressed.
   const saved = await doc.save({ useObjectStreams: !identity });
   const bytes = identity ? signSavedPdf(saved, identity) : saved;
-  const warnings = exportWarnings(context, failedFields, rasters.size, failedText.length);
-  if (droppedLinks > 0) {
-    warnings.push(
-      droppedLinks === 1
-        ? t("Un enlace no tenía destino (o su página ya no está) y no se incluyó.")
-        : t("{n} enlaces no tenían destino (o su página ya no está) y no se incluyeron.", { n: droppedLinks }),
-    );
+  return { bytes, warnings: job.warnings(), compression };
+}
+
+/** Raster pages have their own space: the editor's scene, upside down. */
+const rasterSpace = (page: PageRef): Matrix => [1, 0, 0, -1, 0, page.height];
+
+/** One export: the document being built and what each step has found. */
+class ExportJob {
+  /** Redaction boxes of each page, in scene space. */
+  readonly redactions = new Map<string, Point[][]>();
+  readonly rasterIds: Set<string>;
+  /** Pages exported as an image (JPEG bytes). */
+  readonly rasters = new Map<string, Uint8Array>();
+  readonly failedText: string[] = [];
+  readonly substituted = new Set<string>();
+  droppedLinks = 0;
+
+  doc!: PDFDocument;
+  pages!: PDFPage[];
+  inPlace = false;
+  failedFields: string[] = [];
+  context!: DrawContext;
+  fonts!: FontCache;
+
+  constructor(
+    readonly input: ExportInput,
+    forcedRaster: ReadonlySet<string>,
+  ) {
+    this.rasterIds = new Set(forcedRaster);
   }
-  if (substituted.size > 0) {
-    warnings.unshift(
-      t("Algunos caracteres no existen en la fuente original del documento y se dibujaron con una fuente parecida: {chars}", {
-        chars: [...substituted].slice(0, 12).join(" "),
-      }),
-    );
+
+  sourceOf(page: PageRef): SourceDocument {
+    const source = this.input.sources.get(page.sourceId);
+    if (!source) throw new Error("Falta el documento de origen.");
+    return source;
   }
-  return { bytes, warnings, compression };
+
+  /** The PDF.js viewport transform of a page as the editor shows it (user space → scene). */
+  async viewport(page: PageRef): Promise<Matrix> {
+    const pdfjsPage = await this.sourceOf(page).pdf.getPage(page.sourceIndex + 1);
+    return viewportOf(pdfjsPage, 1, page).transform as Matrix;
+  }
+
+  /** Scene → the exported page's user space. */
+  async sceneToPage(page: PageRef): Promise<Matrix> {
+    return this.rasters.has(page.id) ? rasterSpace(page) : sceneToPdf(await this.viewport(page));
+  }
+
+  /** The pages with their annotations, in output order. */
+  *annotatedPages(): Generator<{ page: PageRef; index: number; data: PageAnnotations }> {
+    for (let index = 0; index < this.input.pages.length; index++) {
+      const page = this.input.pages[index];
+      const data = this.input.annotations[page.id];
+      if (data && data.objects.length > 0) yield { page, index, data };
+    }
+  }
+
+  /**
+   * What lies under redaction boxes is removed from the page's content.
+   * Boxes over objects that show something of their own force an image.
+   */
+  async planRedactions(): Promise<void> {
+    for (const { page, data } of this.annotatedPages()) {
+      if (!hasRedactions(data)) continue;
+      const { areas, coversContent } = await redactionAreas(data);
+      this.redactions.set(page.id, areas);
+      if (coversContent) this.rasterIds.add(page.id);
+    }
+  }
+
+  async rasterize(): Promise<void> {
+    for (const page of this.input.pages) {
+      if (!this.rasterIds.has(page.id)) continue;
+      const options = { dpi: RASTER_DPI, format: "image/jpeg" as const };
+      const data = this.input.annotations[page.id];
+      this.rasters.set(page.id, await rasterizePage(page, this.sourceOf(page), data, this.input.formValues, options));
+    }
+  }
+
+  async assemble(): Promise<{ doc: PDFDocument; pages: PDFPage[] }> {
+    const placements: PagePlacement[] = this.input.pages.map((page) =>
+      this.rasters.has(page.id)
+        ? { kind: "raster", width: page.width, height: page.height }
+        : { sourceId: page.sourceId, sourceIndex: page.sourceIndex, rotation: page.rotation, crop: page.crop },
+    );
+    const fieldFont = async (doc: PDFDocument) => {
+      doc.registerFontkit((await loadFontkit()) as never);
+      return doc.embedFont(await embeddedFontBytes("noto-sans", "regular"), { subset: true });
+    };
+    const assembled = await assembleDocument(placements, this.input.sources, {
+      formValues: this.input.formValues,
+      fieldFont,
+    });
+    this.doc = assembled.doc;
+    this.pages = assembled.pages;
+    this.inPlace = assembled.inPlace;
+    this.failedFields = assembled.failedFields;
+    this.context = new DrawContext(this.doc, {
+      loadImage,
+      loadFont: embeddedFontBytes,
+      loadScriptFont: scriptFontBytes,
+      fontkit: await loadFontkit(),
+    });
+    this.fonts = new FontCache(this.doc.context);
+    return { doc: this.doc, pages: this.pages };
+  }
+
+  /** Rewrites the document text the user edited. */
+  async applyEditedText(): Promise<void> {
+    for (const { page, index, data } of this.annotatedPages()) {
+      if (this.rasters.has(page.id)) continue;
+      const specs = await pageSpecs(this.sourceOf(page), page, data);
+      if (specs.length === 0) continue;
+      const report = await applyNativeSpecs(this.pages[index], specs, this.fonts, fallbackResources(this.context));
+      this.failedText.push(...report.failed);
+      for (const run of specs.flatMap((spec) => spec.runs)) {
+        if (run.font.kind !== "fallback" || !run.font.substitute) continue;
+        for (const glyph of run.glyphs) this.substituted.add(glyph.text);
+      }
+    }
+  }
+
+  /** Cuts what lies under the redaction boxes. Returns the pages where that was not possible. */
+  async redact(): Promise<string[]> {
+    const unredactable: string[] = [];
+    for (let i = 0; i < this.input.pages.length; i++) {
+      const page = this.input.pages[i];
+      const areas = this.redactions.get(page.id);
+      if (!areas || this.rasterIds.has(page.id)) continue;
+      const toPdf = await this.sceneToPage(page);
+      const userAreas = areas.map((area) => area.map(([x, y]) => applyToPoint(toPdf, x, y)));
+      const outcome = await redactPage(this.pages[i], userAreas, this.fonts, fallbackResources(this.context));
+      if (!outcome.done) unredactable.push(page.id);
+    }
+    return unredactable;
+  }
+
+  /** Raster pages get their image; the others, the user's annotations as vector content. */
+  async drawAnnotations(): Promise<void> {
+    for (let i = 0; i < this.input.pages.length; i++) {
+      const page = this.input.pages[i];
+      const raster = this.rasters.get(page.id);
+      if (raster) {
+        const image = await this.doc.embedJpg(raster);
+        this.pages[i].drawImage(image, { x: 0, y: 0, width: page.width, height: page.height });
+      }
+    }
+    for (const { page, index, data } of this.annotatedPages()) {
+      if (this.rasters.has(page.id)) continue;
+      await ensureFontsFor(data.objects);
+      const drawables = await fabricToDrawables(data);
+      if (drawables.length === 0) continue;
+      isolateContent(this.pages[index]);
+      await drawOnPage(this.pages[index], drawables, await this.viewport(page), this.context);
+    }
+  }
+
+  /** Recognised text of scanned pages, invisible over the picture of each word. */
+  async addRecognisedText(): Promise<void> {
+    let font: Awaited<ReturnType<DrawContext["font"]>> | null = null;
+    for (let i = 0; i < this.input.pages.length; i++) {
+      const page = this.input.pages[i];
+      const recognised = this.input.ocr?.[ocrKey(page.sourceId, page.sourceIndex)];
+      if (!recognised || recognised.lines.length === 0) continue;
+      const words = await this.#visibleWords(page, recognised);
+      if (words.length === 0) continue;
+      font ??= await this.context.font({ kind: "embedded", family: "noto-sans", variant: "regular" });
+      isolateContent(this.pages[i]);
+      addInvisibleText(this.pages[i], words, font.font, font.canEncode);
+    }
+  }
+
+  /** Recognised words that no redaction box covers, placed in the exported page's space. */
+  async #visibleWords(page: PageRef, recognised: OcrPage): Promise<{ text: string; quad: Point[] }[]> {
+    const viewport = await this.viewport(page);
+    const toPage: Matrix = this.rasters.has(page.id) ? multiply(rasterSpace(page), viewport) : IDENTITY;
+    const hidden = this.redactions.get(page.id) ?? [];
+    return recognised.lines
+      .flatMap((line) => line.words)
+      .filter((word) => !hidden.some((area) => overlapArea(toSceneQuad(word.quad, viewport), area) > 0))
+      .map((word) => ({ text: word.text, quad: word.quad.map(([x, y]) => applyToPoint(toPage, x, y)) }));
+  }
+
+  /** Notes and links, as annotations other readers can open and follow. */
+  async addNotesAndLinks(): Promise<void> {
+    const indexOfPage = new Map(this.input.pages.map((page, i) => [page.id, i]));
+    for (const { page, index, data } of this.annotatedPages()) {
+      const found = await sceneAnnotations(data);
+      if (found.length === 0) continue;
+      const toPdf = await this.sceneToPage(page);
+      const hidden = this.redactions.get(page.id) ?? [];
+      const list: PageAnnotation[] = [];
+      for (const item of found) {
+        // Whatever a redaction box covers is gone, notes and links included.
+        if (hidden.some((area) => overlapArea(item.corners, area) > 0.5)) continue;
+        const annotation = annotationFor(item, boundingRect(item.corners, toPdf), indexOfPage);
+        if (annotation) list.push(annotation);
+        else this.droppedLinks++;
+      }
+      addPageAnnotations(this.doc, this.pages[index], list, this.pages);
+    }
+  }
+
+  writeProperties(): void {
+    const { doc, input } = this;
+    if (input.stripMetadata) {
+      stripMetadata(doc);
+    } else {
+      const now = new Date();
+      doc.setProducer("ytaPDF");
+      doc.setModificationDate(now);
+      if (!this.inPlace) {
+        doc.setCreator("ytaPDF");
+        doc.setCreationDate(now);
+        if (!doc.getTitle()) doc.setTitle(input.title);
+      }
+      if (input.metadata) applyMetadata(doc, input.metadata);
+    }
+    if (!this.inPlace && input.outline && input.outline.length > 0) writeOutline(doc, this.pages, input.outline);
+  }
+
+  warnings(): string[] {
+    const warnings = exportWarnings(this.context, this.failedFields, this.rasters.size, this.failedText.length);
+    if (this.droppedLinks > 0) {
+      warnings.push(
+        this.droppedLinks === 1
+          ? t("Un enlace no tenía destino (o su página ya no está) y no se incluyó.")
+          : t("{n} enlaces no tenían destino (o su página ya no está) y no se incluyeron.", { n: this.droppedLinks }),
+      );
+    }
+    if (this.substituted.size > 0) {
+      warnings.unshift(
+        t("Algunos caracteres no existen en la fuente original del documento y se dibujaron con una fuente parecida: {chars}", {
+          chars: [...this.substituted].slice(0, 12).join(" "),
+        }),
+      );
+    }
+    return warnings;
+  }
+}
+
+/** The box (user space) around corners given in scene space. */
+function boundingRect(corners: Point[], toPdf: Matrix): UserRect {
+  const points = corners.map(([x, y]) => applyToPoint(toPdf, x, y));
+  const xs = points.map((p) => p[0]);
+  const ys = points.map((p) => p[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+/** The PDF annotation for a note or a link, or null for a link that goes nowhere. */
+function annotationFor(item: SceneAnnotation, rect: UserRect, indexOfPage: Map<string, number>): PageAnnotation | null {
+  if (item.kind === "note") {
+    return { kind: "note", rect, text: item.text, color: [item.color.r, item.color.g, item.color.b] };
+  }
+  if (item.link?.pageId) {
+    const target = indexOfPage.get(item.link.pageId);
+    return target === undefined ? null : { kind: "link", rect, pageIndex: target };
+  }
+  return item.link?.url ? { kind: "link", rect, url: item.link.url } : null;
 }
 
 /**

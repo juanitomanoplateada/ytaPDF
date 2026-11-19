@@ -17,7 +17,7 @@ function saved(): ThemeChoice {
 }
 
 class Theme {
-  choice = $state<ThemeChoice>(typeof window === "undefined" ? "system" : saved());
+  choice = $state<ThemeChoice>(globalThis.window === undefined ? "system" : saved());
 
   set(choice: ThemeChoice): void {
     this.choice = choice;

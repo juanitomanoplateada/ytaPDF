@@ -118,6 +118,31 @@ function annotationsOf(page: PDFPage): { array: PDFArray | undefined; list: Page
   return { array, list };
 }
 
+/** Removes the annotations at `indices` of the page's /Annots, with their pop-up windows. */
+function removeAnnotations(page: PDFPage, array: PDFArray, list: PageAnnotation[], indices: number[]): void {
+  const removed = new Set<PDFDict>();
+  for (const index of indices) {
+    const dict = list[index].dict;
+    if (dict) removed.add(dict);
+  }
+  const popups: PDFDict[] = [];
+  for (const dict of removed) {
+    const popup = dict.lookup(PDFName.of("Popup"));
+    if (popup instanceof PDFDict) popups.push(popup);
+  }
+  for (const popup of popups) removed.add(popup);
+  const goes = (dict: PDFDict | undefined) => {
+    const parent = dict?.lookup(PDFName.of("Parent"));
+    return !!dict && (removed.has(dict) || (parent instanceof PDFDict && removed.has(parent)));
+  };
+  const kept = page.doc.context.obj([]);
+  for (let i = 0; i < array.size(); i++) {
+    if (!goes(list[i].dict)) kept.push(array.get(i));
+  }
+  if (kept.size() > 0) page.node.set(PDFName.of("Annots"), kept);
+  else page.node.delete(PDFName.of("Annots"));
+}
+
 /**
  * Removes from `page` everything under `areas` (convex polygons in the page's
  * user space). Nothing is changed when the outcome is not `done`.
@@ -147,28 +172,7 @@ export async function redactPage(
     const report = await applyNativeSpecs(page, [spec], fonts, resources, { drop: plan.drop, content });
     if (report.failed.length > 0) return { done: false, reason: "unreadable" };
   }
-
-  if (annotations.array && plan.annotations.length > 0) {
-    const removed = new Set<PDFDict>();
-    for (const index of plan.annotations) {
-      const dict = annotations.list[index].dict;
-      if (dict) removed.add(dict);
-    }
-    // Pop-up windows of removed annotations go with them.
-    for (const dict of [...removed]) {
-      const popup = dict.lookup(PDFName.of("Popup"));
-      if (popup instanceof PDFDict) removed.add(popup);
-    }
-    const kept = page.doc.context.obj([]);
-    for (let i = 0; i < annotations.array.size(); i++) {
-      const dict = annotations.list[i].dict;
-      const parent = dict?.lookup(PDFName.of("Parent"));
-      if (dict && (removed.has(dict) || (parent instanceof PDFDict && removed.has(parent)))) continue;
-      kept.push(annotations.array.get(i));
-    }
-    if (kept.size() > 0) page.node.set(PDFName.of("Annots"), kept);
-    else page.node.delete(PDFName.of("Annots"));
-  }
+  if (annotations.array && plan.annotations.length > 0) removeAnnotations(page, annotations.array, annotations.list, plan.annotations);
 
   // A stored thumbnail would still show the page as it was.
   page.node.delete(PDFName.of("Thumb"));

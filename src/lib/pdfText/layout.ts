@@ -61,7 +61,7 @@ function place(glyph: Glyph): PlacedGlyph | undefined {
   const m = baselineMatrix(glyph);
   const lx = Math.hypot(m[0], m[1]);
   const ly = Math.hypot(m[2], m[3]);
-  if (!(lx > 1e-6) || !(ly > 1e-6) || !Number.isFinite(lx + ly + m[4] + m[5])) return undefined;
+  if (lx <= 1e-6 || ly <= 1e-6 || !Number.isFinite(lx + ly + m[4] + m[5])) return undefined;
   const u: Point = [m[0] / lx, m[1] / lx];
   const n: Point = [-u[1], u[0]];
   const origin: Point = [m[4], m[5]];
@@ -88,20 +88,21 @@ const spaceWidths = new WeakMap<PdfFont, number>();
 export function spaceEm(font: PdfFont): number {
   let width = spaceWidths.get(font);
   if (width === undefined) {
-    width = 0;
-    if (!font.composite && font.unicode(32) === " ") width = font.width(32) * font.scale;
-    if (!(width > 0)) {
-      for (const code of font.mappedCodes()) {
-        if (font.unicode(code) === " ") {
-          width = font.width(code) * font.scale;
-          break;
-        }
-      }
-    }
+    width = ownSpaceWidth(font);
     if (!(width > 0.05 && width < 1)) width = 0.25;
     spaceWidths.set(font, width);
   }
   return width;
+}
+
+/** Width (em) of the font's own space glyph: code 32, or any code that draws a space. */
+function ownSpaceWidth(font: PdfFont): number {
+  if (!font.composite && font.unicode(32) === " ") {
+    const width = font.width(32) * font.scale;
+    if (width > 0) return width;
+  }
+  const code = font.mappedCodes().find((c) => font.unicode(c) === " ");
+  return code === undefined ? 0 : font.width(code) * font.scale;
 }
 
 const isSpace = (text: string | undefined) => text !== undefined && /^\s+$/u.test(text);
@@ -174,29 +175,40 @@ function dominantSize(glyphs: PlacedGlyph[]): number {
   return best;
 }
 
+interface LineExtent {
+  u: Point;
+  perp: number;
+  size: number;
+  start: number;
+  end: number;
+}
+
+/** Whether a piece of text sits on a line's baseline, close enough along it to be part of it. */
+function continuesLine(line: LineExtent, piece: LineExtent): boolean {
+  if (!sameDirection(line.u, piece.u)) return false;
+  if (Math.abs(line.perp - piece.perp) > 0.25 * Math.min(line.size, piece.size)) return false;
+  const gap = Math.max(piece.start - line.end, line.start - piece.end);
+  return gap <= 1.5 * Math.max(line.size, piece.size);
+}
+
+/** A piece drawn over a line's text (other than the same glyphs drawn again) is another line. */
+function overlapsWithoutDuplicating(line: LineExtent, piece: LineExtent, glyphs: PlacedGlyph[], chunk: PlacedGlyph[]): boolean {
+  const overlap = Math.min(piece.end, line.end) - Math.max(piece.start, line.start);
+  return overlap > 0.3 * piece.size && !duplicates(glyphs, chunk);
+}
+
 /** Groups the page's glyphs into lines, each sorted along its baseline. */
 export function buildLines(glyphs: Glyph[]): LayoutLine[] {
   const groups: PlacedGlyph[][] = [];
-  const info: { u: Point; perp: number; size: number; start: number; end: number }[] = [];
+  const info: LineExtent[] = [];
 
   for (const chunk of chunks(visibleGlyphs(glyphs))) {
     const { start, end } = extent(chunk);
     const size = dominantSize(chunk);
     const u = chunk[0].u;
     const perp = chunk[0].perp;
-    let target = -1;
-    for (let i = 0; i < groups.length; i++) {
-      const line = info[i];
-      if (!sameDirection(line.u, u)) continue;
-      const tolerance = 0.25 * Math.min(line.size, size);
-      if (Math.abs(line.perp - perp) > tolerance) continue;
-      const gap = Math.max(start - line.end, line.start - end);
-      const overlap = Math.min(end, line.end) - Math.max(start, line.start);
-      if (overlap > 0.3 * size && !duplicates(groups[i], chunk)) continue;
-      if (gap > 1.5 * Math.max(line.size, size)) continue;
-      target = i;
-      break;
-    }
+    const piece = { u, perp, size, start, end };
+    const target = info.findIndex((line, i) => continuesLine(line, piece) && !overlapsWithoutDuplicating(line, piece, groups[i], chunk));
     if (target < 0) {
       groups.push([...chunk]);
       info.push({ u, perp, size, start, end });
@@ -213,39 +225,11 @@ export function buildLines(glyphs: Glyph[]): LayoutLine[] {
 
 function finishLine(glyphs: PlacedGlyph[]): LayoutLine | null {
   glyphs.sort((a, b) => a.x0 - b.x0 || a.glyph.op - b.glyph.op || a.glyph.index - b.glyph.index);
-  // A glyph drawn again on top of the same one only thickens it.
-  const kept: PlacedGlyph[] = [];
-  for (const g of glyphs) {
-    const twin = kept.find(
-      (o) => !o.duplicate && o.glyph.unicode === g.glyph.unicode && Math.abs(o.x0 - g.x0) < 0.15 * g.size && o.glyph !== g.glyph,
-    );
-    if (twin && Math.abs(twin.perp - g.perp) < 0.15 * g.size) g.duplicate = true;
-    kept.push(g);
-  }
-
+  markDuplicates(glyphs);
   const drawn = glyphs.filter((g) => !g.duplicate);
   const visible = drawn.filter((g) => !isSpace(g.glyph.unicode));
   if (visible.length === 0) return null;
-
-  const chars: LayoutChar[] = [];
-  let previous: PlacedGlyph | undefined;
-  for (const g of drawn) {
-    const text = g.glyph.unicode;
-    if (text !== undefined && /^[\u0000-\u001f]+$/.test(text)) continue;
-    if (previous && !isSpace(previous.glyph.unicode) && !isSpace(text)) {
-      const gap = g.x0 - previous.x1;
-      const space = spaceEm(previous.glyph.font) * previous.size;
-      const threshold = Math.min(Math.max(0.6 * space, 0.1 * g.size), 0.3 * g.size);
-      if (gap > threshold) chars.push({ text: " ", glyph: previous, inferred: true });
-    }
-    if (isSpace(text) && (chars.length === 0 || chars.at(-1)!.text === " ")) {
-      previous = g;
-      continue;
-    }
-    chars.push({ text: isSpace(text) ? " " : (text ?? "�"), glyph: g, inferred: false });
-    previous = g;
-  }
-  while (chars.length > 0 && chars.at(-1)!.text === " ") chars.pop();
+  const chars = lineChars(drawn);
 
   const first = visible[0];
   return {
@@ -258,6 +242,43 @@ function finishLine(glyphs: PlacedGlyph[]): LayoutLine | null {
     end: Math.max(...visible.map((g) => g.x1)),
     size: dominantSize(visible),
   };
+}
+
+/** A glyph drawn again on top of the same one only thickens it (fake bold). */
+function markDuplicates(glyphs: PlacedGlyph[]): void {
+  const kept: PlacedGlyph[] = [];
+  for (const g of glyphs) {
+    const twin = kept.find(
+      (o) => !o.duplicate && o.glyph.unicode === g.glyph.unicode && Math.abs(o.x0 - g.x0) < 0.15 * g.size && o.glyph !== g.glyph,
+    );
+    if (twin && Math.abs(twin.perp - g.perp) < 0.15 * g.size) g.duplicate = true;
+    kept.push(g);
+  }
+}
+
+/** Whether the gap between two glyphs is wide enough to be a space nobody drew. */
+function gapIsSpace(previous: PlacedGlyph, g: PlacedGlyph): boolean {
+  if (isSpace(previous.glyph.unicode) || isSpace(g.glyph.unicode)) return false;
+  const space = spaceEm(previous.glyph.font) * previous.size;
+  const threshold = Math.min(Math.max(0.6 * space, 0.1 * g.size), 0.3 * g.size);
+  return g.x0 - previous.x1 > threshold;
+}
+
+/** The characters of a line: its glyphs' text, with inferred spaces and no repeated or trailing ones. */
+function lineChars(drawn: PlacedGlyph[]): LayoutChar[] {
+  const chars: LayoutChar[] = [];
+  let previous: PlacedGlyph | undefined;
+  for (const g of drawn) {
+    const text = g.glyph.unicode;
+    if (text !== undefined && /^[\u0000-\u001f]+$/.test(text)) continue;
+    if (previous && gapIsSpace(previous, g)) chars.push({ text: " ", glyph: previous, inferred: true });
+    previous = g;
+    const space = isSpace(text);
+    if (space && (chars.length === 0 || chars.at(-1)?.text === " ")) continue;
+    chars.push({ text: space ? " " : (text ?? "\uFFFD"), glyph: g, inferred: false });
+  }
+  while (chars.at(-1)?.text === " ") chars.pop();
+  return chars;
 }
 
 /** Baseline position shared by most glyphs (superscripts excluded). */
@@ -282,56 +303,74 @@ function firstWordWidth(line: LayoutLine): number {
  * cannot be read reliably stay on their own.
  */
 export function buildParagraphs(lines: LayoutLine[], canJoin: (line: LayoutLine) => boolean): LayoutParagraph[] {
-  const order = [...lines].sort((a, b) => {
-    if (!sameDirection(a.u, b.u)) return Math.atan2(a.u[1], a.u[0]) - Math.atan2(b.u[1], b.u[0]);
-    return b.perp - a.perp || a.start - b.start;
-  });
-
-  const blocks: { lines: LayoutLine[]; leading: number }[] = [];
-  for (const line of order) {
-    let best: (typeof blocks)[number] | undefined;
-    let bestDistance = Infinity;
-    if (canJoin(line)) {
-      for (const block of blocks) {
-        const last = block.lines.at(-1)!;
-        if (!canJoin(last) || !sameDirection(last.u, line.u)) continue;
-        const size = Math.max(last.size, line.size);
-        if (Math.abs(last.size - line.size) > 0.15 * size) continue;
-        const distance = last.perp - line.perp;
-        if (distance < 0.8 * size || distance > 2.2 * size) continue;
-        if (block.leading > 0 && Math.abs(distance - block.leading) > 0.2 * size) continue;
-        const overlap = Math.min(last.end, line.end) - Math.max(last.start, line.start);
-        if (overlap <= 0) continue;
-        const left = Math.min(...block.lines.map((l) => l.start));
-        const right = Math.max(...block.lines.map((l) => l.end));
-        const aligned =
-          Math.abs(line.start - left) < 0.75 * size ||
-          Math.abs(line.end - right) < 0.75 * size ||
-          Math.abs((line.start + line.end) / 2 - (last.start + last.end) / 2) < 0.75 * size ||
-          (block.lines.length === 1 && line.start < last.start && last.start - line.start < 5 * size);
-        if (!aligned || distance >= bestDistance) continue;
-        best = block;
-        bestDistance = distance;
-      }
-    }
-    if (best) {
-      if (best.lines.length === 1) best.leading = bestDistance;
-      best.lines.push(line);
-    } else {
-      blocks.push({ lines: [line], leading: 0 });
-    }
-  }
-
   const paragraphs: LayoutParagraph[] = [];
-  for (const block of blocks) {
+  for (const block of lineBlocks(lines, canJoin)) {
     const align = block.lines.length > 1 ? alignmentOf(block.lines) : "left";
-    if (align === null) {
-      for (const line of block.lines) paragraphs.push(single(line));
-    } else {
-      paragraphs.push(finishParagraph(block.lines, align));
-    }
+    if (align === null) paragraphs.push(...block.lines.map(single));
+    else paragraphs.push(finishParagraph(block.lines, align));
   }
   return paragraphs;
+}
+
+/** Lines in reading order: by direction, then top to bottom and left to right. */
+function readingOrder(a: LayoutLine, b: LayoutLine): number {
+  if (!sameDirection(a.u, b.u)) return Math.atan2(a.u[1], a.u[0]) - Math.atan2(b.u[1], b.u[0]);
+  return b.perp - a.perp || a.start - b.start;
+}
+
+/** Each line joins the block whose last line is closest above it and that it can continue. */
+function lineBlocks(lines: LayoutLine[], canJoin: (line: LayoutLine) => boolean): LineBlock[] {
+  const blocks: LineBlock[] = [];
+  for (const line of [...lines].sort(readingOrder)) {
+    let best: LineBlock | undefined;
+    let bestDistance = Infinity;
+    for (const block of canJoin(line) ? blocks : []) {
+      const distance = joinDistance(block, line, canJoin);
+      if (distance === null || distance >= bestDistance) continue;
+      best = block;
+      bestDistance = distance;
+    }
+    if (!best) {
+      blocks.push({ lines: [line], leading: 0 });
+      continue;
+    }
+    if (best.lines.length === 1) best.leading = bestDistance;
+    best.lines.push(line);
+  }
+  return blocks;
+}
+
+interface LineBlock {
+  lines: LayoutLine[];
+  leading: number;
+}
+
+/**
+ * How far `line` is below the last line of a block it can continue (same
+ * size and direction, regular spacing, overlapping and aligned), or null.
+ */
+function joinDistance(block: LineBlock, line: LayoutLine, canJoin: (line: LayoutLine) => boolean): number | null {
+  const last = block.lines.at(-1);
+  if (!last || !canJoin(last) || !sameDirection(last.u, line.u)) return null;
+  const size = Math.max(last.size, line.size);
+  if (Math.abs(last.size - line.size) > 0.15 * size) return null;
+  const distance = last.perp - line.perp;
+  if (distance < 0.8 * size || distance > 2.2 * size) return null;
+  if (block.leading > 0 && Math.abs(distance - block.leading) > 0.2 * size) return null;
+  const overlap = Math.min(last.end, line.end) - Math.max(last.start, line.start);
+  return overlap > 0 && alignedWith(block, last, line, size) ? distance : null;
+}
+
+/** Whether a line lines up with a block: same left or right edge, same centre, or a first-line indent. */
+function alignedWith(block: LineBlock, last: LayoutLine, line: LayoutLine, size: number): boolean {
+  const left = Math.min(...block.lines.map((l) => l.start));
+  const right = Math.max(...block.lines.map((l) => l.end));
+  return (
+    Math.abs(line.start - left) < 0.75 * size ||
+    Math.abs(line.end - right) < 0.75 * size ||
+    Math.abs((line.start + line.end) / 2 - (last.start + last.end) / 2) < 0.75 * size ||
+    (block.lines.length === 1 && line.start < last.start && last.start - line.start < 5 * size)
+  );
 }
 
 function single(line: LayoutLine): LayoutParagraph {
@@ -398,7 +437,7 @@ function finishParagraph(lines: LayoutLine[], align: LayoutParagraph["align"]): 
     const lastText = line.chars.at(-1)?.text ?? "";
     const nextFirst = next.chars[0]?.text ?? "";
     const hyphenated = /[-\u00ad\u2010]$/.test(lastText) && /^\p{L}/u.test(nextFirst);
-    const indented = (align === "left" || align === "justify") && next.start - left > 1.0 * size;
+    const indented = (align === "left" || align === "justify") && next.start - left > size;
     const short =
       align === "justify"
         ? endsParagraph(line, right, size)

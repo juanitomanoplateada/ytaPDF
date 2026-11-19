@@ -78,33 +78,17 @@ export async function applyNativeSpecs(
   }
 
   const erase = parseEraseRanges(specs.flatMap((spec) => spec.erase));
-  const glyphsByOp = new Map<string, Glyph[]>();
-  const glyphByKey = new Map<string, Glyph>();
-  for (const glyph of content.glyphs) {
-    const key = `${glyph.path}${glyph.op}`;
-    const list = glyphsByOp.get(key) ?? [];
-    list.push(glyph);
-    glyphsByOp.set(key, list);
-    glyphByKey.set(glyph.key, glyph);
-  }
-
+  const { glyphsByOp, glyphByKey } = indexGlyphs(content.glyphs);
   const pageResources = localResources(context, content.resources);
   const names = new ResourceNames(pageResources);
 
   // Replacement drawings, grouped by the operation they follow.
   const insertions = new Map<string, string[]>();
-  const lastOp = content.operations.length - 1;
   for (const spec of specs) {
-    const requested = Number(spec.insertAfter);
-    const atEnd = spec.insertAfter === "end" || !Number.isInteger(requested) || requested < 0 || requested > lastOp;
-    const index = atEnd ? lastOp : requested;
-    const ctm = index >= 0 ? (content.ctmAfter[index] ?? IDENTITY) : IDENTITY;
+    const { key, ctm } = insertionPoint(spec, content);
     try {
       const drawing = await drawSpec(spec, ctm, glyphByKey, names, resources);
-      if (drawing) {
-        const key = atEnd ? "end" : String(index);
-        insertions.set(key, [...(insertions.get(key) ?? []), drawing]);
-      }
+      if (drawing) insertions.set(key, [...(insertions.get(key) ?? []), drawing]);
     } catch (error) {
       console.error("No se pudo dibujar el texto editado:", error);
       report.failed.push(spec.id);
@@ -125,6 +109,30 @@ export async function applyNativeSpecs(
   drawing.contentStream = undefined;
   drawing.contentStreamRef = undefined;
   return report;
+}
+
+/** The glyphs of a page by operation (`<path><op>`) and by key. */
+function indexGlyphs(glyphs: Glyph[]): { glyphsByOp: Map<string, Glyph[]>; glyphByKey: Map<string, Glyph> } {
+  const glyphsByOp = new Map<string, Glyph[]>();
+  const glyphByKey = new Map<string, Glyph>();
+  for (const glyph of glyphs) {
+    const key = `${glyph.path}${glyph.op}`;
+    const list = glyphsByOp.get(key) ?? [];
+    list.push(glyph);
+    glyphsByOp.set(key, list);
+    glyphByKey.set(glyph.key, glyph);
+  }
+  return { glyphsByOp, glyphByKey };
+}
+
+/** Where a spec's drawing goes (after which top-level operation, or "end") and the CTM there. */
+function insertionPoint(spec: NativeSpec, content: PageContent): { key: string; ctm: Matrix } {
+  const lastOp = content.operations.length - 1;
+  const requested = Number(spec.insertAfter);
+  const atEnd = spec.insertAfter === "end" || !Number.isInteger(requested) || requested < 0 || requested > lastOp;
+  const index = atEnd ? lastOp : requested;
+  const ctm = index >= 0 ? (content.ctmAfter[index] ?? IDENTITY) : IDENTITY;
+  return { key: atEnd ? "end" : String(index), ctm };
 }
 
 // ── Resources ──────────────────────────────────────────────────────────────
@@ -156,7 +164,7 @@ class ResourceNames {
    */
   add(category: "Font" | "XObject" | "ExtGState", prefix: string, object: PDFObject, identity?: string): string {
     const id = identity ?? (object instanceof PDFRef ? object.toString() : undefined);
-    const known = id !== undefined ? this.#assigned.get(`${category}:${id}`) : undefined;
+    const known = id === undefined ? undefined : this.#assigned.get(`${category}:${id}`);
     if (known) return known;
     const key = PDFName.of(category);
     let dict = this.resources.get(key);
@@ -183,6 +191,97 @@ class ResourceNames {
 // ── Erasing ────────────────────────────────────────────────────────────────
 
 const SHOW_TEXT = new Set(["Tj", "TJ", "'", '"']);
+/** Operations that paint something by themselves and are simply left out when dropped. */
+const DROPPABLE = new Set(["Do", "BI", "sh"]);
+
+interface RewriteContext {
+  bytes: Uint8Array;
+  path: string;
+  names: ResourceNames;
+  /** Marked-content sequences that contain something erased. */
+  touched: Set<number>;
+  /** XObjects some operation stopped drawing, and those still drawn. */
+  replaced: Set<string>;
+  drawn: Set<string>;
+}
+
+/**
+ * A dropped painting operation: paths end without painting ("n"), images and
+ * shadings are left out (null). Undefined for operations that paint nothing.
+ */
+function dropOperation(operation: Operation, context: RewriteContext): Part | null | undefined {
+  if (PAINT_PATH.has(operation.op)) return "n";
+  if (!DROPPABLE.has(operation.op)) return undefined;
+  const name = operation.operands[0];
+  if (operation.op === "Do" && isName(name)) context.replaced.add(name.value);
+  return null;
+}
+
+/** The strings and numbers a text-showing operation shows. */
+function showItems({ op, operands }: Operation): Operand[] {
+  if (op === "TJ") return Array.isArray(operands[0]) ? operands[0] : [];
+  return [operands[op === '"' ? 2 : 0] ?? []];
+}
+
+/** The operands of a rewritten TJ: kept codes, and shifts where erased glyphs were. */
+class ShownText {
+  readonly #out: Operand[] = [];
+  #shift = 0;
+  #bytes: number[] = [];
+
+  shift(amount: number): void {
+    this.#flush();
+    this.#shift += amount;
+  }
+
+  keep(bytes: number[]): void {
+    this.#bytes.push(...bytes);
+  }
+
+  #flush(): void {
+    if (this.#bytes.length === 0) return;
+    if (this.#shift !== 0) this.#out.push(Number(this.#shift.toFixed(4)));
+    this.#shift = 0;
+    this.#out.push({ kind: "string", bytes: Uint8Array.from(this.#bytes) });
+    this.#bytes = [];
+  }
+
+  finish(): Operand[] {
+    this.#flush();
+    if (Math.abs(this.#shift) > 1e-6) this.#out.push(Number(this.#shift.toFixed(4)));
+    return this.#out;
+  }
+}
+
+/**
+ * Goes through the codes of a shown string (glyphs come in the order the
+ * interpreter read them, numbered from `index`), keeping the others and
+ * turning erased ones into a shift of their advance. Returns the next index.
+ */
+function eraseFrom(
+  bytes: Uint8Array,
+  index: number,
+  byIndex: Map<number, Glyph>,
+  erased: Set<number>,
+  shown: ShownText,
+): number {
+  let offset = 0;
+  let next = index;
+  while (offset < bytes.length) {
+    const glyph = byIndex.get(next);
+    const length = glyph?.length ?? 1;
+    const code = Array.from(bytes.subarray(offset, offset + length));
+    offset += length;
+    if (glyph && erased.has(next)) {
+      const em = glyph.size * glyph.hScale;
+      shown.shift(em === 0 ? 0 : (-glyph.advance * 1000) / em);
+    } else {
+      shown.keep(code);
+    }
+    next++;
+  }
+  return next;
+}
 const PAINT_PATH = new Set(["S", "s", "f", "F", "f*", "B", "B*", "b", "b*"]);
 /** Marked-content properties that repeat the text or describe what is drawn. */
 const DESCRIPTIVE_PROPERTIES = ["ActualText", "Alt", "E"];
@@ -233,87 +332,61 @@ class StreamRewriter {
     insertions: Map<string, string[]> | null,
   ): Part[] {
     const parts: Part[] = [];
-    const touched = this.#touchedSequences(operations, path);
-    // XObjects this content no longer draws (dropped images, forms drawn as a copy).
-    const replaced = new Set<string>();
-    const drawn = new Set<string>();
+    const context: RewriteContext = {
+      bytes,
+      path,
+      names,
+      touched: this.#touchedSequences(operations, path),
+      replaced: new Set(),
+      drawn: new Set(),
+    };
     for (let i = 0; i < operations.length; i++) {
-      const operation = operations[i];
-      const key = `${path}${i}`;
-      const erased = this.erase.get(key);
-      const xobject = operation.op === "Do" && isName(operation.operands[0]) ? operation.operands[0].value : undefined;
-      if (this.drop.has(key) && PAINT_PATH.has(operation.op)) {
-        parts.push("n");
-      } else if (this.drop.has(key) && (operation.op === "Do" || operation.op === "BI" || operation.op === "sh")) {
-        if (xobject) replaced.add(xobject);
-      } else if (erased && SHOW_TEXT.has(operation.op)) {
-        parts.push(this.#rewriteShow(operation, this.glyphsByOp.get(key) ?? [], erased));
-      } else if (operation.op === "Do" && this.#touches(`${key}/`)) {
-        const clone = this.#rewriteForm(`${key}/`, names);
-        if (clone && xobject) replaced.add(xobject);
-        else if (xobject) drawn.add(xobject);
-        parts.push(clone ?? bytes.subarray(operation.start, operation.end));
-      } else if (touched.has(i) && operation.op === "BDC") {
-        parts.push(withoutDescriptions(operation) ?? bytes.subarray(operation.start, operation.end));
-      } else {
-        if (xobject) drawn.add(xobject);
-        parts.push(bytes.subarray(operation.start, operation.end));
-      }
+      const part = this.#rewriteOperation(operations[i], i, context);
+      if (part !== null) parts.push(part);
       const after = insertions?.get(String(i));
       if (after) parts.push(...after);
     }
-    for (const name of replaced) if (!drawn.has(name)) names.remove("XObject", name);
+    for (const name of context.replaced) if (!context.drawn.has(name)) names.remove("XObject", name);
     return parts;
+  }
+
+  /** What replaces one operation (null: nothing), noting the XObjects it stops or keeps drawing. */
+  #rewriteOperation(operation: Operation, i: number, context: RewriteContext): Part | null {
+    const { op } = operation;
+    const key = `${context.path}${i}`;
+    const original = context.bytes.subarray(operation.start, operation.end);
+    const dropped = this.drop.has(key) ? dropOperation(operation, context) : undefined;
+    if (dropped !== undefined) return dropped;
+    const erased = this.erase.get(key);
+    if (erased && SHOW_TEXT.has(op)) return this.#rewriteShow(operation, this.glyphsByOp.get(key) ?? [], erased);
+    if (op === "Do") return this.#rewriteDo(operation, key, original, context);
+    if (op === "BDC" && context.touched.has(i)) return withoutDescriptions(operation) ?? original;
+    return original;
+  }
+
+  /** A form with something erased inside is drawn as a copy; anything else stays as it is. */
+  #rewriteDo(operation: Operation, key: string, original: Uint8Array, context: RewriteContext): Part {
+    const name = operation.operands[0];
+    const xobject = isName(name) ? name.value : undefined;
+    const clone = this.#touches(`${key}/`) ? this.#rewriteForm(`${key}/`, context.names) : null;
+    if (xobject) (clone ? context.replaced : context.drawn).add(xobject);
+    return clone ?? original;
   }
 
   /** Rewrites a text-showing operation without the erased glyphs, keeping their advance. */
   #rewriteShow(operation: Operation, glyphs: Glyph[], erased: Set<number>): string {
     const { op, operands } = operation;
-    const items: Operand[] = op === "TJ" ? (Array.isArray(operands[0]) ? operands[0] : []) : [operands[op === '"' ? 2 : 0] ?? []];
-    const out: Operand[] = [];
-    let pendingShift = 0;
-    let pendingBytes: number[] = [];
-    const flushBytes = () => {
-      if (pendingBytes.length === 0) return;
-      if (pendingShift !== 0) out.push(Number(pendingShift.toFixed(4)));
-      pendingShift = 0;
-      out.push({ kind: "string", bytes: Uint8Array.from(pendingBytes) });
-      pendingBytes = [];
-    };
-
+    const shown = new ShownText();
     const byIndex = new Map(glyphs.map((g) => [g.index, g]));
     let index = 0;
-    for (const item of items) {
-      if (typeof item === "number") {
-        flushBytes();
-        pendingShift += item;
-        continue;
-      }
-      if (!isString(item)) continue;
-      let offset = 0;
-      // Glyphs come in the same order the interpreter read them.
-      while (offset < item.bytes.length) {
-        const glyph = byIndex.get(index);
-        const length = glyph?.length ?? 1;
-        const codeBytes = Array.from(item.bytes.subarray(offset, offset + length));
-        offset += length;
-        if (glyph && erased.has(index)) {
-          flushBytes();
-          const em = glyph.size * glyph.hScale;
-          if (em !== 0) pendingShift += (-glyph.advance * 1000) / em;
-        } else {
-          pendingBytes.push(...codeBytes);
-        }
-        index++;
-      }
+    for (const item of showItems(operation)) {
+      if (typeof item === "number") shown.shift(item);
+      else if (isString(item)) index = eraseFrom(item.bytes, index, byIndex, erased, shown);
     }
-    flushBytes();
-    if (Math.abs(pendingShift) > 1e-6) out.push(Number(pendingShift.toFixed(4)));
-
-    const shown = `${formatOperand(out)} TJ`;
-    if (op === "'") return `T* ${shown}`;
-    if (op === '"') return `${formatOperand(operands[0] ?? 0)} Tw ${formatOperand(operands[1] ?? 0)} Tc T* ${shown}`;
-    return shown;
+    const text = `${formatOperand(shown.finish())} TJ`;
+    if (op === "'") return `T* ${text}`;
+    if (op === '"') return `${formatOperand(operands[0] ?? 0)} Tw ${formatOperand(operands[1] ?? 0)} Tc T* ${text}`;
+    return text;
   }
 
   /** Draws a modified copy of a form instead of the shared original. */

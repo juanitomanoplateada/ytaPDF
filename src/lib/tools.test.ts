@@ -117,21 +117,21 @@ describe("typed signatures", () => {
   });
 });
 
-describe("signature photos", () => {
-  /** White paper with a dark grey stroke from (20, 10) to (59, 14). */
-  function photo() {
-    const width = 80;
-    const height = 30;
-    const data = new Uint8ClampedArray(width * height * 4).fill(255);
-    for (let y = 10; y < 15; y++) {
-      for (let x = 20; x < 60; x++) {
-        const i = (y * width + x) * 4;
-        data[i] = data[i + 1] = data[i + 2] = 40;
-      }
+/** White paper with a dark grey stroke from (20, 10) to (59, 14). */
+function photo() {
+  const width = 80;
+  const height = 30;
+  const data = new Uint8ClampedArray(width * height * 4).fill(255);
+  for (let y = 10; y < 15; y++) {
+    for (let x = 20; x < 60; x++) {
+      const i = (y * width + x) * 4;
+      data[i] = data[i + 1] = data[i + 2] = 40;
     }
-    return { data, width, height };
   }
+  return { data, width, height };
+}
 
+describe("signature photos", () => {
   it("keeps the ink in one colour on a transparent background, cropped to it", () => {
     const ink = extractInk(photo(), hexToRgb("#1a3a8f"), 0.5);
     expect(ink.found).toBe(true);

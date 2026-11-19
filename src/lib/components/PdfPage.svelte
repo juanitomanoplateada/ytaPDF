@@ -45,7 +45,7 @@
   } from "../fabricSetup";
   import {
     editor,
-    signatureWidth,
+    placedSignatureWidth,
     type DrawTool,
     type PageAnnotations,
     type PageController,
@@ -1108,7 +1108,7 @@
 
     addSignature(signature) {
       if (!canvas) return;
-      place(createSignature(signature, signatureWidth(page.width, signature.initials)), visibleCenter());
+      place(createSignature(signature, placedSignatureWidth(page.width, signature)), visibleCenter());
     },
 
     addMark(kind) {

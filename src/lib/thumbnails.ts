@@ -64,15 +64,23 @@ export function withoutNativeText(data: PageAnnotations): PageAnnotations {
   return { ...data, objects: data.objects.filter((object) => !isNativeData(object)) };
 }
 
+/** What a thumbnail shows and at what size. */
+export interface ThumbnailRequest {
+  source: SourceDocument;
+  page: PageRef;
+  /** Width on screen, in CSS pixels. */
+  cssWidth: number;
+  annotations: PageAnnotations | undefined;
+  /** Changes when the source's form values change, so cached bitmaps are not reused. */
+  formRevision: number;
+  formValues: Record<string, FormValue>;
+  signal: AbortSignal;
+}
+
 async function pageBitmap(
-  source: SourceDocument,
-  page: PageRef,
-  cssWidth: number,
+  { source, page, cssWidth, formRevision, formValues, signal }: ThumbnailRequest,
   pixelRatio: number,
-  formRevision: number,
   specs: NativeSpec[],
-  formValues: Record<string, FormValue>,
-  signal: AbortSignal,
 ): Promise<ImageBitmap | null> {
   const edits = specs.length > 0 ? specKey(specs) : "";
   const key = `${source.id}:${page.sourceIndex}:${page.rotation}:${page.crop?.join(",") ?? ""}:${formRevision}:${edits}:${Math.round(cssWidth * pixelRatio)}`;
@@ -128,20 +136,12 @@ export async function paintAnnotations(
  * Draws a page thumbnail with its annotations into `canvas`, which is only
  * touched once everything is ready so updates never flash.
  */
-export async function renderThumbnail(
-  canvas: HTMLCanvasElement,
-  source: SourceDocument,
-  page: PageRef,
-  cssWidth: number,
-  annotations: PageAnnotations | undefined,
-  formRevision: number,
-  formValues: Record<string, FormValue>,
-  signal: AbortSignal,
-): Promise<void> {
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+export async function renderThumbnail(canvas: HTMLCanvasElement, request: ThumbnailRequest): Promise<void> {
+  const { source, page, annotations, signal } = request;
+  const pixelRatio = Math.min(globalThis.devicePixelRatio || 1, 2);
   const specs = await pageSpecs(source, page, annotations);
   if (signal.aborted) return;
-  const bitmap = await pageBitmap(source, page, cssWidth, pixelRatio, formRevision, specs, formValues, signal);
+  const bitmap = await pageBitmap(request, pixelRatio, specs);
   if (!bitmap || signal.aborted) return;
 
   const scratch = document.createElement("canvas");

@@ -71,6 +71,15 @@ for (const c of [
 }
 
 const isDigit = (c: number) => c >= 0x30 && c <= 0x39;
+
+/** Escapes of literal strings that stand for one byte (n, r, t, b, f after a backslash). */
+const ESCAPES = new Map<number, number>([
+  [0x6e, Char.LineFeed],
+  [0x72, Char.Return],
+  [0x74, Char.Tab],
+  [0x62, 0x08],
+  [0x66, Char.FormFeed],
+]);
 const isRegular = (c: number) => !WHITESPACE[c] && !DELIMITER[c];
 
 /** Marks the end of an array or dictionary while reading nested operands. */
@@ -164,7 +173,7 @@ class Lexer {
     const start = this.pos;
     while (this.pos < bytes.length && isRegular(bytes[this.pos])) this.pos++;
     const raw = latin1(bytes.subarray(start, this.pos));
-    const value = raw.replace(/#([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+    const value = raw.replaceAll(/#([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)));
     return { kind: "name", value };
   }
 
@@ -177,55 +186,71 @@ class Lexer {
       const c = bytes[this.pos++];
       if (c === Char.Backslash) {
         if (this.pos >= bytes.length) break;
-        const e = bytes[this.pos++];
-        switch (e) {
-          case 0x6e: // n
-            out.push(Char.LineFeed);
-            break;
-          case 0x72: // r
-            out.push(Char.Return);
-            break;
-          case 0x74: // t
-            out.push(Char.Tab);
-            break;
-          case 0x62: // b
-            out.push(0x08);
-            break;
-          case 0x66: // f
-            out.push(Char.FormFeed);
-            break;
-          case Char.Return:
-            // Line continuation: the backslash and the end of line are dropped.
-            if (bytes[this.pos] === Char.LineFeed) this.pos++;
-            break;
-          case Char.LineFeed:
-            break;
-          default:
-            if (e >= 0x30 && e <= 0x37) {
-              let value = e - 0x30;
-              for (let i = 0; i < 2 && bytes[this.pos] >= 0x30 && bytes[this.pos] <= 0x37; i++) {
-                value = value * 8 + (bytes[this.pos++] - 0x30);
-              }
-              out.push(value & 0xff);
-            } else {
-              out.push(e);
-            }
-        }
-      } else if (c === Char.ParenOpen) {
-        depth++;
-        out.push(c);
-      } else if (c === Char.ParenClose) {
-        if (--depth === 0) break;
-        out.push(c);
-      } else if (c === Char.Return) {
-        // An unescaped end of line is read as a single line feed.
-        if (bytes[this.pos] === Char.LineFeed) this.pos++;
-        out.push(Char.LineFeed);
-      } else {
-        out.push(c);
+        this.#readEscape(out);
+        continue;
       }
+      // Balanced parentheses are part of the string; the unbalanced one ends it.
+      if (c === Char.ParenOpen) depth++;
+      if (c === Char.ParenClose) depth--;
+      if (depth === 0) break;
+      this.#readPlain(c, out);
     }
     return { kind: "string", bytes: Uint8Array.from(out) };
+  }
+
+  /** A byte of a literal string as written: an unescaped end of line is read as a single line feed. */
+  #readPlain(c: number, out: number[]): void {
+    if (c !== Char.Return) {
+      out.push(c);
+      return;
+    }
+    if (this.bytes[this.pos] === Char.LineFeed) this.pos++;
+    out.push(Char.LineFeed);
+  }
+
+  /** Reads what follows a backslash in a literal string, adding the byte it stands for (if any). */
+  #readEscape(out: number[]): void {
+    const { bytes } = this;
+    const e = bytes[this.pos++];
+    const simple = ESCAPES.get(e);
+    if (simple !== undefined) {
+      out.push(simple);
+    } else if (e === Char.Return || e === Char.LineFeed) {
+      // Line continuation: the backslash and the end of line are dropped.
+      if (e === Char.Return && bytes[this.pos] === Char.LineFeed) this.pos++;
+    } else if (e >= 0x30 && e <= 0x37) {
+      let value = e - 0x30;
+      for (let i = 0; i < 2 && bytes[this.pos] >= 0x30 && bytes[this.pos] <= 0x37; i++) {
+        value = value * 8 + (bytes[this.pos++] - 0x30);
+      }
+      out.push(value & 0xff);
+    } else {
+      out.push(e);
+    }
+  }
+
+  /**
+   * Reads an inline image's dictionary, up to its ID keyword, then skips its
+   * data. `pos` is right after BI; on return it is right after EI.
+   */
+  readInlineImage(): PdfDictOperand {
+    const dict: PdfDictOperand = { kind: "dict", entries: new Map() };
+    let key: string | null = null;
+    for (let part = this.next(); part !== undefined; part = this.next()) {
+      if (isKeyword(part)) {
+        if (part.keyword === "ID") break;
+        continue;
+      }
+      if (part === CLOSE_ARRAY || part === CLOSE_DICT) continue;
+      if (key === null) {
+        if (isName(part)) key = part.value;
+      } else {
+        dict.entries.set(key, part);
+        key = null;
+      }
+    }
+    this.skipInlineImageData();
+    return dict;
   }
 
   readHexString(): PdfString {
@@ -313,7 +338,7 @@ function hexValue(c: number): number {
 export function latin1(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i += 8192) {
-    out += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    out += String.fromCodePoint(...bytes.subarray(i, i + 8192));
   }
   return out;
 }
@@ -331,37 +356,14 @@ export function parseContent(bytes: Uint8Array): Operation[] {
     const token = lexer.next();
     if (token === undefined) break;
     if (start < 0) start = tokenStart;
-
     if (token === CLOSE_ARRAY || token === CLOSE_DICT) continue;
     if (!isKeyword(token)) {
       operands.push(token);
       continue;
     }
-
-    if (token.keyword === "BI") {
-      // Inline image: its dictionary is read up to ID, then the data is skipped.
-      const dict: PdfDictOperand = { kind: "dict", entries: new Map() };
-      let key: string | null = null;
-      for (;;) {
-        const part = lexer.next();
-        if (part === undefined) break;
-        if (isKeyword(part)) {
-          if (part.keyword === "ID") break;
-          continue;
-        }
-        if (part === CLOSE_ARRAY || part === CLOSE_DICT) continue;
-        if (key === null) {
-          if (typeof part === "object" && part !== null && !Array.isArray(part) && part.kind === "name") key = part.value;
-        } else {
-          dict.entries.set(key, part);
-          key = null;
-        }
-      }
-      lexer.skipInlineImageData();
-      operations.push({ op: "BI", operands: [dict], start, end: lexer.pos });
-    } else {
-      operations.push({ op: token.keyword, operands, start, end: lexer.pos });
-    }
+    // Inline image: its dictionary is read up to ID, then the data is skipped.
+    if (token.keyword === "BI") operands = [lexer.readInlineImage()];
+    operations.push({ op: token.keyword, operands, start, end: lexer.pos });
     operands = [];
     start = -1;
   }
@@ -380,19 +382,19 @@ export function formatNumber(value: number): string {
 
 function formatName(value: string): string {
   let out = "/";
-  for (let i = 0; i < value.length; i++) {
-    const c = value.charCodeAt(i);
+  for (const char of value) {
+    const c = char.codePointAt(0) ?? 0;
     const plain = c > 0x20 && c < 0x7f && c !== 0x23 && isRegular(c);
-    out += plain ? value[i] : `#${c.toString(16).padStart(2, "0")}`;
+    out += plain ? char : `#${c.toString(16).padStart(2, "0")}`;
   }
   return out;
 }
 
 export function hexString(bytes: ArrayLike<number>): string {
-  let out = "<";
-  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
-  return `${out}>`;
+  return `<${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}>`;
 }
+
+const formatEntry = ([key, value]: [string, Operand]) => `${formatName(key)} ${formatOperand(value)}`;
 
 export function formatOperand(operand: Operand): string {
   if (operand === null) return "null";
@@ -405,7 +407,7 @@ export function formatOperand(operand: Operand): string {
     case "string":
       return hexString(operand.bytes);
     case "dict":
-      return `<<${[...operand.entries].map(([key, value]) => `${formatName(key)} ${formatOperand(value)}`).join(" ")}>>`;
+      return `<<${[...operand.entries].map(formatEntry).join(" ")}>>`;
   }
 }
 

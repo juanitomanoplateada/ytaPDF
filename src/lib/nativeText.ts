@@ -2,7 +2,18 @@ import { classRegistry, IText, Textbox, util, type FabricObject } from "fabric";
 import { applyToPoint, objectToPdf, sceneToPdf, type Matrix } from "./geometry";
 import { isBoldWeight, isItalicStyle } from "./fonts";
 import { colorToHex, hexToColor, type FillColor } from "./pdfText/color";
-import type { AnalyzedChar, AnalyzedFont, NativeRun, NativeSpec, NativeUnderline, PageTextAnalysis, Point, TextUnit } from "./pdfText/types";
+import type {
+  AnalyzedChar,
+  AnalyzedFont,
+  NativeRun,
+  NativeSpec,
+  NativeUnderline,
+  PageTextAnalysis,
+  Point,
+  RunFont,
+  RunGlyph,
+  TextUnit,
+} from "./pdfText/types";
 
 /**
  * Text of the document turned into an editable object. It is a Fabric text
@@ -146,7 +157,7 @@ function renderEachChar(
 }
 
 export class NativeLine extends IText {
-  static type = "NativeLine";
+  static readonly type = "NativeLine";
   declare ytaNative: NativeData;
   /** The page bitmap already shows this text: draw nothing but keep it selectable. */
   ytaGhost = false;
@@ -165,7 +176,7 @@ export class NativeLine extends IText {
 }
 
 export class NativeBlock extends Textbox {
-  static type = "NativeBlock";
+  static readonly type = "NativeBlock";
   declare ytaNative: NativeData;
   ytaGhost = false;
 
@@ -190,30 +201,34 @@ export class NativeBlock extends Textbox {
     const text = internals(this);
     const count = text._textLines.length;
     for (let i = 0; i < count; i++) {
-      const graphemes = text._textLines[i];
-      const last = i === count - 1;
-      // The last line stays justified only while the text keeps its original lines.
-      const justify = last
-        ? this.ytaNative?.justifyLast === true && count <= (this.ytaNative.lineCount ?? count)
-        : !text.isEndOfWrapping(i) || /[-\u00ad\u2010]$/.test(graphemes.join(""));
-      if (!justify) continue;
+      if (!this.#justifies(i, count)) continue;
       const lineWidth = text.getLineWidth(i);
       const spaces = text.textLines[i].match(text._reSpacesAndTabs);
       if (lineWidth >= text.width || !spaces) continue;
-      const extra = (text.width - lineWidth) / spaces.length;
-      let shift = 0;
-      for (let j = 0; j <= graphemes.length; j++) {
-        const box = text.__charBounds[i][j];
-        if (!box) continue;
-        if (text._reSpaceAndTab.test(graphemes[j])) {
-          box.width += extra;
-          box.kernedWidth += extra;
-          box.left += shift;
-          shift += extra;
-        } else {
-          box.left += shift;
-        }
-      }
+      this.#widenSpaces(i, (text.width - lineWidth) / spaces.length);
+    }
+  }
+
+  /** Whether line `i` of `count` is justified (the last one stays so only while the text keeps its original lines). */
+  #justifies(i: number, count: number): boolean {
+    const text = internals(this);
+    if (i === count - 1) return this.ytaNative?.justifyLast === true && count <= (this.ytaNative.lineCount ?? count);
+    return !text.isEndOfWrapping(i) || /[-\u00ad\u2010]$/.test(text._textLines[i].join(""));
+  }
+
+  /** Adds `extra` to every space of line `i`, moving what follows. */
+  #widenSpaces(i: number, extra: number): void {
+    const text = internals(this);
+    const graphemes = text._textLines[i];
+    let shift = 0;
+    for (let j = 0; j <= graphemes.length; j++) {
+      const box = text.__charBounds[i][j];
+      if (!box) continue;
+      box.left += shift;
+      if (!text._reSpaceAndTab.test(graphemes[j])) continue;
+      box.width += extra;
+      box.kernedWidth += extra;
+      shift += extra;
     }
   }
 }
@@ -241,7 +256,7 @@ function genericStack(font: AnalyzedFont): string {
 }
 
 function nativeFont(font: AnalyzedFont, index: number): NativeFont {
-  const families = font.families.map((family) => `"${family.replace(/"/g, "")}"`);
+  const families = font.families.map((family) => `"${family.replaceAll('"', "")}"`);
   return {
     name: font.name,
     sample: font.sample,
@@ -289,12 +304,13 @@ export function createNativeText(unit: TextUnit, analysis: PageTextAnalysis, vie
     const font = fonts[fontOf.get(c.font)!];
     const fill = colorToHex(c.color);
     if (!colors.has(fill)) colors.set(fill, c.color);
+    const fontStyle: "italic" | "normal" = font.italic ? "italic" : "normal";
     return {
       fontFamily: font.css,
       fontSize: c.size * k,
       fill,
       fontWeight: font.bold ? "bold" : "normal",
-      fontStyle: (font.italic ? "italic" : "normal") as "italic" | "normal",
+      fontStyle,
       ...(c.rise ? { deltaY: -c.rise * k } : {}),
     };
   };
@@ -305,7 +321,8 @@ export function createNativeText(unit: TextUnit, analysis: PageTextAnalysis, vie
   let line = 0;
   let column = 0;
   const put = (char: string, charStyle: Record<string, unknown>) => {
-    (styles[line] ??= {})[column] = charStyle;
+    styles[line] ??= {};
+    styles[line][column] = charStyle;
     text += char;
     column++;
   };
@@ -461,7 +478,7 @@ export function toPlainTextData(object: Record<string, unknown>): Record<string,
   return {
     ...rest,
     type: object.type === "NativeBlock" ? "Textbox" : "IText",
-    fontFamily: plainFontFamily(String(object.fontFamily ?? "")),
+    fontFamily: plainFontFamily(typeof object.fontFamily === "string" ? object.fontFamily : ""),
     styles: [],
     textAlign: typeof object.textAlign === "string" && object.textAlign.startsWith("justify") ? "left" : object.textAlign,
     opacity: object.opacity ?? 1,
@@ -475,6 +492,111 @@ const UNDERLINE_OFFSET = 0.1;
 const UNDERLINE_THICKNESS = 66.667 / 1000;
 
 const colorKey = (color: FillColor) => `${color.space}:${color.components.map((c) => c.toFixed(4)).join(",")}`;
+
+/** A style value as text: strings and numbers (font weights) as they are, anything else as `fallback`. */
+function textOf(value: unknown, fallback: string): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : fallback;
+}
+
+/** One character as Fabric laid it out, in the object's local space (y up). */
+interface PlacedChar {
+  char: string;
+  style: Record<string, unknown>;
+  size: number;
+  x: number;
+  y: number;
+  width: number;
+  baseline: number;
+  color: FillColor;
+}
+
+/** The run a character belongs to (its key) and the glyph it adds, or null for spaces nothing draws. */
+function runGlyph(data: NativeData, placed: PlacedChar): { key: string; font: RunFont; glyph: RunGlyph } | null {
+  const { char, style, x, y } = placed;
+  const font = originalFontFor(data, style);
+  const entry = font?.glyphs[char];
+  if (font && entry) {
+    return {
+      key: `o${font.key}`,
+      font: { kind: "original", sample: font.sample, key: font.key },
+      glyph: { text: char, code: entry[0], length: entry[1], width: entry[2], x, y },
+    };
+  }
+  if (/^\s+$/.test(char)) return null;
+  const family = textOf(style.fontFamily, "");
+  const weight = textOf(style.fontWeight, "normal");
+  const fontStyle = textOf(style.fontStyle, "normal");
+  // The original font is still wanted, but lacks this character.
+  const substitute = font !== undefined;
+  return {
+    key: `f${family}|${weight}|${fontStyle}|${substitute}`,
+    font: { kind: "fallback", family, weight, style: fontStyle, ...(substitute ? { substitute } : {}) },
+    glyph: { text: char, x, y },
+  };
+}
+
+/** Builds the spec of a native object, character by character. */
+class SpecBuilder {
+  readonly #runs = new Map<string, NativeRun>();
+  readonly #colors: Map<string, FillColor>;
+  #underline: NativeUnderline | null = null;
+
+  constructor(
+    readonly spec: NativeSpec,
+    private readonly data: NativeData,
+  ) {
+    this.#colors = new Map(data.colors);
+  }
+
+  colorOf(fill: unknown): FillColor {
+    const hex = typeof fill === "string" ? fill.toLowerCase() : "#000000";
+    return this.#colors.get(hex) ?? hexToColor(hex);
+  }
+
+  add(placed: PlacedChar): void {
+    this.#extendUnderline(placed);
+    const run = runGlyph(this.data, placed);
+    if (!run) return;
+    const runKey = `${run.key}|${placed.size.toFixed(4)}|${colorKey(placed.color)}`;
+    let entry = this.#runs.get(runKey);
+    if (!entry) {
+      entry = { font: run.font, size: placed.size, color: placed.color, glyphs: [] };
+      this.#runs.set(runKey, entry);
+    }
+    entry.glyphs.push(run.glyph);
+  }
+
+  /** Underlined characters next to each other share one rectangle. */
+  #extendUnderline({ style, size, x, width, baseline, color }: PlacedChar): void {
+    if (!style.underline) {
+      this.#underline = null;
+      return;
+    }
+    const thickness = size * UNDERLINE_THICKNESS;
+    const rectY = -(baseline + size * UNDERLINE_OFFSET + thickness);
+    const current = this.#underline;
+    if (
+      current &&
+      colorKey(current.color) === colorKey(color) &&
+      Math.abs(current.y - rectY) < 1e-6 &&
+      Math.abs(current.thickness - thickness) < 1e-6
+    ) {
+      current.width = x + width - current.x;
+      return;
+    }
+    this.#underline = { color, x, y: rectY, width, thickness };
+    this.spec.underlines.push(this.#underline);
+  }
+
+  endLine(): void {
+    this.#underline = null;
+  }
+
+  finish(): NativeSpec {
+    this.spec.runs = [...this.#runs.values()];
+    return this.spec;
+  }
+}
 
 /**
  * What a native object asks of the PDF: the glyphs to erase and the text to
@@ -498,75 +620,31 @@ export function nativeSpec(object: NativeText, viewport: Matrix, drawText = true
   if (Math.abs((object.opacity ?? 1) - data.alpha) > 1e-3) spec.opacity = object.opacity ?? 1;
 
   const text = internals(object);
-  const originalColors = new Map(data.colors);
-  const runs = new Map<string, NativeRun>();
+  const builder = new SpecBuilder(spec, data);
   const leftOffset = text._getLeftOffset();
   let lineTop = text._getTopOffset();
-
   for (let i = 0; i < text._textLines.length; i++) {
-    const graphemes = text._textLines[i];
     const baseline = lineTop + text.getHeightOfLineImpl(i) * (1 - text._fontSizeFraction);
     const lineLeft = leftOffset + text._getLineLeftOffset(i);
-    let underline: NativeUnderline | null = null;
-
-    for (let j = 0; j < graphemes.length; j++) {
-      const char = graphemes[j];
+    text._textLines[i].forEach((char, j) => {
       const box = text.__charBounds[i]?.[j];
-      if (!box) continue;
+      if (!box) return;
       const style = text.getCompleteStyleDeclaration(i, j);
-      const size = Number(style.fontSize) || object.fontSize;
-      const x = lineLeft + box.left;
-      const y = -(baseline + (Number(style.deltaY) || 0));
-      const hex = typeof style.fill === "string" ? style.fill.toLowerCase() : "#000000";
-      const color = originalColors.get(hex) ?? hexToColor(hex);
-
-      if (style.underline) {
-        const thickness = size * UNDERLINE_THICKNESS;
-        const rectY = -(baseline + size * UNDERLINE_OFFSET + thickness);
-        const sameLine =
-          underline && colorKey(underline.color) === colorKey(color) && Math.abs(underline.y - rectY) < 1e-6 && Math.abs(underline.thickness - thickness) < 1e-6;
-        if (sameLine) underline!.width = x + box.width - underline!.x;
-        else {
-          underline = { color, x, y: rectY, width: box.width, thickness };
-          spec.underlines.push(underline);
-        }
-      } else {
-        underline = null;
-      }
-
-      const font = originalFontFor(data, style);
-      const entry = font?.glyphs[char];
-
-      let key: string;
-      let glyph: NativeRun["glyphs"][number];
-      let runFont: NativeRun["font"];
-      if (font && entry) {
-        key = `o${font.key}`;
-        runFont = { kind: "original", sample: font.sample, key: font.key };
-        glyph = { text: char, code: entry[0], length: entry[1], width: entry[2], x, y };
-      } else {
-        if (/^\s+$/.test(char)) continue;
-        const family = String(style.fontFamily ?? "");
-        const weight = String(style.fontWeight ?? "normal");
-        const fontStyle = String(style.fontStyle ?? "normal");
-        // The original font is still wanted, but lacks this character.
-        const substitute = font !== undefined;
-        key = `f${family}|${weight}|${fontStyle}|${substitute}`;
-        runFont = { kind: "fallback", family, weight, style: fontStyle, ...(substitute ? { substitute } : {}) };
-        glyph = { text: char, x, y };
-      }
-      const runKey = `${key}|${size.toFixed(4)}|${colorKey(color)}`;
-      let run = runs.get(runKey);
-      if (!run) {
-        run = { font: runFont, size, color, glyphs: [] };
-        runs.set(runKey, run);
-      }
-      run.glyphs.push(glyph);
-    }
+      builder.add({
+        char,
+        style,
+        size: Number(style.fontSize) || object.fontSize,
+        x: lineLeft + box.left,
+        y: -(baseline + (Number(style.deltaY) || 0)),
+        width: box.width,
+        baseline,
+        color: builder.colorOf(style.fill),
+      });
+    });
+    builder.endLine();
     lineTop += text.getHeightOfLine(i);
   }
-  spec.runs = [...runs.values()];
-  return spec;
+  return builder.finish();
 }
 
 /** Specs of the native objects in serialised annotations (for thumbnails and export). */

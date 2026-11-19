@@ -26,5 +26,5 @@ export interface DeriveResult {
 }
 
 export type WorkerResponse =
-  | { id: number; result: PageTextAnalysis | DeriveResult | null; error?: undefined }
-  | { id: number; error: string; result?: undefined };
+  | { id: number; result: PageTextAnalysis | DeriveResult | null; error?: never }
+  | { id: number; error: string; result?: never };

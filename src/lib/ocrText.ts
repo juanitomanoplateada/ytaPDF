@@ -60,7 +60,7 @@ export function ocrMatchQuads(page: OcrPage | undefined, query: string): Point[]
     // Which word each character of the line's text belongs to.
     const wordAt: number[] = [];
     line.words.forEach((word, i) => {
-      for (let k = 0; k < word.text.length; k++) wordAt.push(i);
+      wordAt.push(...Array.from({ length: word.text.length }, () => i));
       if (i < line.words.length - 1) wordAt.push(i);
     });
     for (const { start, end } of findInString(ocrLineText(line), query)) {

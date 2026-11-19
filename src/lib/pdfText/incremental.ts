@@ -23,6 +23,27 @@ function serialize(object: PDFObject): Uint8Array {
   return out;
 }
 
+interface XrefEntry {
+  number: number;
+  generation: number;
+  offset: number;
+}
+
+/** Cross-reference table: one subsection per run of consecutive object numbers. */
+function xrefTable(entries: XrefEntry[]): string {
+  let xref = "xref\n";
+  let start = 0;
+  while (start < entries.length) {
+    let end = start;
+    while (end + 1 < entries.length && entries[end + 1].number === entries[end].number + 1) end++;
+    const run = entries.slice(start, end + 1);
+    xref += `${entries[start].number} ${run.length}\n`;
+    xref += run.map((e) => `${String(e.offset).padStart(10, "0")} ${String(e.generation).padStart(5, "0")} n\r\n`).join("");
+    start = end + 1;
+  }
+  return xref;
+}
+
 /**
  * @param base Bytes the document was loaded from (unencrypted).
  * @param baseLargest Largest object number right after loading.
@@ -47,7 +68,7 @@ export async function appendUpdate(
 
   const parts: Uint8Array[] = [encoder.encode("\n")];
   let offset = base.length + 1;
-  const entries: { number: number; generation: number; offset: number }[] = [];
+  const entries: XrefEntry[] = [];
   for (const [ref, object] of [...objects.values()].sort((a, b) => a[0].objectNumber - b[0].objectNumber)) {
     const head = encoder.encode(`${ref.objectNumber} ${ref.generationNumber} obj\n`);
     const body = serialize(object);
@@ -57,17 +78,7 @@ export async function appendUpdate(
     offset += head.length + body.length + tail.length;
   }
 
-  // Cross-reference table: one subsection per run of consecutive numbers.
-  let xref = "xref\n";
-  for (let i = 0; i < entries.length; ) {
-    let j = i;
-    while (j + 1 < entries.length && entries[j + 1].number === entries[j].number + 1) j++;
-    xref += `${entries[i].number} ${j - i + 1}\n`;
-    for (let k = i; k <= j; k++) {
-      xref += `${String(entries[k].offset).padStart(10, "0")} ${String(entries[k].generation).padStart(5, "0")} n\r\n`;
-    }
-    i = j + 1;
-  }
+  const xref = xrefTable(entries);
 
   const { Root, Info, ID } = context.trailerInfo;
   const size = Math.max(context.largestObjectNumber, ...entries.map((e) => e.number)) + 1;

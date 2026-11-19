@@ -76,13 +76,13 @@ export class PdfFont {
   /** CIDFontType2: CID → glyph index ("identity" or a table). */
   cidToGid: "identity" | Uint16Array | undefined;
 
-  #encoding: CMap | undefined;
-  #toUnicode: CMap | undefined;
+  readonly #encoding: CMap | undefined;
+  readonly #toUnicode: CMap | undefined;
   /** Simple fonts: glyph name per code. */
   #glyphNames: string[] | undefined;
-  #widths = new Map<number, number>();
+  readonly #widths = new Map<number, number>();
   #defaultWidth = 0;
-  #cidWidths: { from: number; to: number; width: number }[] = [];
+  readonly #cidWidths: { from: number; to: number; width: number }[] = [];
   #standardMetrics: StandardFontMetrics | undefined;
   #symbolUnicode: Map<number, string> | undefined;
 
@@ -106,19 +106,10 @@ export class PdfFont {
     this.#readStyleFromName();
 
     if (this.composite) {
-      const encoding = resolve(context, dict.get(PDFName.of("Encoding")));
-      const encodingName = encoding instanceof PDFName ? encoding.decodeText() : undefined;
-      if (encodingName === "Identity-H" || encodingName === "Identity-V") {
-        this.#encoding = identityCMap();
-      } else if (encoding && !(encoding instanceof PDFName)) {
-        const stream = streamOf(context, encoding);
-        const bytes = stream && streamBytes(stream);
-        if (bytes) this.#encoding = parseCMap(bytes);
-        if (this.#encoding?.codespaces.length === 0) this.#encoding = undefined;
-      }
-      const wmode = numberOf(context, dictOf(context, encoding)?.get(PDFName.of("WMode")));
-      this.vertical = encodingName?.endsWith("-V") === true || wmode === 1;
-      this.decodable = this.#encoding !== undefined;
+      const encoding = compositeEncoding(context, dict.get(PDFName.of("Encoding")));
+      this.#encoding = encoding.cmap;
+      this.vertical = encoding.vertical;
+      this.decodable = encoding.cmap !== undefined;
       this.scale = 0.001;
       if (descendant) this.#readCidMetrics(context, descendant);
     } else {
@@ -128,9 +119,7 @@ export class PdfFont {
       this.#readSimpleMetrics(context);
     }
 
-    const toUnicode = streamOf(context, dict.get(PDFName.of("ToUnicode")));
-    const toUnicodeBytes = toUnicode && streamBytes(toUnicode);
-    if (toUnicodeBytes) this.#toUnicode = parseCMap(toUnicodeBytes);
+    this.#toUnicode = cmapOf(context, dict.get(PDFName.of("ToUnicode")));
 
     if (this.composite && this.program?.kind === "TrueType") {
       this.cidToGid = this.#readCidToGid(context, descriptorOwner);
@@ -251,19 +240,7 @@ export class PdfFont {
     const symbolic = standard === "Symbol" || standard === "ZapfDingbats" || (this.symbolic && !standard);
     const names = [...ENCODINGS[base ?? "StandardEncoding"]];
     if (symbolic && !base) names.fill("");
-
-    if (differences) {
-      let code = 0;
-      for (let i = 0; i < differences.size(); i++) {
-        const item = resolve(context, differences.get(i));
-        if (item instanceof PDFName) {
-          if (code >= 0 && code < 256) names[code] = item.decodeText();
-          code++;
-        } else {
-          code = numberOf(context, item, code);
-        }
-      }
-    }
+    if (differences) applyDifferences(context, names, differences);
     return names;
   }
 
@@ -273,7 +250,7 @@ export class PdfFont {
     numbersOf(context, this.dict.get(PDFName.of("Widths")))?.forEach((w, i) => this.#widths.set(firstChar + i, w));
     const bbox = numbersOf(context, this.dict.get(PDFName.of("FontBBox")));
     const sy = matrix?.[3] ?? 0.001;
-    if (bbox && bbox.length === 4 && sy !== 0) {
+    if (bbox?.length === 4 && sy !== 0) {
       this.ascent = Math.max(bbox[1], bbox[3]) * sy;
       this.descent = Math.min(bbox[1], bbox[3]) * sy;
     }
@@ -320,23 +297,15 @@ export class PdfFont {
   #readDescriptor(context: PDFContext, descriptor: PDFDict | undefined): void {
     const standard = standardFontName(this.name);
     const metrics = standard ? standardFont(standard).font : undefined;
-    if (this.subtype !== "Type3") {
-      const ascent = descriptor ? numberOf(context, descriptor.get(PDFName.of("Ascent"))) : 0;
-      const descent = descriptor ? numberOf(context, descriptor.get(PDFName.of("Descent"))) : 0;
-      const a = ascent > 0 ? ascent : (metrics?.Ascender ?? 800) || 800;
-      const d = descent < 0 ? descent : (metrics?.Descender ?? -200) || -200;
-      // Some files carry bogus metrics; keep the box within a sane range.
-      this.ascent = Math.min(Math.max(a, 500), 1300) / 1000;
-      this.descent = Math.max(Math.min(d, -50), -600) / 1000;
-    }
-    if (!this.composite && descriptor) {
-      const missing = numberOf(context, descriptor.get(PDFName.of("MissingWidth")), Number.NaN);
-      if (Number.isFinite(missing)) this.#defaultWidth = missing;
-    }
+    if (this.subtype !== "Type3") this.#readVerticalMetrics(context, descriptor, metrics);
     if (!descriptor) {
       this.serif = metrics?.FamilyName === "Times";
       this.monospace = metrics?.FamilyName === "Courier";
       return;
+    }
+    if (!this.composite) {
+      const missing = numberOf(context, descriptor.get(PDFName.of("MissingWidth")), Number.NaN);
+      if (Number.isFinite(missing)) this.#defaultWidth = missing;
     }
 
     const flags = numberOf(context, descriptor.get(PDFName.of("Flags")));
@@ -346,17 +315,18 @@ export class PdfFont {
     this.italic = (flags & 64) !== 0 || numberOf(context, descriptor.get(PDFName.of("ItalicAngle"))) !== 0;
     this.bold = (flags & 0x40000) !== 0 || numberOf(context, descriptor.get(PDFName.of("FontWeight"))) >= 600;
 
-    const fontFile = streamOf(context, descriptor.get(PDFName.of("FontFile")));
-    const fontFile2 = streamOf(context, descriptor.get(PDFName.of("FontFile2")));
-    const fontFile3 = streamOf(context, descriptor.get(PDFName.of("FontFile3")));
-    if (fontFile2) {
-      this.program = { kind: "TrueType", stream: fontFile2 };
-    } else if (fontFile3) {
-      const sub = nameOf(context, fontFile3.dict.get(PDFName.of("Subtype")));
-      this.program = { kind: sub === "OpenType" ? "OpenType" : "CFF", stream: fontFile3 };
-    } else if (fontFile) {
-      this.program = { kind: "Type1", stream: fontFile };
-    }
+    this.program = fontProgram(context, descriptor);
+  }
+
+  /** Ascent and descent (as fractions of the em) from the descriptor, or the standard font's. */
+  #readVerticalMetrics(context: PDFContext, descriptor: PDFDict | undefined, metrics: StandardFontMetrics | undefined): void {
+    const ascent = descriptor ? numberOf(context, descriptor.get(PDFName.of("Ascent"))) : 0;
+    const descent = descriptor ? numberOf(context, descriptor.get(PDFName.of("Descent"))) : 0;
+    const a = ascent > 0 ? ascent : (metrics?.Ascender ?? 800) || 800;
+    const d = descent < 0 ? descent : (metrics?.Descender ?? -200) || -200;
+    // Some files carry bogus metrics; keep the box within a sane range.
+    this.ascent = Math.min(Math.max(a, 500), 1300) / 1000;
+    this.descent = Math.max(Math.min(d, -50), -600) / 1000;
   }
 
   #readStyleFromName(): void {
@@ -376,7 +346,7 @@ export class PdfFont {
   /** Family names to try in CSS, from the most to the least specific. */
   cssFamilies(): string[] {
     const base = this.name.split(/[-,+]/)[0].replace(/(PSMT|PS|MT|Std|Pro|LT)$/, "");
-    const spaced = base.replace(/([a-z])([A-Z])/g, "$1 $2");
+    const spaced = base.replaceAll(/([a-z])([A-Z])/g, "$1 $2");
     return [...new Set([base, spaced].filter((name) => name.length > 1))];
   }
 }
@@ -393,9 +363,58 @@ const STANDARD_ALIASES: [RegExp, string][] = [
   [/^zapfdingbats/, "ZapfDingbats"],
 ];
 
+/** A CMap stream (an encoding or a ToUnicode map), parsed. */
+function cmapOf(context: PDFContext, value: PDFObject | undefined): CMap | undefined {
+  const stream = streamOf(context, value);
+  const bytes = stream && streamBytes(stream);
+  return bytes ? parseCMap(bytes) : undefined;
+}
+
+/** A composite font's encoding (identity or an embedded CMap) and its writing direction. */
+function compositeEncoding(context: PDFContext, value: PDFObject | undefined): { cmap: CMap | undefined; vertical: boolean } {
+  const encoding = resolve(context, value);
+  const name = encoding instanceof PDFName ? encoding.decodeText() : undefined;
+  let cmap: CMap | undefined;
+  if (name === "Identity-H" || name === "Identity-V") {
+    cmap = identityCMap();
+  } else if (encoding && !(encoding instanceof PDFName)) {
+    const parsed = cmapOf(context, encoding);
+    cmap = parsed && parsed.codespaces.length > 0 ? parsed : undefined;
+  }
+  const wmode = numberOf(context, dictOf(context, encoding)?.get(PDFName.of("WMode")));
+  return { cmap, vertical: name?.endsWith("-V") === true || wmode === 1 };
+}
+
+/** Writes an encoding's /Differences (a code, then the names from it on) over `names`. */
+function applyDifferences(context: PDFContext, names: string[], differences: PDFArray): void {
+  let code = 0;
+  for (let i = 0; i < differences.size(); i++) {
+    const item = resolve(context, differences.get(i));
+    if (!(item instanceof PDFName)) {
+      code = numberOf(context, item, code);
+      continue;
+    }
+    if (code >= 0 && code < 256) names[code] = item.decodeText();
+    code++;
+  }
+}
+
+/** The font program embedded through a font descriptor. */
+function fontProgram(context: PDFContext, descriptor: PDFDict): PdfFont["program"] {
+  const fontFile2 = streamOf(context, descriptor.get(PDFName.of("FontFile2")));
+  if (fontFile2) return { kind: "TrueType", stream: fontFile2 };
+  const fontFile3 = streamOf(context, descriptor.get(PDFName.of("FontFile3")));
+  if (fontFile3) {
+    const sub = nameOf(context, fontFile3.dict.get(PDFName.of("Subtype")));
+    return { kind: sub === "OpenType" ? "OpenType" : "CFF", stream: fontFile3 };
+  }
+  const fontFile = streamOf(context, descriptor.get(PDFName.of("FontFile")));
+  return fontFile ? { kind: "Type1", stream: fontFile } : undefined;
+}
+
 /** The standard 14 font a font name refers to (also via common aliases). */
 export function standardFontName(name: string): StandardName | undefined {
-  const lower = name.toLowerCase().replace(/[\s_]/g, "");
+  const lower = name.toLowerCase().replaceAll(/[\s_]/g, "");
   const entry = STANDARD_ALIASES.find(([pattern]) => pattern.test(lower));
   if (!entry) return undefined;
   const family = entry[1];
@@ -408,7 +427,9 @@ export function standardFontName(name: string): StandardName | undefined {
     if (italic) return "Times-Italic";
     return "Times-Roman";
   }
-  const suffix = bold && italic ? "-BoldOblique" : bold ? "-Bold" : italic ? "-Oblique" : "";
+  let suffix = "";
+  if (bold) suffix = italic ? "-BoldOblique" : "-Bold";
+  else if (italic) suffix = "-Oblique";
   return `${family}${suffix}` as StandardName;
 }
 

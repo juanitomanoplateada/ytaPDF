@@ -301,7 +301,7 @@ async function textRuns(text: string, primary: UsableFont, bold: boolean, contex
   const runs: { text: string; font: UsableFont }[] = [];
   const push = (char: string, font: UsableFont) => {
     const last = runs.at(-1);
-    if (last && last.font === font) last.text += char;
+    if (last?.font === font) last.text += char;
     else runs.push({ text: char, font });
   };
   for (const char of text) {

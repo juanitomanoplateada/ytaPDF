@@ -34,7 +34,7 @@ let current: { languages: string; worker: Promise<TesseractWorker> } | null = nu
 let progressListener: ((progress: OcrProgress) => void) | null = null;
 
 async function workerFor(languages: OcrLanguage[]): Promise<TesseractWorker> {
-  const key = [...languages].sort().join("+");
+  const key = [...languages].sort((a, b) => a.localeCompare(b)).join("+");
   if (current?.languages === key) return current.worker;
   if (current) void current.worker.then((worker) => worker.terminate()).catch(() => undefined);
   const worker = (async () => {
@@ -126,18 +126,11 @@ function quadOf(box: Box, toUser: Matrix): Point[] {
 
 export function toOcrLines(blocks: RawBlock[], toUser: Matrix): OcrLine[] {
   const lines: OcrLine[] = [];
-  for (const block of blocks) {
-    for (const paragraph of block.paragraphs ?? []) {
-      for (const line of paragraph.lines ?? []) {
-        const words: OcrWord[] = [];
-        for (const word of line.words ?? []) {
-          const text = word.text.trim();
-          if (!text || word.confidence < MIN_CONFIDENCE) continue;
-          words.push({ text, quad: quadOf(word.bbox, toUser) });
-        }
-        if (words.length > 0) lines.push({ words, quad: quadOf(line.bbox, toUser) });
-      }
-    }
+  for (const line of blocks.flatMap((block) => block.paragraphs ?? []).flatMap((paragraph) => paragraph.lines ?? [])) {
+    const words: OcrWord[] = (line.words ?? [])
+      .filter((word) => word.text.trim() !== "" && word.confidence >= MIN_CONFIDENCE)
+      .map((word) => ({ text: word.text.trim(), quad: quadOf(word.bbox, toUser) }));
+    if (words.length > 0) lines.push({ words, quad: quadOf(line.bbox, toUser) });
   }
   return lines;
 }

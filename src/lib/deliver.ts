@@ -53,17 +53,17 @@ export function downloadBytes(bytes: Uint8Array, fileName: string, type: string)
 }
 
 export const canPickSaveLocation =
-  typeof window !== "undefined" && typeof (window as FilePickerWindow).showSaveFilePicker === "function";
+  typeof (globalThis as unknown as FilePickerWindow).showSaveFilePicker === "function";
 
 /**
  * Asks where to save. Resolves with the chosen file, or `null` if the user
  * cancelled. Must be called while the click that asked for it is still recent.
  */
 export async function pickSaveLocation(fileName: string, type: string): Promise<SaveHandle | null> {
-  const picker = (window as FilePickerWindow).showSaveFilePicker;
+  const picker = (globalThis as unknown as FilePickerWindow).showSaveFilePicker;
   if (!picker) return null;
   try {
-    return await picker.call(window, {
+    return await picker.call(globalThis, {
       suggestedName: fileName,
       types: [{ description: DESCRIPTIONS[type] ?? "Archivo", accept: { [type]: [EXTENSIONS[type] ?? ""] } }],
     });

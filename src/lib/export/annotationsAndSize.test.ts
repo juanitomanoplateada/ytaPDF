@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PDFDocument, PDFName, PDFRawStream, type PDFRef } from "@cantoo/pdf-lib";
+import { PDFDocument, PDFName, PDFRawStream } from "@cantoo/pdf-lib";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { FontCache } from "../pdfText/fonts";
 import { parseLinkInput } from "../links";
@@ -42,7 +42,7 @@ describe("compressImages", () => {
     expect(report).toEqual({ images: 1, before: 20000, after: 1000 });
     // Shown one inch wide at 150 ppp: 150 pixels are enough.
     expect(requests[0]).toMatchObject({ width: 400, height: 300, targetWidth: 150, targetHeight: 113, quality: 0.7 });
-    const replaced = doc.context.lookup(image as PDFRef) as PDFRawStream;
+    const replaced = doc.context.lookup(image) as PDFRawStream;
     expect(replaced.getContents().length).toBe(1000);
     expect(replaced.dict.get(PDFName.of("Width"))?.toString()).toBe("150");
     expect(replaced.dict.get(PDFName.of("Filter"))?.toString()).toBe("/DCTDecode");
@@ -52,16 +52,16 @@ describe("compressImages", () => {
     const { doc, page, image } = await pageWithJpeg(400);
     const report = await compressImages(doc, [page], new FontCache(doc.context), { quality: 0.9, maxDpi: 300 }, async () => new Uint8Array(19000));
     expect(report.images).toBe(0);
-    expect((doc.context.lookup(image as PDFRef) as PDFRawStream).getContents().length).toBe(20000);
+    expect((doc.context.lookup(image) as PDFRawStream).getContents().length).toBe(20000);
   });
 
   it("leaves alone images whose colours a browser could change", async () => {
     const cmyk = await pageWithJpeg(72, { ColorSpace: "DeviceCMYK" });
-    expect(isRecodableJpeg(cmyk.doc.context.lookup(cmyk.image as PDFRef) as PDFRawStream)).toBe(false);
+    expect(isRecodableJpeg(cmyk.doc.context.lookup(cmyk.image) as PDFRawStream)).toBe(false);
     const decoded = await pageWithJpeg(72, { Decode: [1, 0, 1, 0, 1, 0] });
-    expect(isRecodableJpeg(decoded.doc.context.lookup(decoded.image as PDFRef) as PDFRawStream)).toBe(false);
+    expect(isRecodableJpeg(decoded.doc.context.lookup(decoded.image) as PDFRawStream)).toBe(false);
     const plain = await pageWithJpeg(72);
-    expect(isRecodableJpeg(plain.doc.context.lookup(plain.image as PDFRef) as PDFRawStream)).toBe(true);
+    expect(isRecodableJpeg(plain.doc.context.lookup(plain.image) as PDFRawStream)).toBe(true);
   });
 });
 

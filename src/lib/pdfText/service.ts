@@ -33,7 +33,7 @@ function hash(text: string): string {
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193;
   for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
+    const c = text.codePointAt(i) ?? 0;
     h1 = Math.imul(h1 ^ c, 0x01000193);
     h2 = Math.imul(h2 ^ c, 0x5bd1e995);
   }
@@ -66,8 +66,8 @@ class TextEditing {
         const pending = this.#pending.get(event.data.id);
         if (!pending) return;
         this.#pending.delete(event.data.id);
-        if (event.data.error !== undefined) pending.reject(new Error(event.data.error));
-        else pending.resolve(event.data.result);
+        if (event.data.error === undefined) pending.resolve(event.data.result);
+        else pending.reject(new Error(event.data.error));
       };
       worker.onerror = (event) => {
         console.error("El analizador de texto se detuvo:", event.message);
@@ -191,7 +191,7 @@ class TextEditing {
     this.#pending.clear();
     this.#opened.clear();
     this.#analyses.clear();
-    for (const key of [...this.#previews.keys()]) {
+    for (const key of this.#previews.keys()) {
       const preview = this.#previews.get(key)!;
       preview.users = 0;
       this.#drop(key);

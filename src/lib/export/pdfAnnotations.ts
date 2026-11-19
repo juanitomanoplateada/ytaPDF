@@ -1,4 +1,4 @@
-import { PDFArray, PDFHexString, PDFName, PDFString, type PDFDocument, type PDFPage } from "@cantoo/pdf-lib";
+import { PDFArray, PDFHexString, PDFName, PDFString, type PDFDict, type PDFDocument, type PDFPage } from "@cantoo/pdf-lib";
 
 /**
  * Notes and links are written as real PDF annotations, not drawn into the
@@ -38,60 +38,55 @@ function pdfDate(date: Date): string {
 
 /** URIs in PDF are 7-bit ASCII: anything else is percent-encoded. */
 function asciiUri(url: string): string {
-  return url.replace(/[^\x21-\x7e]/g, (char) => encodeURIComponent(char));
+  return url.replaceAll(/[^\x21-\x7e]/g, (char) => encodeURIComponent(char));
 }
 
 /** Adds notes and links to an exported page. `pages` are all the exported pages, for internal links. */
 export function addPageAnnotations(doc: PDFDocument, page: PDFPage, annotations: PageAnnotation[], pages: PDFPage[]): number {
   const { context } = doc;
-  const refs = [];
   const now = pdfDate(new Date());
-  let n = 0;
-  for (const annotation of annotations) {
-    const [x0, y0, x1, y1] = annotation.rect;
-    if (annotation.kind === "note") {
-      if (!annotation.text.trim()) continue;
-      // The icon goes at the note's top-left corner, as readers place them.
-      const top = Math.max(y0, y1);
-      const left = Math.min(x0, x1);
-      const dict = context.obj({
-        Type: "Annot",
-        Subtype: "Text",
-        Rect: [left, top - NOTE_ICON, left + NOTE_ICON, top],
-        Contents: PDFHexString.fromText(annotation.text),
-        Name: "Comment",
-        C: annotation.color,
-        Open: false,
-        F: 28,
-        M: PDFString.of(now),
-        NM: PDFString.of(`ytapdf-note-${Date.now().toString(36)}-${n++}`),
-      });
-      refs.push(context.register(dict));
-    } else {
-      const rect = [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
-      const target = annotation.pageIndex !== undefined ? pages[annotation.pageIndex] : undefined;
-      if (target) {
-        const dict = context.obj({
-          Type: "Annot",
-          Subtype: "Link",
-          Rect: rect,
-          Border: [0, 0, 0],
-          H: "I",
-          F: 4,
-          Dest: [target.ref, PDFName.of("Fit")],
-        });
-        refs.push(context.register(dict));
-      } else if (annotation.url) {
-        const action = context.obj({ S: "URI", URI: PDFString.of(asciiUri(annotation.url)) });
-        const dict = context.obj({ Type: "Annot", Subtype: "Link", Rect: rect, Border: [0, 0, 0], H: "I", F: 4, A: action });
-        refs.push(context.register(dict));
-      }
-    }
-  }
+  const refs = annotations
+    .map((annotation, n) =>
+      annotation.kind === "note" ? noteDict(doc, annotation, now, n) : linkDict(doc, annotation, pages),
+    )
+    .filter((dict): dict is PDFDict => dict !== null)
+    .map((dict) => context.register(dict));
   if (refs.length === 0) return 0;
   const existing = page.node.lookup(PDFName.of("Annots"));
   const array = existing instanceof PDFArray ? existing : context.obj([]);
   for (const ref of refs) array.push(ref);
   page.node.set(PDFName.of("Annots"), array);
   return refs.length;
+}
+
+/** A note (/Text annotation) with its icon at the note's top-left corner, as readers place them. */
+function noteDict(doc: PDFDocument, note: NoteAnnotation, now: string, n: number): PDFDict | null {
+  if (!note.text.trim()) return null;
+  const [x0, y0, x1, y1] = note.rect;
+  const top = Math.max(y0, y1);
+  const left = Math.min(x0, x1);
+  return doc.context.obj({
+    Type: "Annot",
+    Subtype: "Text",
+    Rect: [left, top - NOTE_ICON, left + NOTE_ICON, top],
+    Contents: PDFHexString.fromText(note.text),
+    Name: "Comment",
+    C: note.color,
+    Open: false,
+    F: 28,
+    M: PDFString.of(now),
+    NM: PDFString.of(`ytapdf-note-${Date.now().toString(36)}-${n}`),
+  });
+}
+
+/** A link to a page of the document or to an address, or null when it goes nowhere. */
+function linkDict(doc: PDFDocument, link: LinkAnnotation, pages: PDFPage[]): PDFDict | null {
+  const { context } = doc;
+  const [x0, y0, x1, y1] = link.rect;
+  const rect = [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+  const common = { Type: "Annot", Subtype: "Link", Rect: rect, Border: [0, 0, 0], H: "I", F: 4 };
+  const target = link.pageIndex === undefined ? undefined : pages[link.pageIndex];
+  if (target) return context.obj({ ...common, Dest: [target.ref, PDFName.of("Fit")] });
+  if (!link.url) return null;
+  return context.obj({ ...common, A: context.obj({ S: "URI", URI: PDFString.of(asciiUri(link.url)) }) });
 }

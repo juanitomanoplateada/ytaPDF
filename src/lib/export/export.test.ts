@@ -462,15 +462,15 @@ describe("assembleDocument", () => {
   });
 });
 
-describe("export options", () => {
-  async function single(label = "A", pages = 1, options: { field?: boolean } = {}) {
-    const source = await makeSource("a", label, pages, options);
-    return assembleDocument(
-      Array.from({ length: pages }, (_, i) => ({ sourceId: "a", sourceIndex: i })),
-      new Map([["a", source]]),
-    );
-  }
+async function single(label = "A", pages = 1, options: { field?: boolean } = {}) {
+  const source = await makeSource("a", label, pages, options);
+  return assembleDocument(
+    Array.from({ length: pages }, (_, i) => ({ sourceId: "a", sourceIndex: i })),
+    new Map([["a", source]]),
+  );
+}
 
+describe("export options", () => {
   it("protects the file with a password (AES-256)", async () => {
     const { doc } = await single("A", 2);
     protectDocument(doc, "clave segura");

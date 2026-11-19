@@ -8,8 +8,8 @@
  * translates it) with its placeholders in `params`.
  */
 export type RangeResult =
-  | { groups: number[][]; error?: undefined; params?: undefined }
-  | { groups?: undefined; error: string; params?: Record<string, string | number> };
+  | { groups: number[][]; error?: never; params?: never }
+  | { groups?: never; error: string; params?: Record<string, string | number> };
 
 /** The error of a result with its placeholders filled in (untranslated). */
 export function rangeErrorText(result: RangeResult): string | undefined {
@@ -27,33 +27,36 @@ export function parsePageRanges(text: string, total: number): RangeResult {
     .map((part) => part.trim())
     .filter((part) => part.length > 0);
   if (parts.length === 0) return { error: "Escribe al menos una página o un rango, por ejemplo 1-3, 5." };
-
   const groups: number[][] = [];
   for (const part of parts) {
-    const match = /^(\d*)\s*(?:[-–—]\s*(\d*))?$/.exec(part);
-    if (!match || (match[1] === "" && (match[2] === undefined || match[2] === ""))) {
-      return { error: "«{part}» no es una página ni un rango válido.", params: { part } };
-    }
-    const isRange = match[2] !== undefined;
-    const from = match[1] === "" ? 1 : Number(match[1]);
-    const to = !isRange ? from : match[2] === "" ? total : Number(match[2]);
-    for (const page of [from, to]) {
-      if (page < 1 || page > total) {
-        return {
-          error:
-            total === 1
-              ? "La página {page} no existe: el documento tiene 1 página."
-              : "La página {page} no existe: el documento tiene {total} páginas.",
-          params: { page, total },
-        };
-      }
-    }
-    const step = to >= from ? 1 : -1;
-    const group: number[] = [];
-    for (let page = from; page !== to + step; page += step) group.push(page - 1);
+    const group = parsePart(part, total);
+    if (!Array.isArray(group)) return group;
     groups.push(group);
   }
   return { groups };
+}
+
+/** The 0-based pages of one part ("3", "1-4", "8-", "-3", "5-3"), or the error it has. */
+function parsePart(part: string, total: number): number[] | RangeResult {
+  const match = /^(\d*)\s*(?:[-–—]\s*(\d*))?$/.exec(part);
+  if (!match || (match[1] === "" && !match[2])) {
+    return { error: "«{part}» no es una página ni un rango válido.", params: { part } };
+  }
+  const from = match[1] === "" ? 1 : Number(match[1]);
+  let to = from;
+  if (match[2] !== undefined) to = match[2] === "" ? total : Number(match[2]);
+  const missing = [from, to].find((page) => page < 1 || page > total);
+  if (missing !== undefined) {
+    return {
+      error:
+        total === 1
+          ? "La página {page} no existe: el documento tiene 1 página."
+          : "La página {page} no existe: el documento tiene {total} páginas.",
+      params: { page: missing, total },
+    };
+  }
+  const step = to >= from ? 1 : -1;
+  return Array.from({ length: Math.abs(to - from) + 1 }, (_, k) => from + k * step - 1);
 }
 
 /** Splits `total` pages into consecutive groups of `size` (the last may be shorter). */
@@ -79,8 +82,8 @@ export function describePages(indices: number[]): string {
 export function sanitizeFileName(name: string, extension = "pdf"): string {
   return name
     .trim()
-    .replace(new RegExp(`\\.${extension}$`, "i"), "")
+    .replace(new RegExp(String.raw`\.${extension}$`, "i"), "")
     .replaceAll(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
-    .replace(/^[\s.]+|[\s.]+$/g, "")
+    .replaceAll(/^[\s.]+|[\s.]+$/g, "")
     .slice(0, 180);
 }
