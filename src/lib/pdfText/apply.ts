@@ -1,4 +1,4 @@
-import { PDFDict, PDFName, PDFRef, type PDFContext, type PDFFont, type PDFObject, type PDFPage } from "@cantoo/pdf-lib";
+import { PDFDict, PDFName, type PDFContext, type PDFFont, type PDFObject, type PDFPage } from "@cantoo/pdf-lib";
 import { IDENTITY, invert, multiply, type Matrix } from "../geometry";
 import { parseEraseRanges } from "./ranges";
 import type { FontCache } from "./fonts";
@@ -160,11 +160,10 @@ class ResourceNames {
 
   /**
    * Adds `object` under a new name in `category` and returns the name. Objects
-   * with the same `identity` (or reference) share one name.
+   * with the same `identity` share one name.
    */
-  add(category: "Font" | "XObject" | "ExtGState", prefix: string, object: PDFObject, identity?: string): string {
-    const id = identity ?? (object instanceof PDFRef ? object.toString() : undefined);
-    const known = id === undefined ? undefined : this.#assigned.get(`${category}:${id}`);
+  add(category: "Font" | "XObject" | "ExtGState", prefix: string, object: PDFObject, identity: string): string {
+    const known = this.#assigned.get(`${category}:${identity}`);
     if (known) return known;
     const key = PDFName.of(category);
     let dict = this.resources.get(key);
@@ -177,7 +176,7 @@ class ResourceNames {
     while (target.has(PDFName.of(`${prefix}${n}`))) n++;
     const name = `${prefix}${n}`;
     target.set(PDFName.of(name), object);
-    if (id !== undefined) this.#assigned.set(`${category}:${id}`, name);
+    this.#assigned.set(`${category}:${identity}`, name);
     return name;
   }
 
@@ -498,7 +497,7 @@ async function drawRun(
     const fallback = await resources.fallbackFont(
       run.font.kind === "fallback" ? run.font : { kind: "fallback", family: "", weight: "normal", style: "normal" },
     );
-    fontName = names.add("Font", "YtaF", fallback.font.ref);
+    fontName = names.add("Font", "YtaF", fallback.font.ref, `fallback-${fallback.font.ref.toString()}`);
     encode = (glyph) => {
       const text = fallback.prepare(glyph.text);
       if (!text || /^\s+$/.test(text)) return null;

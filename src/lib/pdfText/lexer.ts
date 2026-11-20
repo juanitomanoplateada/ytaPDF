@@ -376,14 +376,20 @@ export function parseContent(bytes: Uint8Array): Operation[] {
 export function formatNumber(value: number): string {
   if (!Number.isFinite(value)) return "0";
   if (Number.isInteger(value)) return String(value);
-  const fixed = value.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+  // `toFixed` always writes the decimal point here, so trimming the trailing
+  // zeros stops at it at the latest. A loop instead of /0+$/, which backtracks.
+  const digits = value.toFixed(6);
+  let end = digits.length;
+  while (digits[end - 1] === "0") end--;
+  if (digits[end - 1] === ".") end--;
+  const fixed = digits.slice(0, end);
   return fixed === "-0" ? "0" : fixed;
 }
 
 function formatName(value: string): string {
   let out = "/";
   for (const char of value) {
-    const c = char.codePointAt(0) ?? 0;
+    const c = char.codePointAt(0)!;
     const plain = c > 0x20 && c < 0x7f && c !== 0x23 && isRegular(c);
     out += plain ? char : `#${c.toString(16).padStart(2, "0")}`;
   }

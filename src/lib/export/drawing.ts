@@ -172,7 +172,7 @@ export class DrawContext {
     const key = `script:${id}:${bold}`;
     let font = this.#fonts.get(key);
     if (!font) {
-      font = loadScriptFont(id, bold).then((bytes) => this.#fromBytes(bytes));
+      font = loadScriptFont(id, bold).then((bytes) => this.#fromBytes(bytes, fontkit));
       this.#fonts.set(key, font);
     }
     return font.catch((error) => {
@@ -184,12 +184,10 @@ export class DrawContext {
   async #embeddedFont(family: EmbeddedFamilyId, variant: FontVariant): Promise<UsableFont> {
     const { loadFont, fontkit } = this.#resources;
     if (!loadFont || !fontkit) throw new Error("Faltan los recursos para incrustar fuentes.");
-    return this.#fromBytes(await loadFont(family, variant));
+    return this.#fromBytes(await loadFont(family, variant), fontkit);
   }
 
-  async #fromBytes(bytes: Uint8Array): Promise<UsableFont> {
-    const { fontkit } = this.#resources;
-    if (!fontkit) throw new Error("Faltan los recursos para incrustar fuentes.");
+  async #fromBytes(bytes: Uint8Array, fontkit: FontkitLike): Promise<UsableFont> {
     this.doc.registerFontkit(fontkit as never);
     const font = await this.doc.embedFont(bytes, { subset: true });
     const glyphs = fontkit.create(bytes);

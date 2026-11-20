@@ -16,8 +16,6 @@ import {
 
 /** Small helpers over pdf-lib's object model. */
 
-export const N = (name: string) => PDFName.of(name);
-
 export function resolve(context: PDFContext, value: PDFObject | undefined): PDFObject | undefined {
   return value instanceof PDFRef ? context.lookup(value) : value;
 }

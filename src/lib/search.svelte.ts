@@ -28,7 +28,8 @@ class Search {
   readonly #texts = new Map<string, Promise<PageText>>();
   #run = 0;
 
-  currentMatch = $derived(this.current >= 0 ? (this.matches[this.current] ?? null) : null);
+  // `current` always points into `matches`, which are replaced together with it.
+  currentMatch = $derived(this.current >= 0 ? this.matches[this.current] : null);
 
   show(): void {
     this.open = true;
@@ -96,7 +97,7 @@ class Search {
     // The first match from the current page on.
     const from = editor.currentPageIndex;
     const order = new Map(editor.pages.map((page, i) => [page.id, i]));
-    const next = matches.findIndex((match) => (order.get(match.pageId) ?? 0) >= from);
+    const next = matches.findIndex((match) => order.get(match.pageId)! >= from);
     this.current = matches.length === 0 ? -1 : Math.max(0, next);
     this.#show();
   }

@@ -164,7 +164,7 @@ function dominantSize(glyphs: PlacedGlyph[]): number {
     const key = Math.round(g.size * 10) / 10;
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  let best = glyphs[0]?.size ?? 0;
+  let best = glyphs[0].size;
   let bestCount = 0;
   for (const [size, count] of counts) {
     if (count > bestCount) {
@@ -274,7 +274,7 @@ function lineChars(drawn: PlacedGlyph[]): LayoutChar[] {
     if (previous && gapIsSpace(previous, g)) chars.push({ text: " ", glyph: previous, inferred: true });
     previous = g;
     const space = isSpace(text);
-    if (space && (chars.length === 0 || chars.at(-1)?.text === " ")) continue;
+    if (space && (chars.length === 0 || chars.at(-1)!.text === " ")) continue;
     chars.push({ text: space ? " " : (text ?? "\uFFFD"), glyph: g, inferred: false });
   }
   while (chars.at(-1)?.text === " ") chars.pop();
@@ -350,8 +350,8 @@ interface LineBlock {
  * size and direction, regular spacing, overlapping and aligned), or null.
  */
 function joinDistance(block: LineBlock, line: LayoutLine, canJoin: (line: LayoutLine) => boolean): number | null {
-  const last = block.lines.at(-1);
-  if (!last || !canJoin(last) || !sameDirection(last.u, line.u)) return null;
+  const last = block.lines.at(-1)!;
+  if (!canJoin(last) || !sameDirection(last.u, line.u)) return null;
   const size = Math.max(last.size, line.size);
   if (Math.abs(last.size - line.size) > 0.15 * size) return null;
   const distance = last.perp - line.perp;
@@ -407,8 +407,9 @@ function endsParagraph(line: LayoutLine, right: number, size: number): boolean {
  * does, and it is not stretched.
  */
 function looksJustified(lines: LayoutLine[], right: number, size: number): boolean {
+  // The caller has already checked that each of these lines either reaches the
+  // right edge or ends a paragraph, and that at least one reaches it.
   const inner = lines.slice(0, -1).filter((l) => !endsParagraph(l, right, size));
-  if (inner.length === 0 || !inner.every((l) => Math.abs(l.end - right) < 0.5 * size)) return false;
   return inner.some((l) => l.end - l.start - naturalWidth(l) > 0.25 * l.size);
 }
 
@@ -437,12 +438,13 @@ function finishParagraph(lines: LayoutLine[], align: LayoutParagraph["align"]): 
     const lastText = line.chars.at(-1)?.text ?? "";
     const nextFirst = next.chars[0]?.text ?? "";
     const hyphenated = /[-\u00ad\u2010]$/.test(lastText) && /^\p{L}/u.test(nextFirst);
-    const indented = (align === "left" || align === "justify") && next.start - left > size;
     const short =
       align === "justify"
         ? endsParagraph(line, right, size)
         : align === "left" && firstWordWidth(next) + 0.3 * size < right - line.end;
-    joins.push(hyphenated || indented || short ? "\n" : " ");
+    // An indented next line needs no check of its own: lines that start
+    // further in than the alignment tolerance never make a left or justified block.
+    joins.push(hyphenated || short ? "\n" : " ");
   }
   return { lines, joins, align, left, right, leading };
 }

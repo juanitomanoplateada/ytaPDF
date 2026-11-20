@@ -104,9 +104,60 @@ const monitorWith = (onProgress?: ProgressHandler) => (monitor: DownloadMonitor)
  */
 export function chunkText(text: string, max: number): string[] {
   const chunker = new Chunker(max);
-  for (const paragraph of text.split(/\n\s*\n|\n(?=\s*[-•*\d])/)) chunker.addParagraph(paragraph.replaceAll(/\s*\n\s*/g, " "));
+  for (const paragraph of splitParagraphs(text)) chunker.addParagraph(joinLines(paragraph));
   chunker.flush();
   return chunker.chunks;
+}
+
+// Both helpers below walk the text once. The regular expressions they replace
+// (/\n\s*\n|\n(?=\s*[-•*\d])/ and /\s*\n\s*/g) backtracked on long runs of
+// white space, which made their running time quadratic.
+
+const isBlank = (line: string) => line.trim() === "";
+const LIST_MARKER = /^[-•*\d]/;
+
+/**
+ * Splits at blank lines, which disappear, and before a line that starts a list
+ * item ("-", "•", "*" or a digit after any indentation). A blank last line is
+ * not a break: it stays with the paragraph before it.
+ */
+function splitParagraphs(text: string): string[] {
+  const lines = text.split("\n");
+  const paragraphs: string[] = [];
+  let current = lines[0];
+  for (let i = 1; i < lines.length; i++) {
+    const last = lines.length - 1;
+    if (isBlank(lines[i]) && i < last) {
+      while (i < last && isBlank(lines[i])) i++;
+      paragraphs.push(current);
+      current = lines[i];
+    } else if (LIST_MARKER.test(lines[i].trimStart())) {
+      paragraphs.push(current);
+      current = lines[i];
+    } else {
+      current += `\n${lines[i]}`;
+    }
+  }
+  paragraphs.push(current);
+  return paragraphs;
+}
+
+/** Turns each run of white space that contains a line break into one space. */
+function joinLines(paragraph: string): string {
+  let out = "";
+  let i = 0;
+  while (i < paragraph.length) {
+    let end = i;
+    while (end < paragraph.length && paragraph[end].trim() === "") end++;
+    if (end === i) {
+      out += paragraph[i++];
+      continue;
+    }
+    const run = paragraph.slice(i, end);
+    out += run.includes("\n") ? " " : run;
+    i = end;
+  }
+  return out;
 }
 
 class Chunker {

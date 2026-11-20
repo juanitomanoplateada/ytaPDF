@@ -30,7 +30,8 @@ export function paperLevel(pixels: Pixels): number {
   for (let i = 0; i < data.length; i += 4) histogram[Math.round(luminance(data[i], data[i + 1], data[i + 2]))]++;
   const total = data.length / 4;
   let seen = 0;
-  for (let level = 0; level < 256; level++) {
+  // Every pixel is at or below 255, so the last level needs no counting.
+  for (let level = 0; level < 255; level++) {
     seen += histogram[level];
     if (seen >= total * 0.6) return level;
   }

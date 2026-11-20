@@ -34,7 +34,8 @@ export function writeOutline(doc: PDFDocument, pages: PDFPage[], entries: Outlin
       }
       context.assign(refs[i], dict);
     });
-    return { first: refs[0], last: refs.at(-1) ?? refs[0] };
+    // Only called with entries, so there is always a last one.
+    return { first: refs[0], last: refs.at(-1)! };
   };
 
   const { first, last } = build(entries, root);

@@ -33,7 +33,7 @@ function hash(text: string): string {
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193;
   for (let i = 0; i < text.length; i++) {
-    const c = text.codePointAt(i) ?? 0;
+    const c = text.codePointAt(i)!;
     h1 = Math.imul(h1 ^ c, 0x01000193);
     h2 = Math.imul(h2 ^ c, 0x5bd1e995);
   }

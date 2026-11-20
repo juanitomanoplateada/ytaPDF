@@ -83,7 +83,8 @@ export function readPkcs12(bytes: Uint8Array, password: string): SigningIdentity
     const message = error instanceof Error ? error.message : "";
     throw new CertificateError(/password|MAC/i.test(message) ? "password" : "format");
   }
-  const bagsOf = (type: string) => p12.getBags({ bagType: type })[type] ?? [];
+  // Filtering by type alone, forge always returns that type's list (maybe empty).
+  const bagsOf = (type: string) => p12.getBags({ bagType: type })[type]!;
   const keyBag = [...bagsOf(forge.pki.oids.pkcs8ShroudedKeyBag), ...bagsOf(forge.pki.oids.keyBag)][0];
   const certificates = bagsOf(forge.pki.oids.certBag)
     .map((bag) => bag.cert)

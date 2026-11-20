@@ -91,7 +91,7 @@ export function loadSignatureFont(id: SignatureFontId): Promise<OutlineFont> {
         if (!response.ok) throw new Error(`No se pudo cargar la fuente ${entry.label}.`);
         return new Uint8Array(await response.arrayBuffer());
       }),
-      import("@cantoo/fontkit").then((module) => (module.default ?? module) as { create(bytes: Uint8Array): unknown }),
+      import("@cantoo/fontkit").then((module) => module.default as { create(bytes: Uint8Array): unknown }),
     ]).then(([bytes, fontkit]) => fontkit.create(bytes) as OutlineFont);
     font.catch(() => loaded.delete(id));
     loaded.set(id, font);

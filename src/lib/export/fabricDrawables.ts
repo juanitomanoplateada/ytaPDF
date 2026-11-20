@@ -35,12 +35,13 @@ interface Paint {
 function parseColor(value: unknown): ParsedColor | null {
   if (typeof value !== "string" || value === "" || value === "transparent") return null;
   const [r, g, b, alpha] = new Color(value).getSource();
-  return { color: { r: r / 255, g: g / 255, b: b / 255 }, alpha: alpha ?? 1 };
+  // Color always gives an alpha (1 when the value has none).
+  return { color: { r: r / 255, g: g / 255, b: b / 255 }, alpha };
 }
 
 /** Removes the scale from a matrix so a shape can be drawn at its real size. */
 function withoutScale(matrix: Matrix, scaleX: number, scaleY: number): Matrix {
-  return multiply(matrix, [1 / (scaleX || 1), 0, 0, 1 / (scaleY || 1), 0, 0]);
+  return multiply(matrix, [1 / scaleX, 0, 0, 1 / scaleY, 0, 0]);
 }
 
 /**
@@ -60,7 +61,7 @@ export async function fabricToDrawables(data: PageAnnotations): Promise<Drawable
     if (isNative(object) || kind === "note" || kind === "link") return;
     if (object instanceof Group) {
       // Children's transforms already include the group's (they know their group).
-      for (const child of object.getObjects()) visit(child, opacity * (object.opacity ?? 1));
+      for (const child of object.getObjects()) visit(child, opacity * object.opacity);
       return;
     }
     const drawable = toDrawable(object, opacity);
@@ -73,7 +74,8 @@ export async function fabricToDrawables(data: PageAnnotations): Promise<Drawable
 function toDrawable(object: FabricObject, parentOpacity = 1): Drawable | null {
   const paint: Paint = {
     matrix: object.calcTransformMatrix() as Matrix,
-    opacity: (object.opacity ?? 1) * parentOpacity,
+    // Fabric objects always have an opacity (1 by default).
+    opacity: object.opacity * parentOpacity,
     fill: parseColor(object.fill),
     stroke: object.strokeWidth > 0 ? parseColor(object.stroke) : null,
   };
@@ -143,8 +145,9 @@ function lineJoinOf(join: string): PathDrawable["lineJoin"] {
 }
 
 function shapeDrawable(object: Ellipse | Rect, { matrix, opacity, fill, stroke }: Paint): Drawable {
-  const sx = object.scaleX || 1;
-  const sy = object.scaleY || 1;
+  // Fabric never lets a scale reach 0: it clamps it to a minimum.
+  const sx = object.scaleX;
+  const sy = object.scaleY;
   // A uniform stroke keeps its width when scaled, so the scale moves from
   // the matrix into the shape's size.
   const uniform = object.strokeUniform;

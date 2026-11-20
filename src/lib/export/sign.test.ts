@@ -56,7 +56,10 @@ describe("signSavedPdf", () => {
     expect(offset2 + length2).toBe(signed.length);
 
     // The signature sits exactly between the two ranges, as a hex string.
-    const hex = new TextDecoder("latin1").decode(signed.subarray(length1 + 1, offset2 - 1)).replace(/0+$/, "");
+    const padded = new TextDecoder("latin1").decode(signed.subarray(length1 + 1, offset2 - 1));
+    let end = padded.length;
+    while (end > 0 && padded[end - 1] === "0") end--;
+    const hex = padded.slice(0, end);
     const p7 = forge.pkcs7.messageFromAsn1(forge.asn1.fromDer(forge.util.hexToBytes(hex.length % 2 ? `${hex}0` : hex))) as forge.pkcs7.PkcsSignedData & {
       rawCapture: { authenticatedAttributes: forge.asn1.Asn1[]; signature: string };
     };

@@ -454,7 +454,8 @@ class ContentRun {
       width: w0 * text.size * text.hScale,
       color: this.state.color,
       alpha: this.state.alpha,
-      insertAfter: this.top ? "end" : (this.interpreter.topOp ?? "end"),
+      // Forms only run from a top-level operation, which is then known.
+      insertAfter: this.top ? "end" : this.interpreter.topOp!,
       textObject: this.interpreter.topTextObject ?? this.textObject,
       vertical: font.vertical,
     };

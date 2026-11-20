@@ -121,10 +121,8 @@ function annotationsOf(page: PDFPage): { array: PDFArray | undefined; list: Page
 /** Removes the annotations at `indices` of the page's /Annots, with their pop-up windows. */
 function removeAnnotations(page: PDFPage, array: PDFArray, list: PageAnnotation[], indices: number[]): void {
   const removed = new Set<PDFDict>();
-  for (const index of indices) {
-    const dict = list[index].dict;
-    if (dict) removed.add(dict);
-  }
+  // Only annotations with a rectangle are removed, and only dictionaries have one.
+  for (const index of indices) removed.add(list[index].dict!);
   const popups: PDFDict[] = [];
   for (const dict of removed) {
     const popup = dict.lookup(PDFName.of("Popup"));

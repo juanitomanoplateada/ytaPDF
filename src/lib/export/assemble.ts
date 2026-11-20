@@ -116,7 +116,7 @@ export async function assembleDocument(
     const doc = await loadSource(firstSource);
     await fill(doc, firstSource.id);
     const pages = doc.getPages();
-    placements.forEach((placement, i) => rotate(pages[i], placement));
+    placements.forEach((placement, i) => rotate(pages[i], placement as SourcePlacement));
     return { doc, pages, inPlace: true, failedFields };
   }
 
@@ -138,8 +138,8 @@ export async function assembleDocument(
 
   const pages = placements.map((placement) => {
     if (isRaster(placement)) return doc.addPage([placement.width, placement.height]);
-    const page = copies.get(`${placement.sourceId}:${placement.sourceIndex}`)?.shift();
-    if (!page) throw new Error("No se pudo copiar una página.");
+    // copyRounds copied each page as many times as it is placed.
+    const page = copies.get(`${placement.sourceId}:${placement.sourceIndex}`)!.shift()!;
     rotate(page, placement);
     return doc.addPage(page);
   });
@@ -193,8 +193,7 @@ function copyRounds(placements: PagePlacement[]): Map<string, number[]>[] {
 }
 
 /** Applies the user's rotation and crop to an output page. */
-function rotate(page: PDFPage, placement: PagePlacement): void {
-  if (isRaster(placement)) return;
+function rotate(page: PDFPage, placement: SourcePlacement): void {
   if (placement.rotation) {
     page.setRotation(degrees((((page.getRotation().angle + placement.rotation) % 360) + 360) % 360));
   }
@@ -318,9 +317,11 @@ function copyFormDefaults(doc: PDFDocument, acroForm: PDFDict, sourceDocs: PDFDo
   const sourceForm = sourceDocs
     .map((source) => ({ source, form: source.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict) }))
     .find(({ form }) => form !== undefined);
-  if (!sourceForm?.form) return;
+  if (!sourceForm) return;
 
-  const { source, form } = sourceForm;
+  const { source } = sourceForm;
+  // `find` kept an entry with a form.
+  const form = sourceForm.form!;
   const copier = PDFObjectCopier.for(source.context, doc.context);
   for (const key of ["DA", "Q", "NeedAppearances", "DR"]) {
     const value = form.get(PDFName.of(key));

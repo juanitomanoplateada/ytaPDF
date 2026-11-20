@@ -80,10 +80,23 @@ export function describePages(indices: number[]): string {
 
 /** Removes characters that file systems reject and a trailing extension. */
 export function sanitizeFileName(name: string, extension = "pdf"): string {
-  return name
+  const cleaned = name
     .trim()
     .replace(new RegExp(String.raw`\.${extension}$`, "i"), "")
-    .replaceAll(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
-    .replaceAll(/^[\s.]+|[\s.]+$/g, "")
-    .slice(0, 180);
+    .replaceAll(/[\\/:*?"<>|\u0000-\u001f]+/g, "_");
+  return trimDotsAndSpaces(cleaned).slice(0, 180);
+}
+
+const isDotOrSpace = (char: string) => char === "." || char.trim() === "";
+
+/**
+ * Strips dots and white space from both ends. A loop rather than a regular
+ * expression anchored at the end, which backtracks on long runs of them.
+ */
+function trimDotsAndSpaces(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && isDotOrSpace(text[start])) start++;
+  while (end > start && isDotOrSpace(text[end - 1])) end--;
+  return text.slice(start, end);
 }

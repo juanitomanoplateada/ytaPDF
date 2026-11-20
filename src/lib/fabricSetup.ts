@@ -232,7 +232,8 @@ export function createText(content: string, style: TextStyle): IText {
 
 export async function createImage(url: string, maxWidth: number, maxHeight: number): Promise<FabricImage> {
   const image = await FabricImage.fromURL(url);
-  const scale = Math.min(1, maxWidth / (image.width || 1), maxHeight / (image.height || 1));
+  // A side of 0 divides to Infinity, which Math.min ignores.
+  const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height);
   image.scale(scale);
   return image;
 }
@@ -410,8 +411,9 @@ export function bakeScale(object: FabricObject | undefined): boolean {
   if (isNative(object)) return bakeNativeScale(object);
   // A group keeps its scale: its children are drawn through it.
   if (object instanceof Group) return false;
-  const sx = object.scaleX || 1;
-  const sy = object.scaleY || 1;
+  // Fabric clamps scales to a small minimum: they are never 0.
+  const sx = object.scaleX;
+  const sy = object.scaleY;
   if (Math.abs(sx - 1) < 1e-3 && Math.abs(sy - 1) < 1e-3) return false;
 
   if (isText(object)) {
@@ -437,7 +439,7 @@ export function selectedObjects(canvas: Canvas): FabricObject[] {
 }
 
 function readTextStyle(text: FabricText): TextStyle {
-  const scale = text.scaleY || 1;
+  const scale = text.scaleY;
   return {
     fontFamily: text.fontFamily,
     // A text resized inside a multiple selection keeps its scale until the
@@ -467,7 +469,7 @@ function readShapeStyle(object: FabricObject): ShapeStyle {
   return {
     stroke: typeof object.stroke === "string" ? normalizeHex(object.stroke) : "#000000",
     fill: typeof object.fill === "string" && object.fill !== "" ? normalizeHex(object.fill) : null,
-    strokeWidth: Math.round((object.strokeWidth ?? 1) * 10) / 10,
+    strokeWidth: Math.round(object.strokeWidth * 10) / 10,
   };
 }
 
@@ -499,7 +501,8 @@ export function describeSelection(canvas: Canvas): SelectionInfo | null {
     angle: Math.round(active.angle || 0),
     flipX: !!active.flipX,
     flipY: !!active.flipY,
-    opacity: active instanceof ActiveSelection ? (objects[0]?.opacity ?? 1) : (active.opacity ?? 1),
+    // A multiple selection always holds objects; Fabric objects always have an opacity.
+    opacity: active instanceof ActiveSelection ? objects[0].opacity : active.opacity,
     text: firstText ? readTextStyle(firstText) : null,
     native: objects.some(isNative),
     originalFonts: originalFonts(objects),
@@ -544,15 +547,14 @@ function roundBounds(box: { left: number; top: number; width: number; height: nu
  * (inside a multiple selection they are relative to it), runs `change`, and
  * selects the same objects again.
  */
-function withLooseSelection(canvas: Canvas, change: (objects: FabricObject[]) => FabricObject[] | void): FabricObject[] {
+function withLooseSelection(canvas: Canvas, change: (objects: FabricObject[]) => void): void {
+  // Callers check first that at least one object can be edited.
   const objects = editableSelection(canvas);
   canvas.discardActiveObject();
-  const result = change(objects) ?? objects;
-  for (const object of result) object.setCoords();
-  if (result.length === 1) canvas.setActiveObject(result[0]);
-  else if (result.length > 1) canvas.setActiveObject(new ActiveSelection(result, { canvas }));
+  change(objects);
+  for (const object of objects) object.setCoords();
+  canvas.setActiveObject(objects.length === 1 ? objects[0] : new ActiveSelection(objects, { canvas }));
   canvas.requestRenderAll();
-  return result;
 }
 
 function moveBy(object: FabricObject, dx: number, dy: number): void {
@@ -646,7 +648,7 @@ function resizeKeepingCorner(active: FabricObject, change: BoundsChange, keepRat
   const before = active.getBoundingRect();
   const [sx, sy] = scaleFactors(active, change, keepRatio);
   if (Math.abs(sx) <= 1e-3 || Math.abs(sy) <= 1e-3) return;
-  active.set({ scaleX: (active.scaleX || 1) * sx, scaleY: (active.scaleY || 1) * sy });
+  active.set({ scaleX: active.scaleX * sx, scaleY: active.scaleY * sy });
   active.setCoords();
   if (!(active instanceof ActiveSelection)) bakeScale(active);
   const after = active.getBoundingRect();
@@ -672,7 +674,7 @@ function styleText(text: FabricText, style: Partial<TextStyle>): void {
   const native = isNative(text);
   const rest = native ? Object.fromEntries(Object.entries(all).filter(([key]) => !PLAIN_TEXT_ONLY.has(key))) : all;
   if (native && Object.keys(rest).length === 0 && fontSize === undefined) return;
-  const size = fontSize === undefined ? undefined : fontSize / (text.scaleY || 1);
+  const size = fontSize === undefined ? undefined : fontSize / text.scaleY;
   text.set(rest);
   if (size !== undefined) text.set("fontSize", size);
   if (native) {

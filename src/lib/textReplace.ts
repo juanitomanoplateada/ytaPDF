@@ -55,7 +55,8 @@ export function replaceInObject(object: NativeText, query: string, replacement: 
     const index = graphemeIndices(text._text);
     const start = index.containing(match.start);
     const end = Math.max(start + 1, index.from(match.end));
-    const style = text.getSelectionStyles(start, start + 1, false)[0] ?? {};
+    // One style per character asked for; spreading it copies it for each new one.
+    const [style] = text.getSelectionStyles(start, start + 1, false);
     text.insertChars(
       replacement,
       split.map(() => ({ ...style })),
@@ -141,8 +142,8 @@ export async function replaceOnPage(
       continue;
     }
     const object = createNativeText(unit, analysis, viewport);
+    // The object has the line's own text, so it has the same matches.
     const count = replaceInObject(object, query, replacement);
-    if (count === 0) continue;
     objects.push(serialize(object));
     for (const key of glyphKeys(unit.erase)) taken.add(key);
     replaced += count;

@@ -94,7 +94,7 @@ function utf16(bytes: Uint8Array): string {
 /** Adds `offset` to the last UTF-16 unit of `text` (bfrange destinations). */
 function incrementLast(text: string, offset: number): string {
   if (offset === 0 || text.length === 0) return text;
-  return text.slice(0, -1) + String.fromCodePoint((text.codePointAt(text.length - 1) ?? 0) + offset);
+  return text.slice(0, -1) + String.fromCodePoint(text.codePointAt(text.length - 1)! + offset);
 }
 
 export function parseCMap(bytes: Uint8Array): CMap {

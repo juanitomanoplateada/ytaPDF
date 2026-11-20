@@ -151,5 +151,17 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],
+    // Some tests build and render whole PDFs; with coverage and every file in
+    // parallel they can take well over the default 5 s.
+    testTimeout: 30_000,
+    coverage: {
+      provider: "v8",
+      // The same files SonarQube measures: TypeScript and JavaScript sources.
+      // Svelte components are outside its analysis, so they are left out here too.
+      include: ["src/**/*.{ts,js}"],
+      exclude: ["src/**/*.test.ts", "src/**/*.d.ts"],
+      reporter: ["text-summary", "lcov"],
+      reportsDirectory: "coverage/ytaPDF",
+    },
   },
 });

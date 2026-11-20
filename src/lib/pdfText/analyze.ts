@@ -27,7 +27,7 @@ const USEFUL_RANGES: [number, number][] = [
 ];
 
 const isUseful = (text: string) => {
-  const cp = text.codePointAt(0) ?? 0;
+  const cp = text.codePointAt(0)!;
   return USEFUL_RANGES.some(([from, to]) => cp >= from && cp <= to);
 };
 
@@ -56,7 +56,7 @@ export function analyzePage(page: PDFPage, fonts: FontCache, reader?: FontProgra
     let index = indexOf.get(glyph.font);
     if (index === undefined) {
       index = table.length;
-      table.push(describeFont(glyph, observed.get(glyph.font) ?? new Set(), programs));
+      table.push(describeFont(glyph, observed.get(glyph.font)!, programs));
       indexOf.set(glyph.font, index);
     }
     return index;
@@ -73,7 +73,8 @@ export function analyzePage(page: PDFPage, fonts: FontCache, reader?: FontProgra
 
   const paragraphs = buildParagraphs(lines, (line) => problem(line) === undefined);
   const lineUnits = lines.map((line) => {
-    const paragraph = paragraphs.find((p) => p.lines.includes(line));
+    // Every line belongs to a paragraph, if only one of its own.
+    const paragraph = paragraphs.find((p) => p.lines.includes(line))!;
     return toUnit("line", lineParagraph(line, paragraph), fontIndex, problem(line));
   });
   const paragraphUnits: TextUnit[] = [];
@@ -88,13 +89,9 @@ export function analyzePage(page: PDFPage, fonts: FontCache, reader?: FontProgra
 }
 
 /** A line edited on its own keeps its width if it was a full line of justified text. */
-function lineParagraph(line: LayoutLine, paragraph: LayoutParagraph | undefined): LayoutParagraph {
-  const index = paragraph?.lines.indexOf(line) ?? -1;
-  const full =
-    paragraph?.align === "justify" &&
-    index >= 0 &&
-    index < paragraph.lines.length - 1 &&
-    paragraph.joins[index] !== "\n";
+function lineParagraph(line: LayoutLine, paragraph: LayoutParagraph): LayoutParagraph {
+  const index = paragraph.lines.indexOf(line);
+  const full = paragraph.align === "justify" && index < paragraph.lines.length - 1 && paragraph.joins[index] !== "\n";
   return {
     lines: [line],
     joins: [],
@@ -121,7 +118,8 @@ function toUnit(
   const chars = lines.map((line) =>
     line.chars.map((c): AnalyzedChar => {
       const g = c.glyph;
-      const scale = g.glyph.size === 0 ? 1 : g.size / g.glyph.size;
+      // Glyphs of size 0 never make it into a line, so the division is safe.
+      const scale = g.size / g.glyph.size;
       // Inferred spaces sit in the gap after their glyph: they take no width here.
       const x0 = (c.inferred ? g.x1 : g.x0) - line.start;
       const x1 = g.x1 - line.start;
@@ -209,15 +207,14 @@ class ProgramCache {
 }
 
 /** Glyph index of a code in a TrueType-based font, when it can be worked out. */
-function glyphIndex(font: PdfFont, program: FontProgram, code: number, text: string | undefined): number | undefined {
+function glyphIndex(font: PdfFont, program: FontProgram, code: number, text: string): number | undefined {
   if (font.composite) {
     const cid = font.cid(code);
     if (font.cidToGid === "identity") return cid;
     return font.cidToGid?.[cid];
   }
-  const candidates = [text?.codePointAt(0), code, 0xf000 + code];
+  const candidates = [text.codePointAt(0)!, code, 0xf000 + code];
   for (const cp of candidates) {
-    if (cp === undefined) continue;
     try {
       const id = program.glyphForCodePoint(cp).id;
       if (id > 0) return id;
@@ -229,14 +226,14 @@ function glyphIndex(font: PdfFont, program: FontProgram, code: number, text: str
 }
 
 /** Whether the embedded program really has an outline for a code (subsets drop unused ones). */
-function hasGlyph(font: PdfFont, program: FontProgram, code: number, text: string | undefined): boolean | undefined {
+function hasGlyph(font: PdfFont, program: FontProgram, code: number, text: string): boolean | undefined {
   const id = glyphIndex(font, program, code, text);
   if (id === undefined) return undefined;
   if (id <= 0 || id >= program.numGlyphs) return false;
   try {
     const glyph = program.getGlyph(id);
     if (glyph.path.commands.length > 0) return true;
-    return text !== undefined && /^\s$/u.test(text) && glyph.advanceWidth > 0;
+    return /^\s$/u.test(text) && glyph.advanceWidth > 0;
   } catch {
     return undefined;
   }

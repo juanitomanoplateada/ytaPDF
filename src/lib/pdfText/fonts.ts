@@ -322,8 +322,8 @@ export class PdfFont {
   #readVerticalMetrics(context: PDFContext, descriptor: PDFDict | undefined, metrics: StandardFontMetrics | undefined): void {
     const ascent = descriptor ? numberOf(context, descriptor.get(PDFName.of("Ascent"))) : 0;
     const descent = descriptor ? numberOf(context, descriptor.get(PDFName.of("Descent"))) : 0;
-    const a = ascent > 0 ? ascent : (metrics?.Ascender ?? 800) || 800;
-    const d = descent < 0 ? descent : (metrics?.Descender ?? -200) || -200;
+    const a = ascent > 0 ? ascent : metrics?.Ascender || 800;
+    const d = descent < 0 ? descent : metrics?.Descender || -200;
     // Some files carry bogus metrics; keep the box within a sane range.
     this.ascent = Math.min(Math.max(a, 500), 1300) / 1000;
     this.descent = Math.max(Math.min(d, -50), -600) / 1000;

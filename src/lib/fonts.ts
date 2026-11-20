@@ -121,7 +121,8 @@ export const FONT_FAMILIES: FontFamilyOption[] = [
 export const DEFAULT_FONT_FAMILY = FONT_FAMILIES[0];
 
 function family(id: FontFamilyId): FontFamilyOption {
-  return FONT_FAMILIES.find((f) => f.id === id) ?? DEFAULT_FONT_FAMILY;
+  // Only called with the ids of the table above.
+  return FONT_FAMILIES.find((f) => f.id === id)!;
 }
 
 export function familyFromCss(fontFamily: string | undefined): FontFamilyOption {

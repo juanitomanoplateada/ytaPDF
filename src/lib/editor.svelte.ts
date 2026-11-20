@@ -605,7 +605,8 @@ class Editor {
     if (added.length === 0) return;
 
     const isNew = !this.hasDocument;
-    this.#placeNewPages(added, options.insertAt, firstName ?? t("documento"));
+    // Pages were added, so some file opened and gave its name.
+    this.#placeNewPages(added, options.insertAt, firstName!);
     // Save can write back to the file only when it is the whole document.
     const handle = options.handles?.[0];
     if (isNew && opened === 1 && list.length === 1 && handle) {
@@ -641,7 +642,8 @@ class Editor {
     this.#workId = work?.id ?? createId("trabajo");
     this.keptWork = work?.kept ?? false;
     this.#resetHistory(snapshot);
-    this.currentPageId = snapshot.pages[0]?.id ?? null;
+    // Documents start with pages: opened files or a work with some left.
+    this.currentPageId = snapshot.pages[0].id;
     this.view = "editor";
   }
 
@@ -2017,7 +2019,8 @@ class Editor {
     this.#apply(this.#history[index]);
     this.#lastCommit = { key: null, at: 0 };
     if (!this.pages.some((page) => page.id === this.currentPageId)) {
-      this.currentPageId = this.pages[Math.min(previousPageIndex, this.pages.length - 1)]?.id ?? null;
+      // Every step of the history has pages.
+      this.currentPageId = this.pages[Math.min(previousPageIndex, this.pages.length - 1)].id;
     }
   }
 
@@ -2124,7 +2127,8 @@ class Editor {
         perSource.push({
           id: source.id,
           title: baseName(source.name),
-          pageId: pages.find((page) => page.sourceId === source.id)?.id ?? null,
+          // `order` only holds sources of these pages.
+          pageId: pages.find((page) => page.sourceId === source.id)!.id,
           top: null,
           children,
         });

@@ -92,7 +92,7 @@ async function loadImage(src: string): Promise<ImageData> {
 
 let fontkitModule: Promise<FontkitLike> | null = null;
 function loadFontkit(): Promise<FontkitLike> {
-  fontkitModule ??= import("@cantoo/fontkit").then((module) => (module.default ?? module) as unknown as FontkitLike);
+  fontkitModule ??= import("@cantoo/fontkit").then((module) => module.default as unknown as FontkitLike);
   return fontkitModule;
 }
 
@@ -133,7 +133,8 @@ export async function exportDocument(input: ExportInput, forcedRaster: ReadonlyS
   // the file as unused objects.
   removeUnreachableObjects(doc);
 
-  if (identity && pages.length > 0) {
+  // Assembling fails without pages, so there is always a first one to sign on.
+  if (identity) {
     addSignaturePlaceholder(
       doc,
       pages[0],

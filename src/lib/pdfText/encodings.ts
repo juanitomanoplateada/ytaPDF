@@ -138,7 +138,8 @@ const isSurrogate = (value: number) => value >= 0xd800 && value <= 0xdfff;
 
 /** The text of a `uniXXXXYYYY…` name: groups of four hex digits, none of them a surrogate. */
 function fromUniName(hex: string): string | undefined {
-  const values = hex.match(/.{4}/g)?.map((group) => Number.parseInt(group, 16)) ?? [];
+  // The caller matched groups of four, so there is at least one.
+  const values = hex.match(/.{4}/g)!.map((group) => Number.parseInt(group, 16));
   return values.some(isSurrogate) ? undefined : String.fromCodePoint(...values);
 }
 

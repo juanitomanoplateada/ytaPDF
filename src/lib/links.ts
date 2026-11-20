@@ -18,7 +18,18 @@ export function parseLinkInput(value: string): ParsedLink {
     // Anything that could run code or open local files stays out of the PDF.
     return SAFE_SCHEMES.has(`${scheme.toLowerCase()}:`) ? { kind: "url", url: text } : { kind: "invalid" };
   }
-  if (/^[^@/]+@[^@/]+\.[^@/]+$/.test(text)) return { kind: "url", url: `mailto:${text}` };
+  if (isEmailAddress(text)) return { kind: "url", url: `mailto:${text}` };
   if (/^[^./]+(\.[^./]+)+/.test(text)) return { kind: "url", url: `https://${text}` };
   return { kind: "invalid" };
+}
+
+/**
+ * "name@host.tld": a single "@" with text before it, no "/", and a dot inside
+ * the host (neither its first nor its last character). Checked by position
+ * rather than with a regular expression, which would backtrack on long input.
+ */
+function isEmailAddress(text: string): boolean {
+  const at = text.indexOf("@");
+  if (at <= 0 || at !== text.lastIndexOf("@") || text.includes("/")) return false;
+  return text.slice(at + 2, -1).includes(".");
 }

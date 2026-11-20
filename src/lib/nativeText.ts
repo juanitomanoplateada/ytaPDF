@@ -201,36 +201,40 @@ export class NativeBlock extends Textbox {
     const text = internals(this);
     const count = text._textLines.length;
     for (let i = 0; i < count; i++) {
-      if (!this.#justifies(i, count)) continue;
+      if (!justifiesLine(this, i, count)) continue;
       const lineWidth = text.getLineWidth(i);
       const spaces = text.textLines[i].match(text._reSpacesAndTabs);
       if (lineWidth >= text.width || !spaces) continue;
-      this.#widenSpaces(i, (text.width - lineWidth) / spaces.length);
+      widenSpaces(this, i, (text.width - lineWidth) / spaces.length);
     }
   }
+}
 
-  /** Whether line `i` of `count` is justified (the last one stays so only while the text keeps its original lines). */
-  #justifies(i: number, count: number): boolean {
-    const text = internals(this);
-    if (i === count - 1) return this.ytaNative?.justifyLast === true && count <= (this.ytaNative.lineCount ?? count);
-    return !text.isEndOfWrapping(i) || /[-\u00ad\u2010]$/.test(text._textLines[i].join(""));
-  }
+// The two helpers below are plain functions, not private methods: Fabric's
+// constructor already lays out justified text (and so calls enlargeSpaces)
+// before the private methods of a subclass exist on the instance, and calling
+// one then throws "Receiver must be an instance of class NativeBlock".
 
-  /** Adds `extra` to every space of line `i`, moving what follows. */
-  #widenSpaces(i: number, extra: number): void {
-    const text = internals(this);
-    const graphemes = text._textLines[i];
-    let shift = 0;
-    for (let j = 0; j <= graphemes.length; j++) {
-      const box = text.__charBounds[i][j];
-      if (!box) continue;
-      box.left += shift;
-      if (!text._reSpaceAndTab.test(graphemes[j])) continue;
-      box.width += extra;
-      box.kernedWidth += extra;
-      shift += extra;
-    }
-  }
+/** Whether line `i` of `count` is justified (the last one stays so only while the text keeps its original lines). */
+function justifiesLine(block: NativeBlock, i: number, count: number): boolean {
+  const text = internals(block);
+  if (i === count - 1) return block.ytaNative?.justifyLast === true && count <= (block.ytaNative.lineCount ?? count);
+  return !text.isEndOfWrapping(i) || /[-\u00ad\u2010]$/.test(text._textLines[i].join(""));
+}
+
+/** Adds `extra` to every space of line `i`, moving what follows. */
+function widenSpaces(block: NativeBlock, i: number, extra: number): void {
+  const text = internals(block);
+  const graphemes = text._textLines[i];
+  let shift = 0;
+  // One box per grapheme plus the end of the line, which only moves.
+  text.__charBounds[i].forEach((box, j) => {
+    box.left += shift;
+    if (j >= graphemes.length || !text._reSpaceAndTab.test(graphemes[j])) return;
+    box.width += extra;
+    box.kernedWidth += extra;
+    shift += extra;
+  });
 }
 
 classRegistry.setClass(NativeLine);
